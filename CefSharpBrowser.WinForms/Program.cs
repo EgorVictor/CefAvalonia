@@ -17,12 +17,16 @@ static class Program
 
         foreach (var arg in args)
         {
-            if (arg.StartsWith("--url:", StringComparison.OrdinalIgnoreCase))
-                url = arg["--url:".Length..];
-            else if (arg.StartsWith("--pipe:", StringComparison.OrdinalIgnoreCase))
-                pipeName = arg["--pipe:".Length..];
-            else if (arg.StartsWith("--host-pid:", StringComparison.OrdinalIgnoreCase))
-                int.TryParse(arg["--host-pid:".Length..], out hostPid);
+            var eq = arg.IndexOf('=');
+            var key = eq >= 0 ? arg[..eq] : arg;
+            var val = eq >= 0 ? arg[(eq + 1)..] : "";
+
+            if (key.Equals("--url", StringComparison.OrdinalIgnoreCase))
+                url = val;
+            else if (key.Equals("--pipe", StringComparison.OrdinalIgnoreCase))
+                pipeName = val;
+            else if (key.Equals("--host-pid", StringComparison.OrdinalIgnoreCase))
+                int.TryParse(val, out hostPid);
         }
 
         if (string.IsNullOrEmpty(pipeName))
