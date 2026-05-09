@@ -3,6 +3,7 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using System;
+using Avalonia.Threading;
 
 namespace CefSharp.Avalonia;
 
@@ -68,7 +69,8 @@ public partial class MainWindow : Window
 
     private void OnIslandAddressChanged(object? sender, string url)
     {
-        urlTextBox.Text = url;
+        Dispatcher.UIThread.Post(() =>
+            urlTextBox.Text = url);
     }
 
     private void ResizeIsland()

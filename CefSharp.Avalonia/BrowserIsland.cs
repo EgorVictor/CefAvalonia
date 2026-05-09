@@ -1,7 +1,6 @@
-using CefSharp;
+using Avalonia.Threading;
 using CefSharp.WinForms;
 using System;
-using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
@@ -90,14 +89,14 @@ public sealed class BrowserIsland : IDisposable
 
     private void OnAddressChanged(object? sender, AddressChangedEventArgs e)
     {
-        global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        Dispatcher.UIThread.Post(() =>
             AddressChanged?.Invoke(this, e.Address));
     }
 
     private void OnLoadError(object? sender, LoadErrorEventArgs e)
     {
         if (e.ErrorCode != CefErrorCode.Aborted)
-            global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+           Dispatcher.UIThread.Post(() =>
                 LoadError?.Invoke(this, e));
     }
 

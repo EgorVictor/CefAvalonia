@@ -19,8 +19,6 @@ class Program
                 "CefSharp.Avalonia", "Cache"),
         };
 
-        settings.CefCommandLineArgs.Add("disable-gpu", "1");
-        settings.CefCommandLineArgs.Add("disable-gpu-compositing", "1");
         settings.CefCommandLineArgs.Add("disable-extensions", "1");
         settings.CefCommandLineArgs.Add("disable-background-networking", "1");
 
