@@ -39,7 +39,7 @@ public class StandaloneForm : Form
         topPanel.Controls.Add(goButton);
 
         browser = new ChromiumWebBrowser(url) { Dock = DockStyle.Fill };
-        browser.AddressChanged += (_, e) => urlTextBox.Text = e.Address;
+        browser.AddressChanged += (_, e) => BeginInvoke(() => urlTextBox.Text = e.Address);
 
         table.Controls.Add(topPanel, 0, 0);
         table.Controls.Add(browser, 0, 1);
