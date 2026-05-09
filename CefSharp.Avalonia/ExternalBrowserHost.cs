@@ -16,11 +16,10 @@ public sealed class ExternalBrowserHost : IDisposable
 
     public event EventHandler<string>? AddressChanged;
 
-    public void Create(IntPtr parentHwnd, int w = 800, int h = 600)
+    public void Create(IntPtr parentHwnd)
     {
-        containerHwnd = CreateWindowEx(0, "Static", "", WS_CHILD,
-            0, 0, 0, 0, parentHwnd, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-        lastW = w; lastH = h;
+        containerHwnd = CreateWindowEx(0, "Static", "", WS_CHILD | WS_VISIBLE,
+            0, 0, 100, 100, parentHwnd, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
         StartProcess();
     }
 
@@ -85,8 +84,8 @@ public sealed class ExternalBrowserHost : IDisposable
     public void Resize(int x, int y, int w, int h)
     {
         if (containerHwnd == IntPtr.Zero || disposed) return;
-        if (w == lastW && h == lastH) return;
         if (w <= 0 || h <= 0) return;
+        if (w == lastW && h == lastH) return;
         lastW = w; lastH = h;
 
         SetWindowPos(containerHwnd, IntPtr.Zero, x, y, w, h, SWP_SHOWWINDOW | SWP_NOZORDER);
@@ -139,6 +138,7 @@ public sealed class ExternalBrowserHost : IDisposable
     }
 
     private const int WS_CHILD = 0x40000000;
+    private const int WS_VISIBLE = 0x10000000;
     private const int SWP_SHOWWINDOW = 0x0040;
     private const int SWP_NOZORDER = 0x0004;
 

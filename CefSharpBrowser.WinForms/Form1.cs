@@ -66,7 +66,7 @@ public class Form1 : Form
                     {
                         targetW = w;
                         targetH = h;
-                        BeginInvoke(() => SetWindowPos(Handle, IntPtr.Zero, 0, 0, w, h, SWP_NOZORDER));
+                        BeginInvoke(() => SetWindowPos(Handle, IntPtr.Zero, 0, 0, w, h, SWP_SHOWWINDOW | SWP_NOZORDER));
                     }
                 }
             }
