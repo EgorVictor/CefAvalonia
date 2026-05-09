@@ -3,6 +3,7 @@ using Avalonia.Platform;
 using CefSharp;
 using CefSharp.WinForms;
 using System;
+using System.Threading.Tasks;
 using SWF = System.Windows.Forms;
 
 namespace CefSharp.Avalonia;
@@ -12,6 +13,7 @@ public sealed class CefSharpBrowserHost : NativeControlHost
     private SWF.Panel? hostPanel;
     private ChromiumWebBrowser? browser;
     private bool disposed;
+    private bool isRecreating;
 
     public string? CurrentAddress { get; private set; }
     public bool IsBrowserCreated => browser?.IsBrowserInitialized ?? false;
@@ -68,6 +70,75 @@ public sealed class CefSharpBrowserHost : NativeControlHost
         }
 
         RecreateBrowserCore();
+    }
+
+    public async Task RecreateBrowserAsync()
+    {
+        if (disposed) return;
+
+        var savedUrl = browser?.Address ?? CurrentAddress ?? "about:blank";
+
+        if (hostPanel != null && !hostPanel.IsDisposed && hostPanel.InvokeRequired)
+        {
+            var tcs = new TaskCompletionSource();
+            hostPanel.BeginInvoke(() =>
+            {
+                try { NavigateAboutBlank(); tcs.SetResult(); }
+                catch (Exception ex) { tcs.SetException(ex); }
+            });
+            await tcs.Task;
+        }
+        else
+        {
+            NavigateAboutBlank();
+        }
+
+        await Task.Delay(2000);
+
+        if (hostPanel != null && !hostPanel.IsDisposed && hostPanel.InvokeRequired)
+        {
+            var tcs = new TaskCompletionSource();
+            hostPanel.BeginInvoke(() =>
+            {
+                try { DoRecreate(savedUrl); tcs.SetResult(); }
+                catch (Exception ex) { tcs.SetException(ex); }
+            });
+            await tcs.Task;
+        }
+        else
+        {
+            DoRecreate(savedUrl);
+        }
+    }
+
+    private void NavigateAboutBlank()
+    {
+        if (browser != null && !browser.IsDisposed && hostPanel?.Controls.Count > 0)
+        {
+            isRecreating = true;
+            browser.Load("about:blank");
+        }
+    }
+
+    private void DoRecreate(string savedUrl)
+    {
+        UnbindBrowserEvents();
+
+        if (browser != null && !browser.IsDisposed)
+        {
+            hostPanel?.Controls.Remove(browser);
+            browser.Dispose();
+            browser = null;
+        }
+
+        browser = new ChromiumWebBrowser(savedUrl)
+        {
+            Dock = SWF.DockStyle.Fill
+        };
+
+        BindBrowserEvents();
+        hostPanel?.Controls.Add(browser);
+        isRecreating = false;
     }
 
     private void RecreateBrowserCore()
@@ -146,6 +217,13 @@ public sealed class CefSharpBrowserHost : NativeControlHost
         }
     }
 
+    public void ClearExternalEvents()
+    {
+        AddressChanged = null;
+        LoadError = null;
+        LoadingStateChanged = null;
+    }
+
     public void Dispose()
     {
         if (disposed) return;
@@ -155,7 +233,10 @@ public sealed class CefSharpBrowserHost : NativeControlHost
 
     private void OnBrowserInitialized(object? sender, EventArgs e)
     {
-        if (browser != null && browser.IsBrowserInitialized)
+        if (browser == null || !browser.IsBrowserInitialized)
+            return;
+
+        if (!isRecreating)
             Navigate("https://www.bing.com");
     }
 
