@@ -3,7 +3,6 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using System;
-using Avalonia.Threading;
 
 namespace CefSharp.Avalonia;
 
@@ -13,6 +12,7 @@ public partial class MainWindow : Window
     private Button goButton = null!;
     private Panel browserPanel = null!;
     private BrowserIsland? island;
+    private MemoryGuard? memoryGuard;
 
     public MainWindow()
     {
@@ -48,10 +48,16 @@ public partial class MainWindow : Window
 
         browserPanel.SizeChanged += OnBrowserPanelSizeChanged;
         ResizeIsland();
+
+        memoryGuard = new MemoryGuard(island, thresholdMB: 350);
+        memoryGuard.Start();
     }
 
     protected override void OnClosing(WindowClosingEventArgs e)
     {
+        memoryGuard?.Dispose();
+        memoryGuard = null;
+
         browserPanel.SizeChanged -= OnBrowserPanelSizeChanged;
         if (island != null)
         {
@@ -69,8 +75,7 @@ public partial class MainWindow : Window
 
     private void OnIslandAddressChanged(object? sender, string url)
     {
-        Dispatcher.UIThread.Post(() =>
-            urlTextBox.Text = url);
+        urlTextBox.Text = url;
     }
 
     private void ResizeIsland()

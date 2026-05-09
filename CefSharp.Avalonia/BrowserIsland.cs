@@ -1,4 +1,4 @@
-using Avalonia.Threading;
+using CefSharp;
 using CefSharp.WinForms;
 using System;
 using System.Runtime.InteropServices;
@@ -9,62 +9,71 @@ namespace CefSharp.Avalonia;
 public sealed class BrowserIsland : IDisposable
 {
     private IntPtr containerHwnd = IntPtr.Zero;
+    private IntPtr parentHwnd = IntPtr.Zero;
     private Panel? panel;
     private ChromiumWebBrowser? browser;
     private int currentW = -1;
     private int currentH = -1;
+    private int lastX, lastY, lastW, lastH;
+    private string lastUrl = "about:blank";
     private bool disposed;
+    private bool created;
 
     public event EventHandler<string>? AddressChanged;
     public event EventHandler<LoadErrorEventArgs>? LoadError;
 
+    public string CurrentUrl => lastUrl;
+
     public void Create(IntPtr parentHwnd)
     {
-        if (containerHwnd != IntPtr.Zero) return;
+        if (created) return;
+        this.parentHwnd = parentHwnd;
 
         containerHwnd = CreateWindowEx(0, "Static", "", WS_CHILD,
             0, 0, 0, 0, parentHwnd, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
 
         panel = new Panel();
-
         browser = new ChromiumWebBrowser("about:blank");
         browser.AddressChanged += OnAddressChanged;
         browser.LoadError += OnLoadError;
         panel.Controls.Add(browser);
-
         panel.CreateControl();
         SetParent(panel.Handle, containerHwnd);
+        created = true;
     }
 
     public void Resize(int x, int y, int w, int h)
     {
-        if (containerHwnd == IntPtr.Zero || disposed) return;
+        lastX = x; lastY = y; lastW = w; lastH = h;
+        if (!created || disposed) return;
         if (w == currentW && h == currentH) return;
-        currentW = w;
-        currentH = h;
-
         if (w <= 0 || h <= 0) return;
+        currentW = w; currentH = h;
 
         SetWindowPos(containerHwnd, IntPtr.Zero, x, y, w, h, SWP_SHOWWINDOW | SWP_NOZORDER);
-
-        if (panel != null && panel.IsHandleCreated)
+        if (panel?.IsHandleCreated == true)
             SetWindowPos(panel.Handle, IntPtr.Zero, 0, 0, w, h, SWP_NOZORDER);
-
-        if (browser != null && browser.IsHandleCreated)
+        if (browser?.IsHandleCreated == true)
             SetWindowPos(browser.Handle, IntPtr.Zero, 0, 0, w, h, SWP_NOZORDER);
     }
 
     public void Navigate(string url)
     {
-        if (browser != null && !disposed)
-            browser.Load(url ?? "about:blank");
+        if (string.IsNullOrEmpty(url)) url = "about:blank";
+        lastUrl = url;
+        browser?.Load(url);
     }
 
-    public void Dispose()
+    public void Recreate()
     {
         if (disposed) return;
-        disposed = true;
 
+        var savedPx = lastX; var savedPy = lastY;
+        var savedPw = lastW; var savedPh = lastH;
+        var savedParent = parentHwnd;
+        var savedUrl = lastUrl;
+
+        created = false;
         if (browser != null)
         {
             browser.AddressChanged -= OnAddressChanged;
@@ -73,30 +82,56 @@ public sealed class BrowserIsland : IDisposable
             browser.Dispose();
             browser = null;
         }
-
         panel?.Dispose();
         panel = null;
-
         if (containerHwnd != IntPtr.Zero)
         {
             DestroyWindow(containerHwnd);
             containerHwnd = IntPtr.Zero;
         }
+        currentW = -1; currentH = -1;
 
-        currentW = -1;
-        currentH = -1;
+        Create(savedParent);
+        Navigate(savedUrl);
+
+        if (savedPw > 0 && savedPh > 0)
+            Resize(savedPx, savedPy, savedPw, savedPh);
+    }
+
+    public void Dispose()
+    {
+        if (disposed) return;
+        disposed = true;
+        created = false;
+        if (browser != null)
+        {
+            browser.AddressChanged -= OnAddressChanged;
+            browser.LoadError -= OnLoadError;
+            panel?.Controls.Remove(browser);
+            browser.Dispose();
+            browser = null;
+        }
+        panel?.Dispose();
+        panel = null;
+        if (containerHwnd != IntPtr.Zero)
+        {
+            DestroyWindow(containerHwnd);
+            containerHwnd = IntPtr.Zero;
+        }
+        currentW = -1; currentH = -1;
     }
 
     private void OnAddressChanged(object? sender, AddressChangedEventArgs e)
     {
-        Dispatcher.UIThread.Post(() =>
+        lastUrl = e.Address;
+        global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
             AddressChanged?.Invoke(this, e.Address));
     }
 
     private void OnLoadError(object? sender, LoadErrorEventArgs e)
     {
         if (e.ErrorCode != CefErrorCode.Aborted)
-           Dispatcher.UIThread.Post(() =>
+            global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 LoadError?.Invoke(this, e));
     }
 
