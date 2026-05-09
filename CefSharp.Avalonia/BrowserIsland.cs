@@ -90,13 +90,15 @@ public sealed class BrowserIsland : IDisposable
 
     private void OnAddressChanged(object? sender, AddressChangedEventArgs e)
     {
-        AddressChanged?.Invoke(this, e.Address);
+        global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            AddressChanged?.Invoke(this, e.Address));
     }
 
     private void OnLoadError(object? sender, LoadErrorEventArgs e)
     {
         if (e.ErrorCode != CefErrorCode.Aborted)
-            LoadError?.Invoke(this, e);
+            global::Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                LoadError?.Invoke(this, e));
     }
 
     private const int WS_CHILD = 0x40000000;
