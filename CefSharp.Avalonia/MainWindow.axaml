@@ -1,0 +1,21 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="600"
+        x:Class="CefSharp.Avalonia.MainWindow"
+        Title="CefSharp Avalonia Browser"
+        Width="800"
+        Height="600">
+  <DockPanel>
+    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="5">
+      <TextBox Name="UrlTextBox" Width="700" Margin="0,0,5,0"
+               Text="https://www.bing.com"
+               Watermark="Enter URL..."/>
+      <Button Name="GoButton" Content="Go" Width="80" Padding="5"/>
+    </StackPanel>
+    <Border BorderBrush="Gray" BorderThickness="1">
+      <Panel Name="BrowserPanel"/>
+    </Border>
+  </DockPanel>
+</Window>
