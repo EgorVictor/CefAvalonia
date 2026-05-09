@@ -29,12 +29,6 @@ static class Program
                 int.TryParse(val, out hostPid);
         }
 
-        if (string.IsNullOrEmpty(pipeName))
-        {
-            MessageBox.Show("Missing --pipe argument", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return 1;
-        }
-
         var logDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CefSharpBrowser.WinForms", "logs");
@@ -61,7 +55,13 @@ static class Program
 
         try
         {
-            Application.Run(new BrowserForm(url, pipeName, hostPid));
+            Form form;
+            if (string.IsNullOrEmpty(pipeName))
+                form = new StandaloneForm(url);
+            else
+                form = new BrowserForm(url, pipeName, hostPid);
+
+            Application.Run(form);
         }
         finally
         {
