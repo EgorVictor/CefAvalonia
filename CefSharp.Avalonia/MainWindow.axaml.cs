@@ -11,8 +11,7 @@ public partial class MainWindow : Window
     private TextBox urlTextBox = null!;
     private Button goButton = null!;
     private Panel browserPanel = null!;
-    private BrowserIsland? island;
-    private MemoryGuard? memoryGuard;
+    private ExternalBrowserHost? host;
 
     public MainWindow()
     {
@@ -41,52 +40,48 @@ public partial class MainWindow : Window
         var handle = topLevel?.TryGetPlatformHandle();
         if (handle == null) return;
 
-        island = new BrowserIsland();
-        island.AddressChanged += OnIslandAddressChanged;
-        island.Create(handle.Handle);
-        island.Navigate("https://www.bing.com");
+        host = new ExternalBrowserHost();
+        host.AddressChanged += OnHostAddressChanged;
+        host.Create(handle.Handle);
 
         browserPanel.SizeChanged += OnBrowserPanelSizeChanged;
-        ResizeIsland();
+        ResizeHost();
 
-        memoryGuard = new MemoryGuard(island, thresholdMB: 350);
-        memoryGuard.Start();
+        host.Navigate("https://www.bing.com");
     }
 
     protected override void OnClosing(WindowClosingEventArgs e)
     {
-        memoryGuard?.Dispose();
-        memoryGuard = null;
-
         browserPanel.SizeChanged -= OnBrowserPanelSizeChanged;
-        if (island != null)
+
+        if (host != null)
         {
-            island.AddressChanged -= OnIslandAddressChanged;
-            island.Dispose();
-            island = null;
+            host.AddressChanged -= OnHostAddressChanged;
+            host.Dispose();
+            host = null;
         }
         base.OnClosing(e);
     }
 
     private void OnBrowserPanelSizeChanged(object? sender, SizeChangedEventArgs e)
     {
-        ResizeIsland();
+        ResizeHost();
     }
 
-    private void OnIslandAddressChanged(object? sender, string url)
+    private void OnHostAddressChanged(object? sender, string url)
     {
         urlTextBox.Text = url;
     }
 
-    private void ResizeIsland()
+    private void ResizeHost()
     {
-        if (island == null) return;
+        if (host == null) return;
 
         var scale = TopLevel.GetTopLevel(this)?.RenderScaling ?? 1.0;
         var pos = browserPanel.TranslatePoint(new Point(0, 0), this);
         if (pos == null) return;
 
-        island.Resize(
+        host.Resize(
             (int)(pos.Value.X * scale),
             (int)(pos.Value.Y * scale),
             (int)(browserPanel.Bounds.Width * scale),
@@ -97,13 +92,13 @@ public partial class MainWindow : Window
 
     private void NavigateToUrl()
     {
-        if (island == null) return;
+        if (host == null) return;
         string url = urlTextBox.Text ?? string.Empty;
         if (string.IsNullOrWhiteSpace(url)) return;
 
         if (!url.StartsWith("http://") && !url.StartsWith("https://"))
             url = "https://" + url;
         urlTextBox.Text = url;
-        island.Navigate(url);
+        host.Navigate(url);
     }
 }

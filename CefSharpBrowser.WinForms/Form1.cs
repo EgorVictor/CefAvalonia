@@ -1,132 +1,115 @@
-using System;
-using System.Windows.Forms;
 using CefSharp;
 using CefSharp.WinForms;
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using System.Windows.Forms;
 
 namespace CefSharpBrowser.WinForms
 {
     public class Form1 : Form
+{
+    private ChromiumWebBrowser browser;
+    private IntPtr parentHwnd;
+    private int targetW = 800;
+    private int targetH = 600;
+
+    public Form1(IntPtr parentHwnd, int width, int height)
     {
-        private TextBox urlTextBox;
-        private Button goButton;
-        private ChromiumWebBrowser browser;
+        this.parentHwnd = parentHwnd;
+        targetW = width > 0 ? width : 800;
+        targetH = height > 0 ? height : 600;
 
-        public Form1()
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        Width = targetW;
+        Height = targetH;
+
+        browser = new ChromiumWebBrowser("about:blank");
+        browser.Dock = DockStyle.Fill;
+        browser.AddressChanged += OnAddressChanged;
+        Controls.Add(browser);
+
+        Load += OnFormLoad;
+    }
+
+    private void OnFormLoad(object sender, EventArgs e)
+    {
+        SetParent(Handle, parentHwnd);
+        SetWindowPos(Handle, IntPtr.Zero, 0, 0, targetW, targetH, SWP_SHOWWINDOW | SWP_NOZORDER);
+        browser.Load("https://www.bing.com");
+
+        Task.Run((Func<Task>)ReadCommands);
+    }
+
+    private async Task ReadCommands()
+    {
+        try
         {
-            InitializeComponent();
-            InitializeBrowser();
-        }
-
-        private void InitializeComponent()
-        {
-            this.urlTextBox = new System.Windows.Forms.TextBox();
-            this.goButton = new System.Windows.Forms.Button();
-            this.SuspendLayout();
-            // 
-            // urlTextBox
-            // 
-            this.urlTextBox.Location = new System.Drawing.Point(12, 12);
-            this.urlTextBox.Name = "urlTextBox";
-            this.urlTextBox.Size = new System.Drawing.Size(500, 21);
-            this.urlTextBox.TabIndex = 0;
-            this.urlTextBox.Text = "https://www.bing.com";
-            // 
-            // goButton
-            // 
-            this.goButton.Location = new System.Drawing.Point(518, 10);
-            this.goButton.Name = "goButton";
-            this.goButton.Size = new System.Drawing.Size(75, 23);
-            this.goButton.TabIndex = 1;
-            this.goButton.Text = "Go";
-            this.goButton.UseVisualStyleBackColor = true;
-            // 
-            // Form1
-            // 
-            this.ClientSize = new System.Drawing.Size(826, 615);
-            this.Controls.Add(this.urlTextBox);
-            this.Controls.Add(this.goButton);
-            this.Name = "Form1";
-            this.Text = "CefSharp WinForms Browser";
-            this.ResumeLayout(false);
-            this.PerformLayout();
-
-        }
-
-        private void InitializeBrowser()
-        {
-            browser = new ChromiumWebBrowser("https://www.bing.com")
+            using (var reader = new StreamReader(Console.OpenStandardInput()))
             {
-                Dock = DockStyle.Fill
-            };
-            this.Controls.Add(browser);
-            browser.AddressChanged += Browser_AddressChanged;
-            browser.LoadError += Browser_LoadError;
-        }
-
-        private void GoButton_Click(object sender, EventArgs e)
-        {
-            NavigateToUrl();
-        }
-
-        private void UrlTextBox_KeyPress(object sender, KeyPressEventArgs e)
-        {
-            if (e.KeyChar == (char)Keys.Enter)
-            {
-                NavigateToUrl();
-            }
-        }
-
-        private void NavigateToUrl()
-        {
-            string url = urlTextBox.Text;
-            if (!string.IsNullOrWhiteSpace(url))
-            {
-                if (!url.StartsWith("http://") && !url.StartsWith("https://"))
+                string line;
+                while ((line = await reader.ReadLineAsync()) != null)
                 {
-                    url = "https://" + url;
-                    urlTextBox.Text = url;
+                    if (line.StartsWith("NAVIGATE "))
+                    {
+                        var url = line.Substring(9);
+                        BeginInvoke((Action)(() => browser.Load(url)));
+                    }
+                    else if (line.StartsWith("RESIZE "))
+                    {
+                        var parts = line.Substring(7).Split(' ');
+                        int w, h;
+                        if (parts.Length == 2 && int.TryParse(parts[0], out w) && int.TryParse(parts[1], out h))
+                        {
+                            targetW = w;
+                            targetH = h;
+                            BeginInvoke((Action)(() => SetWindowPos(Handle, IntPtr.Zero, 0, 0, w, h, SWP_NOZORDER)));
+                        }
+                    }
                 }
-                browser.Load(url);
             }
         }
+        catch { }
+    }
 
-        private void Browser_AddressChanged(object sender, AddressChangedEventArgs e)
+    private void OnAddressChanged(object sender, AddressChangedEventArgs e)
+    {
+        try
         {
-            if (urlTextBox.InvokeRequired)
-            {
-                urlTextBox.Invoke(new Action(() => { urlTextBox.Text = e.Address; }));
-            }
-            else
-            {
-                urlTextBox.Text = e.Address;
-            }
+            Console.WriteLine("ADDRESS|" + e.Address);
+            Console.Out.Flush();
         }
+        catch { }
+    }
 
-        private void Browser_LoadError(object sender, LoadErrorEventArgs e)
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        if (!Cef.IsInitialized)
         {
-            if (e.ErrorCode != CefErrorCode.Aborted)
-            {
-                MessageBox.Show($"Page failed to load: {e.ErrorText}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
+            var settings = new CefSettings();
+            settings.MultiThreadedMessageLoop = true;
+            Cef.Initialize(settings);
         }
+    }
 
-        protected override void OnHandleCreated(EventArgs e)
-        {
-            base.OnHandleCreated(e);
-            if (!Cef.IsInitialized)
-            {
-                var settings = new CefSettings();
-                Cef.Initialize(settings);
-            }
-        }
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (Cef.IsInitialized)
+            Cef.Shutdown();
+        base.OnFormClosing(e);
+    }
 
-        protected override void OnFormClosing(FormClosingEventArgs e)
-        {
-            if (Cef.IsInitialized)
-            {
-                Cef.Shutdown();
-            }
-            base.OnFormClosing(e);
-        }
+    private const int SWP_SHOWWINDOW = 0x0040;
+    private const int SWP_NOZORDER = 0x0004;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     }
 }

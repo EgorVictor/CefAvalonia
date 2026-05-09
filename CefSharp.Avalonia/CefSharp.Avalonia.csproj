@@ -6,7 +6,6 @@
     <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
-    <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 
   <ItemGroup>
@@ -14,6 +13,18 @@
     <PackageReference Include="Avalonia.Desktop" Version="11.3.7" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.7" />
     <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.7" />
-    <PackageReference Include="CefSharp.WinForms.NETCore" Version="109.1.110" />
   </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CefSharpBrowser.WinForms\CefSharpBrowser.WinForms.csproj"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <Target Name="CopyChildExe" AfterTargets="Build">
+    <ItemGroup>
+      <_ChildExe Include="$(ProjectDir)..\CefSharpBrowser.WinForms\bin\$(Platform)\$(Configuration)\net462\CefSharpBrowser.WinForms.exe" />
+      <_ChildExe Include="$(ProjectDir)..\CefSharpBrowser.WinForms\bin\$(Configuration)\net462\CefSharpBrowser.WinForms.exe" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_ChildExe)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" Condition="Exists('%(Identity)')" />
+  </Target>
 </Project>
