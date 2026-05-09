@@ -1,17 +1,15 @@
-using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
-using Avalonia.Interactivity;
 using System;
+using Avalonia.Threading;
 
 namespace CefSharp.Avalonia;
 
 public partial class MainWindow : Window
 {
     private TextBox urlTextBox = null!;
-    private Button goButton = null!;
-    private Panel browserPanel = null!;
-    private ExternalBrowserHost? host;
+    private CefSharpBrowserHost browserHost = null!;
+    private CefMemoryGuard? memoryGuard;
 
     public MainWindow()
     {
@@ -22,83 +20,35 @@ public partial class MainWindow : Window
     private void SetupControls()
     {
         urlTextBox = this.FindControl<TextBox>("UrlTextBox")!;
-        goButton = this.FindControl<Button>("GoButton")!;
-        browserPanel = this.FindControl<Panel>("BrowserPanel")!;
+        browserHost = this.FindControl<CefSharpBrowserHost>("BrowserHost")!;
+        var goButton = this.FindControl<Button>("GoButton")!;
 
-        goButton.Click += GoButton_Click;
-        urlTextBox.KeyDown += (s, e) =>
+        goButton.Click += (_, _) => NavigateToUrl();
+        urlTextBox.KeyDown += (_, e) =>
         {
             if (e.Key == Key.Enter) NavigateToUrl();
         };
-    }
 
-    protected override void OnOpened(EventArgs e)
-    {
-        base.OnOpened(e);
-
-        var topLevel = TopLevel.GetTopLevel(this);
-        var handle = topLevel?.TryGetPlatformHandle();
-        if (handle == null) return;
-
-        host = new ExternalBrowserHost();
-        host.AddressChanged += OnHostAddressChanged;
-        host.Create(handle.Handle);
-
-        browserPanel.SizeChanged += OnBrowserPanelSizeChanged;
-        ResizeHost();
-
-        host.Navigate("https://www.bing.com");
-    }
-
-    protected override void OnClosing(WindowClosingEventArgs e)
-    {
-        browserPanel.SizeChanged -= OnBrowserPanelSizeChanged;
-
-        if (host != null)
+        browserHost.AddressChanged += (_, url) =>
         {
-            host.AddressChanged -= OnHostAddressChanged;
-            host.Dispose();
-            host = null;
-        }
-        base.OnClosing(e);
+            Dispatcher.UIThread.Post(()=> urlTextBox.Text = url);
+        };
+
+        memoryGuard = new CefMemoryGuard(browserHost);
+
+        Closed += OnClosed;
     }
 
-    private void OnBrowserPanelSizeChanged(object? sender, SizeChangedEventArgs e)
+    private void OnClosed(object? sender, EventArgs e)
     {
-        ResizeHost();
+        memoryGuard?.Dispose();
+        memoryGuard = null;
     }
-
-    private void OnHostAddressChanged(object? sender, string url)
-    {
-        urlTextBox.Text = url;
-    }
-
-    private void ResizeHost()
-    {
-        if (host == null) return;
-
-        var scale = TopLevel.GetTopLevel(this)?.RenderScaling ?? 1.0;
-        var pos = browserPanel.TranslatePoint(new Point(0, 0), this);
-        if (pos == null) return;
-
-        host.Resize(
-            (int)(pos.Value.X * scale),
-            (int)(pos.Value.Y * scale),
-            (int)(browserPanel.Bounds.Width * scale),
-            (int)(browserPanel.Bounds.Height * scale));
-    }
-
-    private void GoButton_Click(object? sender, RoutedEventArgs e) => NavigateToUrl();
 
     private void NavigateToUrl()
     {
-        if (host == null) return;
         string url = urlTextBox.Text ?? string.Empty;
         if (string.IsNullOrWhiteSpace(url)) return;
-
-        if (!url.StartsWith("http://") && !url.StartsWith("https://"))
-            url = "https://" + url;
-        urlTextBox.Text = url;
-        host.Navigate(url);
+        browserHost.Navigate(url);
     }
 }

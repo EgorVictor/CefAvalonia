@@ -11,13 +11,13 @@ namespace CefSharpBrowser.WinForms;
 public class Form1 : Form
 {
     private readonly ChromiumWebBrowser browser;
-    private readonly IntPtr parentHwnd;
+    private IntPtr ownerHwnd;
     private int targetW = 800;
     private int targetH = 600;
 
-    public Form1(IntPtr parentHwnd, int width, int height)
+    public Form1(IntPtr ownerHwnd, int width, int height)
     {
-        this.parentHwnd = parentHwnd;
+        this.ownerHwnd = ownerHwnd;
         targetW = width > 0 ? width : 800;
         targetH = height > 0 ? height : 600;
 
@@ -39,10 +39,8 @@ public class Form1 : Form
 
     private void OnFormLoad(object? sender, EventArgs e)
     {
-        SetParent(Handle, parentHwnd);
-        SetWindowPos(Handle, IntPtr.Zero, 0, 0, targetW, targetH, SWP_SHOWWINDOW | SWP_NOZORDER);
+        SetWindowLongPtr(Handle, GWLP_HWNDPARENT, ownerHwnd);
         browser.Load("https://www.bing.com");
-
         Task.Run(ReadCommands);
     }
 
@@ -54,20 +52,23 @@ public class Form1 : Form
             string? line;
             while ((line = await reader.ReadLineAsync()) != null)
             {
-                if (line.StartsWith("NAVIGATE "))
+                if (line.StartsWith("POSITION "))
+                {
+                    var parts = line["POSITION ".Length..].Split(' ');
+                    if (parts.Length == 4 &&
+                        int.TryParse(parts[0], out var x) &&
+                        int.TryParse(parts[1], out var y) &&
+                        int.TryParse(parts[2], out var w) &&
+                        int.TryParse(parts[3], out var h))
+                    {
+                        targetW = w; targetH = h;
+                        BeginInvoke(() => SetWindowPos(Handle, IntPtr.Zero, x, y, w, h, SWP_SHOWWINDOW | SWP_NOZORDER));
+                    }
+                }
+                else if (line.StartsWith("NAVIGATE "))
                 {
                     var url = line["NAVIGATE ".Length..];
                     BeginInvoke(() => browser.Load(url));
-                }
-                else if (line.StartsWith("RESIZE "))
-                {
-                    var parts = line["RESIZE ".Length..].Split(' ');
-                    if (parts.Length == 2 && int.TryParse(parts[0], out var w) && int.TryParse(parts[1], out var h))
-                    {
-                        targetW = w;
-                        targetH = h;
-                        BeginInvoke(() => SetWindowPos(Handle, IntPtr.Zero, 0, 0, w, h, SWP_SHOWWINDOW | SWP_NOZORDER));
-                    }
                 }
             }
         }
@@ -101,11 +102,12 @@ public class Form1 : Form
         base.OnFormClosing(e);
     }
 
+    private const int GWLP_HWNDPARENT = -8;
     private const int SWP_SHOWWINDOW = 0x0040;
     private const int SWP_NOZORDER = 0x0004;
 
     [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+    private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);

@@ -3,6 +3,7 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
     <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
@@ -13,22 +14,10 @@
     <PackageReference Include="Avalonia.Desktop" Version="11.3.7" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.7" />
     <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.7" />
+    <PackageReference Include="Avalonia.Diagnostics" Version="11.3.7">
+      <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
+      <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="CefSharp.WinForms.NETCore" Version="109.1.110" />
   </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\CefSharpBrowser.WinForms\CefSharpBrowser.WinForms.csproj"
-                      ReferenceOutputAssembly="false" />
-  </ItemGroup>
-
-  <PropertyGroup>
-    <NoWarn>$(NoWarn);NU1702</NoWarn>
-  </PropertyGroup>
-
-  <Target Name="CopyChildExe" AfterTargets="Build">
-    <ItemGroup>
-      <_ChildExe Include="$(ProjectDir)..\CefSharpBrowser.WinForms\bin\$(Platform)\$(Configuration)\net8.0-windows\CefSharpBrowser.WinForms.exe" />
-      <_ChildExe Include="$(ProjectDir)..\CefSharpBrowser.WinForms\bin\$(Configuration)\net8.0-windows\CefSharpBrowser.WinForms.exe" />
-    </ItemGroup>
-    <Copy SourceFiles="@(_ChildExe)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" Condition="Exists('%(Identity)')" />
-  </Target>
 </Project>
