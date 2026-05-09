@@ -59,6 +59,7 @@ public sealed class BrowserProcessManager : IDisposable
         var psi = new ProcessStartInfo
         {
             FileName = exePath,
+            WorkingDirectory = Path.GetDirectoryName(exePath),
             Arguments = $"--pipe={pipeName} --url=\"{url}\" --host-pid={Environment.ProcessId}",
             UseShellExecute = false,
             CreateNoWindow = true

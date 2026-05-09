@@ -32,11 +32,9 @@ public partial class MainWindow : Window
             Dispatcher.UIThread.Post(() => browserHost.EmbedWindow(hwnd));
 
         browserManager.BrowserCrashed += () =>
-            Dispatcher.UIThread.Post(async () =>
+            Dispatcher.UIThread.Post(() =>
             {
-                Title = "Browser crashed - restarting...";
-                await Task.Delay(2000);
-                _ = browserManager.RestartAsync();
+                Title = "Browser process exited";
             });
 
         goButton.Click += async (_, _) => await NavigateToUrl();

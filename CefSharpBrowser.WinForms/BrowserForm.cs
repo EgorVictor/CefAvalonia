@@ -15,13 +15,18 @@ public class BrowserForm : Form
 {
     private readonly ChromiumWebBrowser browser;
     private readonly NamedPipeServerStream pipeServer;
-    private readonly StreamReader pipeReader;
-    private readonly StreamWriter pipeWriter;
+    private readonly string pipeName;
+    private readonly int hostPid;
+    private StreamReader? pipeReader;
+    private StreamWriter? pipeWriter;
     private readonly CancellationTokenSource pipeCts = new();
     private Thread? pipeThread;
 
     public BrowserForm(string url, string pipeName, int hostPid)
     {
+        this.pipeName = pipeName;
+        this.hostPid = hostPid;
+
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
@@ -33,15 +38,10 @@ public class BrowserForm : Form
             Dock = DockStyle.Fill
         };
 
-        browser.AddressChanged += OnAddressChanged;
-        browser.LoadError += OnLoadError;
-
         Controls.Add(browser);
 
         pipeServer = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1,
             PipeTransmissionMode.Message, PipeOptions.Asynchronous);
-        pipeReader = new StreamReader(pipeServer, Encoding.UTF8);
-        pipeWriter = new StreamWriter(pipeServer, Encoding.UTF8) { AutoFlush = true };
 
         Shown += (_, _) => StartPipeListener();
         FormClosing += OnFormClosing;
@@ -52,26 +52,32 @@ public class BrowserForm : Form
 
     private void StartPipeListener()
     {
-        pipeThread = new Thread(async () =>
+        pipeThread = new Thread(() =>
         {
             try
             {
                 pipeServer.WaitForConnection();
 
+                pipeReader = new StreamReader(pipeServer, Encoding.UTF8);
+                pipeWriter = new StreamWriter(pipeServer, Encoding.UTF8) { AutoFlush = true };
+
+                browser.AddressChanged += OnAddressChanged;
+                browser.LoadError += OnLoadError;
+
                 var hwnd = Handle.ToString("X");
-                await SendEventAsync($"Ready|{hwnd}");
+                SendEvent("Ready|" + hwnd);
 
                 while (!pipeCts.IsCancellationRequested)
                 {
-                    var line = await pipeReader.ReadLineAsync();
+                    var line = pipeReader.ReadLine();
                     if (line == null) break;
-                    ProcessCommand(line);
+                    BeginInvoke((Action)(() => ProcessCommand(line)));
                 }
             }
             catch (ObjectDisposedException) { }
             catch (Exception ex)
             {
-                await SendEventAsync("PipeError|" + ex.Message);
+                SendEvent("PipeError|" + ex.Message);
             }
         })
         { IsBackground = true };
@@ -84,50 +90,47 @@ public class BrowserForm : Form
         var cmd = sep >= 0 ? line[..sep] : line;
         var arg = sep >= 0 ? line[(sep + 1)..] : "";
 
-        BeginInvoke((Action)(() =>
+        switch (cmd)
         {
-            switch (cmd)
-            {
-                case "Navigate":
-                    var navUrl = arg;
-                    if (!navUrl.StartsWith("http://") && !navUrl.StartsWith("https://"))
-                        navUrl = "https://" + navUrl;
-                    browser.Load(navUrl);
-                    break;
+            case "Navigate":
+                var navUrl = arg;
+                if (!navUrl.StartsWith("http://") && !navUrl.StartsWith("https://"))
+                    navUrl = "https://" + navUrl;
+                browser.Load(navUrl);
+                break;
 
-                case "Reload":
-                    browser.Reload();
-                    break;
+            case "Reload":
+                browser.Reload();
+                break;
 
-                case "Stop":
-                    browser.Stop();
-                    break;
+            case "Stop":
+                browser.Stop();
+                break;
 
-                case "Close":
-                    BeginInvoke((Action)Close);
-                    break;
-            }
-        }));
+            case "Close":
+                Close();
+                break;
+        }
     }
 
-    private async Task SendEventAsync(string message)
+    private void SendEvent(string message)
     {
         try
         {
-            await pipeWriter.WriteLineAsync(message);
+            pipeWriter?.WriteLine(message);
         }
         catch { }
     }
 
     private void OnAddressChanged(object? sender, AddressChangedEventArgs e)
     {
-        _ = SendEventAsync($"AddressChanged|{e.Address}");
+        SendEvent("AddressChanged|" + e.Address);
     }
 
     private void OnLoadError(object? sender, LoadErrorEventArgs e)
     {
         if (!e.Frame.IsMain) return;
-        _ = SendEventAsync($"LoadError|{(int)e.ErrorCode}|{e.ErrorText}|{e.FailedUrl}");
+        SendEvent($"LoadError|{(int)e.ErrorCode}|{e.ErrorText}|{e.FailedUrl}");
     }
 
     private async Task WatchHostAsync(int hostPid)
@@ -138,7 +141,7 @@ public class BrowserForm : Form
             {
                 var host = Process.GetProcessById(hostPid);
                 host.WaitForExit();
-                await SendEventAsync("HostExited");
+                SendEvent("HostExited");
                 break;
             }
             catch (ArgumentException)
@@ -163,8 +166,8 @@ public class BrowserForm : Form
         if (!browser.IsDisposed)
             browser.Dispose();
 
-        pipeReader.Dispose();
-        pipeWriter.Dispose();
-        pipeServer.Dispose();
+        pipeReader?.Dispose();
+        pipeWriter?.Dispose();
+        pipeServer?.Dispose();
     }
 }

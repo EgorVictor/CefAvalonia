@@ -34,6 +34,14 @@ static class Program
             "CefSharpBrowser.WinForms", "logs");
         Directory.CreateDirectory(logDir);
 
+        var startupLog = Path.Combine(logDir, "startup.log");
+        File.AppendAllText(startupLog,
+            $"[{DateTime.UtcNow:HH:mm:ss}] Starting: pipe='{pipeName}', url='{url}', hostPid={hostPid}{Environment.NewLine}");
+
+        // Strip quotes from URL value (from command-line --url="...")
+        if (url.Length >= 2 && url[0] == '"' && url[^1] == '"')
+            url = url[1..^1];
+
         Cef.EnableHighDPISupport();
 
         var settings = new CefSettings
@@ -49,6 +57,7 @@ static class Program
         var success = Cef.Initialize(settings);
         if (!success)
         {
+            File.AppendAllText(startupLog, $"[{DateTime.UtcNow:HH:mm:ss}] Cef.Initialize failed{Environment.NewLine}");
             MessageBox.Show("Cef.Initialize failed", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
@@ -62,6 +71,12 @@ static class Program
                 form = new BrowserForm(url, pipeName, hostPid);
 
             Application.Run(form);
+        }
+        catch (Exception ex)
+        {
+            File.AppendAllText(startupLog,
+                $"[{DateTime.UtcNow:HH:mm:ss}] Unhandled exception: {ex}{Environment.NewLine}");
+            throw;
         }
         finally
         {
