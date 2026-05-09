@@ -29,7 +29,12 @@ public partial class MainWindow : Window
             Dispatcher.UIThread.Post(() => urlTextBox.Text = url);
 
         browserManager.WindowHandleReceived += hwnd =>
-            Dispatcher.UIThread.Post(() => browserHost.EmbedWindow(hwnd));
+            Dispatcher.UIThread.Post(async () =>
+            {
+                browserHost.EmbedWindow(hwnd);
+                await Task.Delay(200);
+                browserHost.ResizeEmbedded();
+            });
 
         browserManager.BrowserCrashed += () =>
             Dispatcher.UIThread.Post(() =>

@@ -15,11 +15,9 @@ public sealed class BrowserProcessManager : IDisposable
     private NamedPipeClientStream? pipe;
     private StreamReader? reader;
     private StreamWriter? writer;
-    private Timer? watchdogTimer;
     private string? lastUrl;
     private bool disposed;
-    private DateTime highMemorySince;
-    private DateTime criticalMemorySince;
+    private readonly SemaphoreSlim writeLock = new(1, 1);
 
     public event Action<string>? AddressChanged;
     public event Action<string>? LoadError;
@@ -35,7 +33,6 @@ public sealed class BrowserProcessManager : IDisposable
     private static string ResolveExePath()
     {
         var name = "CefSharpBrowser.WinForms.exe";
-
         var local = Path.Combine(AppContext.BaseDirectory, name);
         if (File.Exists(local)) return local;
 
@@ -70,8 +67,6 @@ public sealed class BrowserProcessManager : IDisposable
             throw new InvalidOperationException("Failed to start browser process");
 
         await ConnectPipeAsync();
-
-        watchdogTimer = new Timer(WatchdogTick, null, 5000, 5000);
     }
 
     private async Task ConnectPipeAsync()
@@ -151,84 +146,16 @@ public sealed class BrowserProcessManager : IDisposable
     private async Task SendAsync(string cmd, string arg)
     {
         if (writer == null) return;
+        await writeLock.WaitAsync();
         try
         {
             await writer.WriteLineAsync($"{cmd}|{arg}");
         }
         catch { }
-    }
-
-    private void WatchdogTick(object? state)
-    {
-        if (disposed || browserProcess == null) return;
-
-        long totalMemory = 0;
-        int subCount = 0;
-
-        try
+        finally
         {
-            if (!browserProcess.HasExited)
-                totalMemory += browserProcess.PrivateMemorySize64;
+            writeLock.Release();
         }
-        catch { }
-
-        try
-        {
-            foreach (var p in Process.GetProcessesByName("CefSharp.BrowserSubprocess"))
-            {
-                try { totalMemory += p.PrivateMemorySize64; subCount++; }
-                catch { }
-                p.Dispose();
-            }
-        }
-        catch { }
-
-        var now = DateTime.UtcNow;
-
-        if (totalMemory > 1_000_000_000L)
-        {
-            if (criticalMemorySince == default)
-                criticalMemorySince = now;
-
-            if ((now - criticalMemorySince).TotalSeconds >= 60)
-            {
-                LogMemory(totalMemory, subCount, "CRITICAL: restarting browser process");
-                _ = RestartAsync();
-                criticalMemorySince = default;
-                highMemorySince = default;
-            }
-            return;
-        }
-        criticalMemorySince = default;
-
-        if (totalMemory > 700_000_000L)
-        {
-            if (highMemorySince == default)
-                highMemorySince = now;
-
-            if ((now - highMemorySince).TotalSeconds >= 30)
-                LogMemory(totalMemory, subCount, "WARNING");
-            return;
-        }
-        highMemorySince = default;
-    }
-
-    private void LogMemory(long totalBytes, int subCount, string level)
-    {
-        var logPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CefSharp.Avalonia", "logs", "memory.log");
-        Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
-        File.AppendAllText(logPath,
-            $"[{DateTime.UtcNow:HH:mm:ss}] {level}: {totalBytes / 1024 / 1024}MB, {subCount} subprocess(es){Environment.NewLine}");
-    }
-
-    public async Task RestartAsync()
-    {
-        await SendAsync("Close", "");
-        await Task.Delay(1500);
-        Kill();
-        await StartAsync(lastUrl ?? "https://www.bing.com");
     }
 
     private void Kill()
@@ -254,7 +181,7 @@ public sealed class BrowserProcessManager : IDisposable
     {
         if (disposed) return;
         disposed = true;
-        watchdogTimer?.Dispose();
+        writeLock.Dispose();
         Kill();
     }
 }

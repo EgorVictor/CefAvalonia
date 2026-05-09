@@ -20,6 +20,7 @@ public class BrowserForm : Form
     private StreamReader? pipeReader;
     private StreamWriter? pipeWriter;
     private readonly CancellationTokenSource pipeCts = new();
+    private readonly object pipeLock = new();
     private Thread? pipeThread;
 
     public BrowserForm(string url, string pipeName, int hostPid)
@@ -115,11 +116,15 @@ public class BrowserForm : Form
 
     private void SendEvent(string message)
     {
-        try
+        if (pipeWriter == null) return;
+        lock (pipeLock)
         {
-            pipeWriter?.WriteLine(message);
+            try
+            {
+                pipeWriter.WriteLine(message);
+            }
+            catch { }
         }
-        catch { }
     }
 
     private void OnAddressChanged(object? sender, AddressChangedEventArgs e)

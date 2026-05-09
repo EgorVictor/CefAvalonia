@@ -1,6 +1,9 @@
 using Avalonia.Controls;
 using Avalonia.Platform;
+using Avalonia.Threading;
 using System;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using SWF = System.Windows.Forms;
 
@@ -11,7 +14,6 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
     private SWF.Panel? hostPanel;
     private IntPtr embeddedHwnd = IntPtr.Zero;
 
-    public IntPtr ContainerHandle => hostPanel?.Handle ?? IntPtr.Zero;
     public bool IsEmbedded => embeddedHwnd != IntPtr.Zero;
 
     protected override IPlatformHandle CreateNativeControlCore(IPlatformHandle parent)
@@ -31,30 +33,30 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
         if (hostPanel == null || hostPanel.IsDisposed) return;
         embeddedHwnd = childHwnd;
 
+        Debug.WriteLine($"[EmbedWindow] child=0x{childHwnd.ToInt64():X}, panel=0x{hostPanel.Handle.ToInt64():X}, panelSize={hostPanel.Width}x{hostPanel.Height}");
+
         SetParent(childHwnd, hostPanel.Handle);
 
         var style = GetWindowLong(childHwnd, GWL_STYLE);
         style |= WS_CHILD;
-        style |= WS_VISIBLE;
         SetWindowLong(childHwnd, GWL_STYLE, style);
 
         MoveWindow(childHwnd, 0, 0, hostPanel.Width, hostPanel.Height, true);
+
+        SetWindowLong(childHwnd, GWL_STYLE, style | WS_VISIBLE);
+        ShowWindow(childHwnd, SW_SHOW);
     }
 
     public void ResizeEmbedded()
     {
         if (hostPanel == null || embeddedHwnd == IntPtr.Zero) return;
+        Debug.WriteLine($"[ResizeEmbedded] panelSize={hostPanel.Width}x{hostPanel.Height}");
         MoveWindow(embeddedHwnd, 0, 0, hostPanel.Width, hostPanel.Height, true);
-    }
-
-    public void Unembed()
-    {
-        embeddedHwnd = IntPtr.Zero;
     }
 
     protected override void DestroyNativeControlCore(IPlatformHandle control)
     {
-        Unembed();
+        embeddedHwnd = IntPtr.Zero;
         if (hostPanel != null && !hostPanel.IsDisposed)
         {
             hostPanel.Dispose();
@@ -67,6 +69,7 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
     private const uint WS_CHILD = 0x40000000;
     private const uint WS_VISIBLE = 0x10000000;
     private const uint WS_CLIPCHILDREN = 0x02000000;
+    private const int SW_SHOW = 5;
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
@@ -79,4 +82,7 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool MoveWindow(IntPtr hWnd, int x, int y, int nWidth, int nHeight, bool bRepaint);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 }
