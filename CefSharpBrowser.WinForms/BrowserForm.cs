@@ -35,7 +35,6 @@ public class BrowserForm : Form
 
         browser.AddressChanged += OnAddressChanged;
         browser.LoadError += OnLoadError;
-        browser.IsBrowserInitializedChanged += OnBrowserInitialized;
 
         Controls.Add(browser);
 
@@ -44,7 +43,7 @@ public class BrowserForm : Form
         pipeReader = new StreamReader(pipeServer, Encoding.UTF8);
         pipeWriter = new StreamWriter(pipeServer, Encoding.UTF8) { AutoFlush = true };
 
-        Load += (_, _) => StartPipeListener();
+        Shown += (_, _) => StartPipeListener();
         FormClosing += OnFormClosing;
 
         if (hostPid > 0)
@@ -59,7 +58,8 @@ public class BrowserForm : Form
             {
                 pipeServer.WaitForConnection();
 
-                await SendEventAsync("Ready");
+                var hwnd = Handle.ToString("X");
+                await SendEventAsync($"Ready|{hwnd}");
 
                 while (!pipeCts.IsCancellationRequested)
                 {
@@ -106,19 +106,6 @@ public class BrowserForm : Form
                 case "Close":
                     BeginInvoke((Action)Close);
                     break;
-
-                case "MoveResize":
-                    var parts = arg.Split('|');
-                    if (parts.Length == 4 &&
-                        int.TryParse(parts[0], out var mx) &&
-                        int.TryParse(parts[1], out var my) &&
-                        int.TryParse(parts[2], out var mw) &&
-                        int.TryParse(parts[3], out var mh))
-                    {
-                        Location = new System.Drawing.Point(mx, my);
-                        Size = new System.Drawing.Size(mw, mh);
-                    }
-                    break;
             }
         }));
     }
@@ -141,14 +128,6 @@ public class BrowserForm : Form
     {
         if (!e.Frame.IsMain) return;
         _ = SendEventAsync($"LoadError|{(int)e.ErrorCode}|{e.ErrorText}|{e.FailedUrl}");
-    }
-
-    private void OnBrowserInitialized(object? sender, EventArgs e)
-    {
-        if (browser.IsBrowserInitialized)
-        {
-            // Browser is ready - the initial URL was set in the constructor
-        }
     }
 
     private async Task WatchHostAsync(int hostPid)
@@ -180,7 +159,6 @@ public class BrowserForm : Form
         pipeCts.Cancel();
         browser.AddressChanged -= OnAddressChanged;
         browser.LoadError -= OnLoadError;
-        browser.IsBrowserInitializedChanged -= OnBrowserInitialized;
 
         if (!browser.IsDisposed)
             browser.Dispose();

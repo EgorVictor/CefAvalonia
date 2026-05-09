@@ -9,7 +9,7 @@ namespace CefSharp.Avalonia;
 public partial class MainWindow : Window
 {
     private TextBox urlTextBox = null!;
-    private Border browserPlaceholder = null!;
+    private ExternalBrowserProcessHost browserHost = null!;
     private readonly BrowserProcessManager browserManager = new();
 
     public MainWindow()
@@ -21,15 +21,15 @@ public partial class MainWindow : Window
     private void SetupControls()
     {
         urlTextBox = this.FindControl<TextBox>("UrlTextBox")!;
-        browserPlaceholder = this.FindControl<Border>("BrowserPlaceholder")!;
+        browserHost = this.FindControl<ExternalBrowserProcessHost>("BrowserHost")!;
         var goButton = this.FindControl<Button>("GoButton")!;
         var reloadButton = this.FindControl<Button>("ReloadButton")!;
 
         browserManager.AddressChanged += url =>
             Dispatcher.UIThread.Post(() => urlTextBox.Text = url);
 
-        browserManager.Ready += () =>
-            Dispatcher.UIThread.Post(() => Title = "CefSharp Avalonia Browser");
+        browserManager.WindowHandleReceived += hwnd =>
+            Dispatcher.UIThread.Post(() => browserHost.EmbedWindow(hwnd));
 
         browserManager.BrowserCrashed += () =>
             Dispatcher.UIThread.Post(async () =>
@@ -46,13 +46,11 @@ public partial class MainWindow : Window
         };
         reloadButton.Click += async (_, _) => await browserManager.ReloadAsync();
 
-        PositionChanged += OnWindowMoved;
         Resized += OnWindowResized;
 
         Opened += async (_, _) =>
         {
             await browserManager.StartAsync("https://www.bing.com");
-            SyncBrowserPosition();
         };
     }
 
@@ -63,29 +61,9 @@ public partial class MainWindow : Window
         await browserManager.NavigateAsync(url);
     }
 
-    private void OnWindowMoved(object? sender, PixelPointEventArgs e)
-    {
-        SyncBrowserPosition();
-    }
-
     private void OnWindowResized(object? sender, EventArgs e)
     {
-        SyncBrowserPosition();
-    }
-
-    private void SyncBrowserPosition()
-    {
-        if (!IsVisible || WindowState == WindowState.Minimized)
-            return;
-
-        var pos = Position;
-        var bx = pos.X + (int)browserPlaceholder.Bounds.X;
-        var by = pos.Y + (int)browserPlaceholder.Bounds.Y;
-        var bw = (int)browserPlaceholder.Bounds.Width;
-        var bh = (int)browserPlaceholder.Bounds.Height;
-
-        if (bw > 0 && bh > 0)
-            _ = browserManager.MoveResizeAsync(bx, by, bw, bh);
+        browserHost.ResizeEmbedded();
     }
 
     protected override void OnClosing(WindowClosingEventArgs e)

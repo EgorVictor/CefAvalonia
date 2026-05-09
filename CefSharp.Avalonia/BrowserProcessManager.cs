@@ -24,7 +24,7 @@ public sealed class BrowserProcessManager : IDisposable
     public event Action<string>? AddressChanged;
     public event Action<string>? LoadError;
     public event Action? BrowserCrashed;
-    public event Action? Ready;
+    public event Action<IntPtr>? WindowHandleReceived;
 
     public BrowserProcessManager()
     {
@@ -122,7 +122,11 @@ public sealed class BrowserProcessManager : IDisposable
         switch (cmd)
         {
             case "Ready":
-                Ready?.Invoke();
+                if (!string.IsNullOrEmpty(arg) &&
+                    long.TryParse(arg, System.Globalization.NumberStyles.HexNumber, null, out var hwnd))
+                {
+                    WindowHandleReceived?.Invoke(new IntPtr(hwnd));
+                }
                 break;
             case "AddressChanged":
                 lastUrl = arg;
@@ -138,11 +142,6 @@ public sealed class BrowserProcessManager : IDisposable
     {
         lastUrl = url;
         await SendAsync("Navigate", url);
-    }
-
-    public async Task MoveResizeAsync(int x, int y, int w, int h)
-    {
-        await SendAsync("MoveResize", $"{x}|{y}|{w}|{h}");
     }
 
     public async Task ReloadAsync() => await SendAsync("Reload", "");
