@@ -2,21 +2,23 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        xmlns:local="clr-namespace:CefSharp.Avalonia"
         mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="600"
         x:Class="CefSharp.Avalonia.MainWindow"
         Title="CefSharp Avalonia Browser"
         Width="800"
         Height="600">
   <DockPanel>
-    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="5">
-      <TextBox Name="UrlTextBox" Width="700" Margin="0,0,5,0"
+    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="5" Spacing="5">
+      <TextBox Name="UrlTextBox" Width="650"
                Text="https://www.bing.com"
                Watermark="Enter URL..."/>
-      <Button Name="GoButton" Content="Go" Width="80" Padding="5"/>
+      <Button Name="GoButton" Content="Go" Width="60"/>
+      <Button Name="ReloadButton" Content="Reload" Width="70"/>
     </StackPanel>
-    <Border BorderBrush="Gray" BorderThickness="1">
-      <local:CefSharpBrowserHost Name="BrowserHost"/>
+    <Border Name="BrowserPlaceholder" Background="#2b2b2b"
+            BorderBrush="#555" BorderThickness="1">
+      <TextBlock Text="Browser window" Foreground="#888"
+                 HorizontalAlignment="Center" VerticalAlignment="Center"/>
     </Border>
   </DockPanel>
 </Window>

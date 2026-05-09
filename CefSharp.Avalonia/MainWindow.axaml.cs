@@ -1,15 +1,16 @@
 using Avalonia.Controls;
 using Avalonia.Input;
+using Avalonia.Threading;
 using System;
+using System.Threading.Tasks;
 
 namespace CefSharp.Avalonia;
 
 public partial class MainWindow : Window
 {
     private TextBox urlTextBox = null!;
-    private CefSharpBrowserHost browserHost = null!;
-    private CefMemoryGuard? memoryGuard;
-    private DateTime lastLoadErrorLog;
+    private Border browserPlaceholder = null!;
+    private readonly BrowserProcessManager browserManager = new();
 
     public MainWindow()
     {
@@ -20,54 +21,76 @@ public partial class MainWindow : Window
     private void SetupControls()
     {
         urlTextBox = this.FindControl<TextBox>("UrlTextBox")!;
-        browserHost = this.FindControl<CefSharpBrowserHost>("BrowserHost")!;
+        browserPlaceholder = this.FindControl<Border>("BrowserPlaceholder")!;
         var goButton = this.FindControl<Button>("GoButton")!;
+        var reloadButton = this.FindControl<Button>("ReloadButton")!;
 
-        goButton.Click += (_, _) => NavigateToUrl();
-        urlTextBox.KeyDown += (_, e) =>
+        browserManager.AddressChanged += url =>
+            Dispatcher.UIThread.Post(() => urlTextBox.Text = url);
+
+        browserManager.Ready += () =>
+            Dispatcher.UIThread.Post(() => Title = "CefSharp Avalonia Browser");
+
+        browserManager.BrowserCrashed += () =>
+            Dispatcher.UIThread.Post(async () =>
+            {
+                Title = "Browser crashed - restarting...";
+                await Task.Delay(2000);
+                _ = browserManager.RestartAsync();
+            });
+
+        goButton.Click += async (_, _) => await NavigateToUrl();
+        urlTextBox.KeyDown += async (_, e) =>
         {
-            if (e.Key == Key.Enter) NavigateToUrl();
+            if (e.Key == Key.Enter) await NavigateToUrl();
         };
+        reloadButton.Click += async (_, _) => await browserManager.ReloadAsync();
 
-        browserHost.AddressChanged += (_, url) =>
+        PositionChanged += OnWindowMoved;
+        Resized += OnWindowResized;
+
+        Opened += async (_, _) =>
         {
-            urlTextBox.Text = url;
+            await browserManager.StartAsync("https://www.bing.com");
+            SyncBrowserPosition();
         };
-
-        browserHost.LoadError += OnLoadError;
-
-        memoryGuard = new CefMemoryGuard(browserHost);
-
-        Closed += OnClosed;
     }
 
-    private void OnLoadError(object? sender, CefSharp.LoadErrorEventArgs e)
+    private async Task NavigateToUrl()
     {
-        if (!e.Frame.IsMain) return;
-
-        var now = DateTime.UtcNow;
-        if ((now - lastLoadErrorLog).TotalSeconds < 30) return;
-        lastLoadErrorLog = now;
-
-        System.IO.File.AppendAllText(
-            System.IO.Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "CefSharp.Avalonia", "logs", "browser.log"),
-            $"[{now:HH:mm:ss}] LoadError: [{e.ErrorCode}] {e.ErrorText} ({e.FailedUrl}){Environment.NewLine}");
-    }
-
-    private void OnClosed(object? sender, EventArgs e)
-    {
-        memoryGuard?.Dispose();
-        memoryGuard = null;
-        browserHost.LoadError -= OnLoadError;
-        browserHost.ClearExternalEvents();
-    }
-
-    private void NavigateToUrl()
-    {
-        string url = urlTextBox.Text ?? string.Empty;
+        var url = urlTextBox.Text ?? string.Empty;
         if (string.IsNullOrWhiteSpace(url)) return;
-        browserHost.Navigate(url);
+        await browserManager.NavigateAsync(url);
+    }
+
+    private void OnWindowMoved(object? sender, PixelPointEventArgs e)
+    {
+        SyncBrowserPosition();
+    }
+
+    private void OnWindowResized(object? sender, EventArgs e)
+    {
+        SyncBrowserPosition();
+    }
+
+    private void SyncBrowserPosition()
+    {
+        if (!IsVisible || WindowState == WindowState.Minimized)
+            return;
+
+        var pos = Position;
+        var bx = pos.X + (int)browserPlaceholder.Bounds.X;
+        var by = pos.Y + (int)browserPlaceholder.Bounds.Y;
+        var bw = (int)browserPlaceholder.Bounds.Width;
+        var bh = (int)browserPlaceholder.Bounds.Height;
+
+        if (bw > 0 && bh > 0)
+            _ = browserManager.MoveResizeAsync(bx, by, bw, bh);
+    }
+
+    protected override void OnClosing(WindowClosingEventArgs e)
+    {
+        browserManager.Dispose();
+        base.OnClosing(e);
     }
 }
