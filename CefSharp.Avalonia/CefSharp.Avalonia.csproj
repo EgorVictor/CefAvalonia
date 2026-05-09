@@ -26,8 +26,8 @@
 
   <Target Name="CopyChildExe" AfterTargets="Build">
     <ItemGroup>
-      <_ChildExe Include="$(ProjectDir)..\CefSharpBrowser.WinForms\bin\$(Platform)\$(Configuration)\net462\CefSharpBrowser.WinForms.exe" />
-      <_ChildExe Include="$(ProjectDir)..\CefSharpBrowser.WinForms\bin\$(Configuration)\net462\CefSharpBrowser.WinForms.exe" />
+      <_ChildExe Include="$(ProjectDir)..\CefSharpBrowser.WinForms\bin\$(Platform)\$(Configuration)\net8.0-windows\CefSharpBrowser.WinForms.exe" />
+      <_ChildExe Include="$(ProjectDir)..\CefSharpBrowser.WinForms\bin\$(Configuration)\net8.0-windows\CefSharpBrowser.WinForms.exe" />
     </ItemGroup>
     <Copy SourceFiles="@(_ChildExe)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" Condition="Exists('%(Identity)')" />
   </Target>

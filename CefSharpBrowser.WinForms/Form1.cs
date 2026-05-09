@@ -6,12 +6,12 @@ using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
-namespace CefSharpBrowser.WinForms
+namespace CefSharpBrowser.WinForms;
+
+public class Form1 : Form
 {
-    public class Form1 : Form
-{
-    private ChromiumWebBrowser browser;
-    private IntPtr parentHwnd;
+    private readonly ChromiumWebBrowser browser;
+    private readonly IntPtr parentHwnd;
     private int targetW = 800;
     private int targetH = 600;
 
@@ -27,47 +27,46 @@ namespace CefSharpBrowser.WinForms
         Width = targetW;
         Height = targetH;
 
-        browser = new ChromiumWebBrowser("about:blank");
-        browser.Dock = DockStyle.Fill;
+        browser = new ChromiumWebBrowser("about:blank")
+        {
+            Dock = DockStyle.Fill
+        };
         browser.AddressChanged += OnAddressChanged;
         Controls.Add(browser);
 
         Load += OnFormLoad;
     }
 
-    private void OnFormLoad(object sender, EventArgs e)
+    private void OnFormLoad(object? sender, EventArgs e)
     {
         SetParent(Handle, parentHwnd);
         SetWindowPos(Handle, IntPtr.Zero, 0, 0, targetW, targetH, SWP_SHOWWINDOW | SWP_NOZORDER);
         browser.Load("https://www.bing.com");
 
-        Task.Run((Func<Task>)ReadCommands);
+        Task.Run(ReadCommands);
     }
 
     private async Task ReadCommands()
     {
         try
         {
-            using (var reader = new StreamReader(Console.OpenStandardInput()))
+            using var reader = new StreamReader(Console.OpenStandardInput());
+            string? line;
+            while ((line = await reader.ReadLineAsync()) != null)
             {
-                string line;
-                while ((line = await reader.ReadLineAsync()) != null)
+                if (line.StartsWith("NAVIGATE "))
                 {
-                    if (line.StartsWith("NAVIGATE "))
+                    var url = line["NAVIGATE ".Length..];
+                    BeginInvoke(() => browser.Load(url));
+                }
+                else if (line.StartsWith("RESIZE "))
+                {
+                    var parts = line["RESIZE ".Length..].Split(' ');
+                    if (parts.Length == 2 && int.TryParse(parts[0], out var w) && int.TryParse(parts[1], out var h))
                     {
-                        var url = line.Substring(9);
-                        BeginInvoke((Action)(() => browser.Load(url)));
-                    }
-                    else if (line.StartsWith("RESIZE "))
-                    {
-                        var parts = line.Substring(7).Split(' ');
-                        int w, h;
-                        if (parts.Length == 2 && int.TryParse(parts[0], out w) && int.TryParse(parts[1], out h))
-                        {
-                            targetW = w;
-                            targetH = h;
-                            BeginInvoke((Action)(() => SetWindowPos(Handle, IntPtr.Zero, 0, 0, w, h, SWP_NOZORDER)));
-                        }
+                        targetW = w;
+                        targetH = h;
+                        BeginInvoke(() => SetWindowPos(Handle, IntPtr.Zero, 0, 0, w, h, SWP_NOZORDER));
                     }
                 }
             }
@@ -75,11 +74,11 @@ namespace CefSharpBrowser.WinForms
         catch { }
     }
 
-    private void OnAddressChanged(object sender, AddressChangedEventArgs e)
+    private void OnAddressChanged(object? sender, AddressChangedEventArgs e)
     {
         try
         {
-            Console.WriteLine("ADDRESS|" + e.Address);
+            Console.WriteLine($"ADDRESS|{e.Address}");
             Console.Out.Flush();
         }
         catch { }
@@ -90,8 +89,7 @@ namespace CefSharpBrowser.WinForms
         base.OnHandleCreated(e);
         if (!Cef.IsInitialized)
         {
-            var settings = new CefSettings();
-            settings.MultiThreadedMessageLoop = true;
+            var settings = new CefSettings { MultiThreadedMessageLoop = true };
             Cef.Initialize(settings);
         }
     }
@@ -111,5 +109,4 @@ namespace CefSharpBrowser.WinForms
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-    }
 }
