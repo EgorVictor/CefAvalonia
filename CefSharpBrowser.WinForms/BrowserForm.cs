@@ -135,21 +135,31 @@ public class BrowserForm : Form
 
     private async Task WatchHostAsync(int hostPid)
     {
+        var log = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "CefSharpBrowser.WinForms", "logs", "watchdog.log");
+        var wDir = Path.GetDirectoryName(log)!;
+        if (!Directory.Exists(wDir)) Directory.CreateDirectory(wDir);
+
         while (!pipeCts.IsCancellationRequested)
         {
             try
             {
                 var host = Process.GetProcessById(hostPid);
+                File.AppendAllText(log, $"[{DateTime.UtcNow:HH:mm:ss}] Monitoring host PID {hostPid}, HasExited={host.HasExited}{Environment.NewLine}");
                 host.WaitForExit();
+                File.AppendAllText(log, $"[{DateTime.UtcNow:HH:mm:ss}] Host PID {hostPid} exited{Environment.NewLine}");
                 SendEvent("HostExited");
                 break;
             }
-            catch (ArgumentException)
+            catch (Exception ex)
             {
+                File.AppendAllText(log, $"[{DateTime.UtcNow:HH:mm:ss}] GetProcessById failed: {ex.GetType().Name}: {ex.Message}{Environment.NewLine}");
                 break;
             }
         }
 
+        File.AppendAllText(log, $"[{DateTime.UtcNow:HH:mm:ss}] Closing form{Environment.NewLine}");
         BeginInvoke((Action)(() =>
         {
             if (!IsDisposed)
