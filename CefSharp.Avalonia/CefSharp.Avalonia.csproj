@@ -20,6 +20,10 @@
                       ReferenceOutputAssembly="false" />
   </ItemGroup>
 
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);NU1702</NoWarn>
+  </PropertyGroup>
+
   <Target Name="CopyChildExe" AfterTargets="Build">
     <ItemGroup>
       <_ChildExe Include="$(ProjectDir)..\CefSharpBrowser.WinForms\bin\$(Platform)\$(Configuration)\net462\CefSharpBrowser.WinForms.exe" />
