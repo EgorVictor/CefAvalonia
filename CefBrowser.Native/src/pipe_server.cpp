@@ -12,12 +12,6 @@ static std::wstring Utf8ToWide(const std::string& str)
     return result;
 }
 
-static void DebugLog(const char* msg) {
-    OutputDebugStringA("[PipeServer] ");
-    OutputDebugStringA(msg);
-    OutputDebugStringA("\n");
-}
-
 PipeServer::PipeServer(const std::string& pipeName, int hostPid)
     : pipe_name_(pipeName), host_pid_(hostPid)
 {
@@ -36,39 +30,29 @@ void PipeServer::Start(PipeCommandCallback onCommand,
                        std::function<void()> onDisconnect,
                        std::function<void()> onConnected)
 {
-    DebugLog("Start called");
     running_ = true;
     writer_running_ = true;
-    write_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr); // auto-reset
+    write_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     writer_thread_ = std::thread(&PipeServer::WriterThreadProc, this);
     thread_ = std::thread(&PipeServer::ThreadProc, this,
                           std::move(onCommand), std::move(onResize),
                           std::move(onDisconnect), std::move(onConnected));
-    DebugLog("Thread launched");
 }
 
 void PipeServer::Stop()
 {
-    DebugLog("Stop called");
     writer_running_ = false;
     running_ = false;
-    if (write_event_) SetEvent(write_event_);   // unblock writer
-    if (stop_event_) SetEvent(stop_event_);       // unblock pipe reader
-    // Close pipe handle to break pending I/O
+    if (write_event_) SetEvent(write_event_);
+    if (stop_event_) SetEvent(stop_event_);
     if (pipe_ != INVALID_HANDLE_VALUE) {
         CloseHandle(pipe_);
         pipe_ = INVALID_HANDLE_VALUE;
     }
-    if (writer_thread_.joinable()) {
-        DebugLog("Joining writer thread...");
+    if (writer_thread_.joinable())
         writer_thread_.join();
-        DebugLog("Writer thread joined");
-    }
-    if (thread_.joinable()) {
-        DebugLog("Joining pipe thread...");
+    if (thread_.joinable())
         thread_.join();
-        DebugLog("Pipe thread joined");
-    }
     if (write_event_) {
         CloseHandle(write_event_);
         write_event_ = nullptr;
@@ -85,56 +69,35 @@ void PipeServer::ThreadProc(PipeCommandCallback onCommand,
                             std::function<void()> onDisconnect,
                             std::function<void()> onConnected)
 {
-    char tmp[256];
-    DebugLog("ThreadProc started");
-
     HANDLE hostProcess = nullptr;
-    if (host_pid_ > 0) {
+    if (host_pid_ > 0)
         hostProcess = OpenProcess(SYNCHRONIZE, FALSE, host_pid_);
-        sprintf_s(tmp, "hostProcess=0x%IX", (size_t)hostProcess);
-        DebugLog(tmp);
-    }
 
     std::wstring fullPath = MakePipePath(pipe_name_);
-    sprintf_s(tmp, "Creating pipe: %S", fullPath.c_str());
-    DebugLog(tmp);
 
-    // Synchronous pipe - no FILE_FLAG_OVERLAPPED
     pipe_ = CreateNamedPipeW(fullPath.c_str(),
                              PIPE_ACCESS_DUPLEX,
                              PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                              1, 4096, 4096, 0, nullptr);
-    sprintf_s(tmp, "CreateNamedPipe result=0x%IX err=%d", (size_t)pipe_, GetLastError());
-    DebugLog(tmp);
 
     if (pipe_ == INVALID_HANDLE_VALUE) {
-        DebugLog("CreateNamedPipe FAILED - exiting thread");
         if (hostProcess) CloseHandle(hostProcess);
         return;
     }
 
-    // Wait for client connection (blocks until client connects)
-    DebugLog("ConnectNamedPipe (blocking)...");
     BOOL connected = ConnectNamedPipe(pipe_, nullptr);
     DWORD lastErr = GetLastError();
-    sprintf_s(tmp, "ConnectNamedPipe result=%d err=%d", connected, lastErr);
-    DebugLog(tmp);
 
     if (connected == 0) {
-        // Failed to connect - check if Stop() was called
         if (!running_) {
-            DebugLog("ConnectNamedPipe failed because Stop() was called");
             CloseHandle(pipe_);
             pipe_ = INVALID_HANDLE_VALUE;
             if (hostProcess) CloseHandle(hostProcess);
             return;
         }
-        // Handle ERROR_PIPE_CONNECTED (client already connected)
         if (lastErr == ERROR_PIPE_CONNECTED) {
-            DebugLog("Client already connected (ERROR_PIPE_CONNECTED)");
+            // Client already connected
         } else {
-            sprintf_s(tmp, "ConnectNamedPipe FAILED err=%d", lastErr);
-            DebugLog(tmp);
             CloseHandle(pipe_);
             pipe_ = INVALID_HANDLE_VALUE;
             if (hostProcess) CloseHandle(hostProcess);
@@ -142,24 +105,14 @@ void PipeServer::ThreadProc(PipeCommandCallback onCommand,
         }
     }
 
-    DebugLog("Client connected! Calling onConnected...");
     if (onConnected) onConnected();
-    DebugLog("onConnected done, entering read loop");
 
-    // Main read loop
     while (running_) {
         std::string line;
-        if (!ReadLine(line)) {
-            DebugLog("ReadLine returned false");
+        if (!ReadLine(line))
             break;
-        }
-        if (line.empty()) {
-            DebugLog("Empty line, breaking");
+        if (line.empty())
             break;
-        }
-
-        sprintf_s(tmp, "Received: %s", line.c_str());
-        DebugLog(tmp);
 
         auto sep = line.find('|');
         std::string cmd = (sep != std::string::npos) ? line.substr(0, sep) : line;
@@ -172,29 +125,22 @@ void PipeServer::ThreadProc(PipeCommandCallback onCommand,
                     int w = std::stoi(arg.substr(0, p));
                     int h = std::stoi(arg.substr(p + 1));
                     if (w > 0 && h > 0 && onResize) onResize(w, h);
-                } catch (const std::exception& e) {
-                    sprintf_s(tmp, "Resize parse failed: %s", e.what());
-                    DebugLog(tmp);
-                }
+                } catch (...) { }
             }
         } else {
             if (onCommand) onCommand(cmd, arg);
         }
     }
 
-    DebugLog("Read loop ended");
     if (onDisconnect) onDisconnect();
 
-    // Cleanup only if Stop() hasn't already closed pipe_
     if (pipe_ != INVALID_HANDLE_VALUE) {
-        DebugLog("Disconnecting and closing pipe");
         DisconnectNamedPipe(pipe_);
         CloseHandle(pipe_);
         pipe_ = INVALID_HANDLE_VALUE;
     }
 
     if (hostProcess) CloseHandle(hostProcess);
-    DebugLog("ThreadProc exiting");
 }
 
 bool PipeServer::ReadLine(std::string& line)
@@ -206,7 +152,6 @@ bool PipeServer::ReadLine(std::string& line)
         if (!ReadFile(pipe_, buf, sizeof(buf), &bytesRead, nullptr)) {
             DWORD err = GetLastError();
             if (err == ERROR_MORE_DATA) {
-                // Message is larger than buffer - append what we got
                 line.append(buf, bytesRead);
                 continue;
             }
@@ -218,7 +163,6 @@ bool PipeServer::ReadLine(std::string& line)
         if (bytesRead == 0) return false;
         line.append(buf, bytesRead);
 
-        // Check for newline at end of message
         if (!line.empty() && line.back() == '\n') {
             if (line.size() >= 2 && line[line.size() - 2] == '\r')
                 line.resize(line.size() - 2);
@@ -227,7 +171,6 @@ bool PipeServer::ReadLine(std::string& line)
             return true;
         }
 
-        // If we got less than buffer, this was the complete message (no newline?)
         if (bytesRead < sizeof(buf)) return !line.empty();
     }
     return false;
@@ -235,13 +178,10 @@ bool PipeServer::ReadLine(std::string& line)
 
 void PipeServer::WriterThreadProc()
 {
-    char tmp[256];
-    DebugLog("WriterThreadProc started");
     while (writer_running_) {
         WaitForSingleObject(write_event_, INFINITE);
         if (!writer_running_) break;
 
-        // Drain all queued messages
         for (;;) {
             std::string msg;
             {
@@ -252,16 +192,9 @@ void PipeServer::WriterThreadProc()
             }
             msg += '\n';
             DWORD written = 0;
-            if (!WriteFile(pipe_, msg.data(), (DWORD)msg.size(), &written, nullptr)) {
-                DWORD err = GetLastError();
-                sprintf_s(tmp, "Writer: WriteFile failed, err=%d (%s)",
-                          err, (err == ERROR_BROKEN_PIPE) ? "BROKEN_PIPE" :
-                               (err == ERROR_PIPE_NOT_CONNECTED) ? "NOT_CONNECTED" : "OTHER");
-                DebugLog(tmp);
-            }
+            WriteFile(pipe_, msg.data(), (DWORD)msg.size(), &written, nullptr);
         }
     }
-    DebugLog("WriterThreadProc exiting");
 }
 
 void PipeServer::SendEvent(const std::string& message)

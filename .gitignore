@@ -29,6 +29,12 @@ bld/
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
+build/
+out/
+
+## CEF runtime
+cache/
+DawnCache/
 
 ## NuGet
 packages/

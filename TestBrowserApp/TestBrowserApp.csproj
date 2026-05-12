@@ -1,0 +1,43 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- Must match CefSharp.Avalonia target framework -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <Nullable>enable</Nullable>
+    <!-- Required for HWND interop (SetParent, GetWindowLong, etc.) -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Must use same Avalonia version as CefSharp.Avalonia -->
+    <PackageReference Include="Avalonia" Version="11.3.7" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.3.7" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.7" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.7" />
+    <PackageReference Include="Avalonia.Diagnostics" Version="11.3.7">
+      <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
+      <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <!-- Reference the BrowserView control project -->
+  <ItemGroup>
+    <ProjectReference Include="..\CefSharp.Avalonia\CefSharp.Avalonia.csproj" />
+  </ItemGroup>
+
+  <!-- Copy native CEF binaries from CefBrowser.Native build output -->
+  <Target Name="CopyNativeDeps" AfterTargets="Build">
+    <PropertyGroup>
+      <CefNativeDir>..\CefBrowser.Native\build\Release</CefNativeDir>
+    </PropertyGroup>
+    <ItemGroup>
+      <CefFiles Include="$(CefNativeDir)\*.*" Exclude="$(CefNativeDir)\*.obj;$(CefNativeDir)\*.pdb;$(CefNativeDir)\*.ilk;$(CefNativeDir)\*.exp;$(CefNativeDir)\*.lib" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CefFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+    <Message Text="Copied CEF native files from $(CefNativeDir) to $(OutputPath)" Importance="high" />
+  </Target>
+</Project>

@@ -1,0 +1,18 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="1024" d:DesignHeight="768"
+        x:Class="TestBrowserApp.MainWindow"
+        Title="TestBrowserApp"
+        Width="1024" Height="768">
+  <DockPanel>
+    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="6" Spacing="6">
+      <TextBox Name="UrlTextBox" Width="750"
+               Watermark="Enter URL and press Enter..."/>
+      <Button Name="GoButton" Content="Go" Width="60"/>
+      <Button Name="ReloadButton" Content="Reload" Width="70"/>
+    </StackPanel>
+    <Panel Name="BrowserContainer"/>
+  </DockPanel>
+</Window>

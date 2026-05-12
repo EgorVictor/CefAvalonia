@@ -4,7 +4,7 @@ VisualStudioVersion = 18.5.11723.231
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CefSharp.Avalonia", "CefSharp.Avalonia\CefSharp.Avalonia.csproj", "{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MemoryTest", "MemoryTest\MemoryTest.csproj", "{4788BF01-E7D9-4489-AF9D-0F7A76D22EA6}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TestBrowserApp", "TestBrowserApp\TestBrowserApp.csproj", "{B2C3D4E5-F6A7-8901-BCDE-F12345678901}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -16,10 +16,10 @@ Global
 		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Debug|AnyCPU.Build.0 = Debug|AnyCPU
 		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Release|AnyCPU.ActiveCfg = Release|AnyCPU
 		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Release|AnyCPU.Build.0 = Release|AnyCPU
-		{4788BF01-E7D9-4489-AF9D-0F7A76D22EA6}.Debug|AnyCPU.ActiveCfg = Debug|AnyCPU
-		{4788BF01-E7D9-4489-AF9D-0F7A76D22EA6}.Debug|AnyCPU.Build.0 = Debug|AnyCPU
-		{4788BF01-E7D9-4489-AF9D-0F7A76D22EA6}.Release|AnyCPU.ActiveCfg = Release|AnyCPU
-		{4788BF01-E7D9-4489-AF9D-0F7A76D22EA6}.Release|AnyCPU.Build.0 = Release|AnyCPU
+		{B2C3D4E5-F6A7-8901-BCDE-F12345678901}.Debug|AnyCPU.ActiveCfg = Debug|AnyCPU
+		{B2C3D4E5-F6A7-8901-BCDE-F12345678901}.Debug|AnyCPU.Build.0 = Debug|AnyCPU
+		{B2C3D4E5-F6A7-8901-BCDE-F12345678901}.Release|AnyCPU.ActiveCfg = Release|AnyCPU
+		{B2C3D4E5-F6A7-8901-BCDE-F12345678901}.Release|AnyCPU.Build.0 = Release|AnyCPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
