@@ -99,7 +99,10 @@ CefBrowser/
 │   ├── CefSharp.Avalonia.csproj
 │   ├── BrowserView.cs              # 可复用的 Avalonia UserControl
 │   ├── BrowserProcessManager.cs    # 子进程管理 + Named Pipe 客户端 + 消息调度
-│   └── ExternalBrowserProcessHost.cs # HWND 嵌入 (NativeControlHost)
+│   ├── ExternalBrowserProcessHost.cs # HWND 嵌入 (NativeControlHost)
+│   ├── CefSettings.cs              # CefSettings 镜像类
+│   ├── build/                      # NuGet 打包 MSBuild targets
+│   └── buildTransitive/
 │
 ├── TestBrowserApp/                 # 测试演示应用 (.NET 8)
 │   ├── TestBrowserApp.csproj
@@ -108,7 +111,9 @@ CefBrowser/
 │   ├── MainWindow.axaml / .cs      # 主窗口 (地址栏 + 浏览器)
 │   └── app.manifest                # Windows 兼容性清单
 │
-├── CefBrowser.sln                  # Visual Studio 解决方案
+├── .github/workflows/publish.yml   # GitHub Actions 自动发布
+├── package.ps1                     # 一键编译脚本
+├── pack.ps1                        # 打包 NuGet 脚本
 └── README.md                       # 本文件
 ```
 
@@ -125,9 +130,21 @@ CefBrowser/
 | .NET SDK | 8.0+ |
 | CEF Binary | 109.1.11（匹配 Chromium 109.0.5414.87） |
 
-### 1. 编译 CefBrowser.Native（原生 C++ 子进程）
+### 一键编译
 
-#### 下载 CEF 二进制分发包
+```powershell
+.\package.ps1            # Release (默认)
+.\package.ps1 -Debug     # Debug
+```
+
+此命令依次：
+1. 编译 `CefBrowser.Native`（CMake + Ninja）
+2. 编译 .NET 项目
+3. 打包为 `CefBrowser-Win7-x64.zip`
+
+### 分步编译
+
+#### 1. 下载 CEF 二进制分发包
 
 ```cmd
 # 下载地址（~200MB）：
@@ -137,54 +154,23 @@ CefBrowser/
 C:\cef\cef_binary_109.1.11+g6d4fdb2+chromium-109.0.5414.87_windows64\
 ```
 
-#### CMake 构建
+#### 2. 编译原生子进程
 
 ```cmd
 cd CefBrowser.Native
 
-cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   -DCEF_ROOT=C:/cef/cef_binary_109.1.11+g6d4fdb2+chromium-109.0.5414.87_windows64 ^
   -DCMAKE_MODULE_PATH=C:/cef/cef_binary_109.1.11+g6d4fdb2+chromium-109.0.5414.87_windows64/cmake
 
 cmake --build build --config Release
 ```
 
-编译产物：`CefBrowser.Native\build\Release\CefBrowser.Native.exe`
-
-#### 分发所需的配套文件
-
-除了 `CefBrowser.Native.exe`，还需要从 CEF 分发包中复制以下文件到同一目录：
-
-| 文件 |
-|------|
-| `libcef.dll` |
-| `chrome_elf.dll` |
-| `icudtl.dat` |
-| `snapshot_blob.bin` |
-| `v8_context_snapshot.bin` |
-| `d3dcompiler_47.dll` |
-| `libEGL.dll` |
-| `libGLESv2.dll` |
-| `*.pak` |
-| `locales/`（目录） |
-
-### 2. 编译 .NET 项目
+#### 3. 编译 .NET + 运行
 
 ```cmd
-dotnet restore
-dotnet build -c Release
-```
-
-`TestBrowserApp.csproj` 的 `CopyNativeDeps` Target 会自动从 `CefBrowser.Native\build\Release\` 复制原生文件到输出目录。
-
-### 3. 运行
-
-```cmd
-# 直接运行测试应用
-dotnet run --project TestBrowserApp -c Release
-
-# 或一键跳过浏览器（仅测试 UI）
-TestBrowserApp.exe --no-cef
+dotnet build TestBrowserApp -c Release
+.\TestBrowserApp\bin\Release\net8.0-windows\TestBrowserApp.exe
 ```
 
 ---
@@ -207,20 +193,18 @@ TestBrowserApp.exe --no-cef
 # 正常启动
 TestBrowserApp.exe
 
-# 启动后自动加载百度
-# 在地址栏输入 URL 按 Enter 即可跳转
+# 跳过浏览器（仅测试 UI）
+TestBrowserApp.exe --no-cef
 ```
 
 ### 代码结构
 
 - `MainWindow.xaml` — XAML 布局（地址栏、按钮、BrowserContainer 面板）
 - `MainWindow.xaml.cs` — 事件绑定（导航、刷新、状态同步）
-- `BrowserView` 控件以代码方式创建并添加到 `BrowserContainer`（跨项目 XAML 引用受限）
+- `BrowserView` 控件以代码方式创建并添加到 `BrowserContainer`
 
 ```csharp
-// 在代码中使用 BrowserView
 var browser = new BrowserView();
-browser.Url = "https://www.baidu.com";
 browser.AddressChanged += url => Console.WriteLine($"Navigated to: {url}");
 browser.TitleChanged += title => this.Title = title;
 container.Children.Add(browser);
@@ -233,12 +217,47 @@ await browser.StopAsync();
 
 ---
 
-## 集成到自有项目
+## NuGet 包
 
-### 1. 添加项目引用
+`CefSharp.Avalonia` 已发布到 nuget.org：
+
+```
+https://www.nuget.org/packages/CefSharp.Avalonia
+```
+
+### 安装
 
 ```xml
-<ProjectReference Include="..\CefSharp.Avalonia\CefSharp.Avalonia.csproj" />
+<PackageReference Include="CefSharp.Avalonia" Version="1.0.0" />
+```
+
+### 本地打包
+
+```powershell
+.\pack.ps1
+```
+
+输出：`artifacts\CefSharp.Avalonia.1.0.0.nupkg`
+
+### 自动发布
+
+推 tag 到 GitHub 自动触发 GitHub Actions：
+
+```cmd
+git tag v1.0.1
+git push --tags
+```
+
+工作流：下载 CEF → 构建原生 → dotnet pack → 推送到 nuget.org
+
+---
+
+## 集成到自有项目
+
+### 1. 安装 NuGet 包
+
+```xml
+<PackageReference Include="CefSharp.Avalonia" Version="1.0.0" />
 ```
 
 ### 2. 配置目标框架
@@ -254,10 +273,18 @@ await browser.StopAsync();
 
 ```xml
 <Window xmlns:cef="clr-namespace:CefSharp.Avalonia;assembly=CefSharp.Avalonia">
-  <cef:BrowserView Url="https://www.baidu.com" />
+  <cef:BrowserView />
 </Window>
 ```
 
-### 4. 部署依赖
+### 4. CefSettings 配置
 
-确保 `CefBrowser.Native\build\Release\` 下的所有原生文件与你的应用输出在一起的同一目录。
+可在代码中设置 CEF 初始化参数：
+
+```csharp
+var browser = new BrowserView();
+browser.CefSettings.NoSandbox = true;
+browser.CefSettings.Locale = "zh-CN";
+```
+
+所有 28 个 CEF 设置项通过 `--cef-*` 命令行参数序列化到原生进程。

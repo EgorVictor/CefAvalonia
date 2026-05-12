@@ -289,7 +289,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     // ---- Step 2: Read parameters (command line first, env var fallback) ----
     std::string pipeName;
-    std::string url = "https://www.bing.com";
+    std::string url = "about:blank";
     int hostPid = 0;
     bool standalone = HasArg(L"--standalone");
 

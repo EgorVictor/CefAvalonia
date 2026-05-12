@@ -23,7 +23,7 @@ public class BrowserView : UserControl
     private DateTime _pendingNavTime;
 
     public static readonly StyledProperty<string> UrlProperty =
-        AvaloniaProperty.Register<BrowserView, string>(nameof(Url), defaultValue: "https://www.baidu.com");
+        AvaloniaProperty.Register<BrowserView, string>(nameof(Url), defaultValue: "");
 
     /// <summary>Current URL. Setter normalizes (adds https://, www prefix).</summary>
     public string Url
@@ -197,22 +197,20 @@ public class BrowserView : UserControl
     /// <summary>
     /// Normalizes a user-entered URL: adds https:// if missing, prepends www. for bare domains.
     /// Recognizes file:// and local paths and converts them to file:/// URLs.
+    /// Returns empty string unchanged.
     /// </summary>
     private static string NormalizeUrl(string url)
     {
         url = url.Trim();
-        if (url.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
-            return url;
+        if (string.IsNullOrEmpty(url)) return url;
+        if (url.StartsWith("file://", StringComparison.OrdinalIgnoreCase)) return url;
         if (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
-            url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-            return url;
+            url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return url;
         // Local file path (e.g. C:\path or /path)
         if (url.Contains('\\') || url.Contains(":/") || url.StartsWith("/"))
         {
-            // Normalize backslashes and build file:/// URL
             url = url.Replace('\\', '/');
-            if (!url.StartsWith("/"))
-                url = "/" + url;
+            if (!url.StartsWith("/")) url = "/" + url;
             return "file://" + url;
         }
         url = "https://" + url;
