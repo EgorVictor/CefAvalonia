@@ -22,10 +22,8 @@
       <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
       <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
     </PackageReference>
+    <PackageReference Include="CefSharp.Avalonia" Version="1.0.0" />
   </ItemGroup>
 
   <!-- Use the NuGet package instead of project reference -->
-  <ItemGroup>
-    <PackageReference Include="CefSharp.Avalonia" Version="1.0.0" />
-  </ItemGroup>
 </Project>

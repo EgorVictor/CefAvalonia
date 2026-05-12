@@ -415,7 +415,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             [&](const std::string& cmd, const std::string& arg) {
                 if (cmd == "Navigate") {
                     std::string navUrl = arg;
-                    if (navUrl.find("http://") != 0 && navUrl.find("https://") != 0)
+                    if (navUrl.find("http://") != 0 && navUrl.find("https://") != 0
+                        && navUrl.find("file://") != 0)
                         navUrl = "https://" + navUrl;
                     PushCmd(CmdType::Navigate, navUrl);
                 } else if (cmd == "Reload") {

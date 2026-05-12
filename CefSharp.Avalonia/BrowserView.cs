@@ -196,12 +196,26 @@ public class BrowserView : UserControl
 
     /// <summary>
     /// Normalizes a user-entered URL: adds https:// if missing, prepends www. for bare domains.
+    /// Recognizes file:// and local paths and converts them to file:/// URLs.
     /// </summary>
     private static string NormalizeUrl(string url)
     {
         url = url.Trim();
-        if (!url.StartsWith("http://") && !url.StartsWith("https://"))
-            url = "https://" + url;
+        if (url.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+            return url;
+        if (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+            url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            return url;
+        // Local file path (e.g. C:\path or /path)
+        if (url.Contains('\\') || url.Contains(":/") || url.StartsWith("/"))
+        {
+            // Normalize backslashes and build file:/// URL
+            url = url.Replace('\\', '/');
+            if (!url.StartsWith("/"))
+                url = "/" + url;
+            return "file://" + url;
+        }
+        url = "https://" + url;
         try
         {
             var host = new Uri(url).Host;

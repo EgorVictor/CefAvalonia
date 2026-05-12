@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CEF Win7 测试页面</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+    }
+    .container {
+      background: rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(10px);
+      border-radius: 16px;
+      padding: 40px;
+      max-width: 600px;
+      width: 90%;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+    }
+    h1 { font-size: 28px; margin-bottom: 16px; text-align: center; }
+    .status {
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+      padding: 16px;
+      margin: 16px 0;
+    }
+    .status-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .status-item:last-child { border-bottom: none; }
+    .label { opacity: 0.8; }
+    .value { font-weight: bold; }
+    .ok { color: #4ade80; }
+    .test-btn {
+      display: block;
+      width: 100%;
+      padding: 12px;
+      margin-top: 16px;
+      background: rgba(255, 255, 255, 0.2);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      border-radius: 8px;
+      color: #fff;
+      font-size: 16px;
+      cursor: pointer;
+      transition: background 0.3s;
+    }
+    .test-btn:hover { background: rgba(255, 255, 255, 0.3); }
+    #log {
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 8px;
+      padding: 12px;
+      margin-top: 16px;
+      max-height: 150px;
+      overflow-y: auto;
+      font-family: "Consolas", "Courier New", monospace;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .canvas-test {
+      width: 100%;
+      height: 80px;
+      margin: 16px 0;
+      border-radius: 8px;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>CEF Win7 渲染测试</h1>
+
+    <div class="status">
+      <div class="status-item">
+        <span class="label">页面加载</span>
+        <span class="value ok" id="loadStatus">✅ 成功</span>
+      </div>
+      <div class="status-item">
+        <span class="label">JavaScript</span>
+        <span class="value ok" id="jsStatus">✅ 正常</span>
+      </div>
+      <div class="status-item">
+        <span class="label">CSS 渐变</span>
+        <span class="value ok">✅ 正常</span>
+      </div>
+      <div class="status-item">
+        <span class="label">渲染时间</span>
+        <span class="value" id="renderTime">-- ms</span>
+      </div>
+      <div class="status-item">
+        <span class="label">用户代理</span>
+        <span class="value" id="ua" style="font-size:11px; word-break:break-all;">--</span>
+      </div>
+    </div>
+
+    <canvas id="canvas" class="canvas-test" width="600" height="80"></canvas>
+
+    <button class="test-btn" onclick="runTests()">运行完整测试</button>
+
+    <div id="log">等待测试...</div>
+  </div>
+
+  <script>
+    const startTime = Date.now();
+
+    window.onload = function() {
+      const elapsed = Date.now() - startTime;
+      document.getElementById('renderTime').textContent = elapsed + ' ms';
+      document.getElementById('ua').textContent = navigator.userAgent;
+      document.title = 'CEF Win7 测试 - 渲染时间: ' + elapsed + 'ms';
+      log('页面加载完成: ' + elapsed + 'ms');
+      log('用户代理: ' + navigator.userAgent);
+    };
+
+    function log(msg) {
+      const el = document.getElementById('log');
+      const time = new Date().toLocaleTimeString();
+      el.innerHTML += '[' + time + '] ' + msg + '<br>';
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function drawCanvas() {
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width, h = canvas.height;
+
+      // 背景
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, w, h);
+
+      // 绘制彩虹渐变条
+      const colors = ['#ff0000', '#ff8800', '#ffff00', '#00ff00', '#0088ff', '#8800ff'];
+      const barH = h / colors.length;
+      colors.forEach(function(color, i) {
+        ctx.fillStyle = color;
+        ctx.fillRect(0, i * barH, w, barH);
+      });
+
+      // 绘制文字
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 24px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Canvas 渲染正常', w / 2, h / 2 + 8);
+
+      log('Canvas 2D 渲染测试通过');
+    }
+
+    function runTests() {
+      log('========== 开始测试 ==========');
+
+      drawCanvas();
+
+      // 测试 DOM 操作
+      try {
+        const div = document.createElement('div');
+        div.textContent = 'DOM 创建成功';
+        div.style.color = '#4ade80';
+        document.querySelector('.container').appendChild(div);
+        log('DOM 操作测试通过');
+      } catch (e) {
+        log('DOM 操作测试失败: ' + e.message);
+      }
+
+      // 测试 JSON
+      try {
+        const obj = JSON.parse('{"test": "ok", "num": 123}');
+        log('JSON 解析测试通过: ' + JSON.stringify(obj));
+      } catch (e) {
+        log('JSON 解析测试失败: ' + e.message);
+      }
+
+      // 测试定时器
+      let timerOk = false;
+      const t = setTimeout(function() {
+        timerOk = true;
+        log('setTimeout 测试通过');
+      }, 100);
+
+      // 测试本地存储
+      try {
+        localStorage.setItem('cef_test', 'ok');
+        const val = localStorage.getItem('cef_test');
+        log('localStorage 测试通过: ' + val);
+        localStorage.removeItem('cef_test');
+      } catch (e) {
+        log('localStorage 测试失败: ' + e.message);
+      }
+
+      // 测试 fetch (本地)
+      if (typeof fetch !== 'undefined') {
+        log('fetch API 可用');
+      } else {
+        log('fetch API 不可用');
+      }
+
+      // 测试 XMLHttpRequest
+      try {
+        const xhr = new XMLHttpRequest();
+        log('XMLHttpRequest 可用');
+      } catch (e) {
+        log('XMLHttpRequest 不可用: ' + e.message);
+      }
+
+      // 计算总结
+      setTimeout(function() {
+        const total = Date.now() - startTime;
+        log('========== 测试完成 ==========');
+        log('总耗时: ' + total + 'ms');
+        document.getElementById('renderTime').textContent = total + ' ms';
+      }, 200);
+    }
+
+    // 页面加载后自动运行
+    window.addEventListener('DOMContentLoaded', function() {
+      log('DOMContentLoaded 触发');
+    });
+  </script>
+</body>
+</html>
