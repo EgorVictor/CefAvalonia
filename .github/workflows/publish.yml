@@ -53,20 +53,30 @@ jobs:
       - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
 
-      - name: Set version (from tag or manual input)
+      - name: Set version
         shell: pwsh
         run: |
+          # Priority: manual input > git tag > csproj default
           $ver = "${{ github.event.inputs.version }}"
-          if (-not $ver) { $ver = "${{ github.ref_name }}" -replace '^v', '' }
-          if (-not $ver) { $ver = "1.0.0" }
-          Write-Host "Version=$ver"
-          "PACKAGE_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if ($ver) {
+            "PACKAGE_VERSION=$ver" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "Version from manual input: $ver"
+          } elseif ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}" -replace '^v', ''
+            "PACKAGE_VERSION=$tag" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "Version from tag: $tag"
+          } else {
+            # Branch push — keep existing csproj version, don't override
+            Write-Host "Branch push — using csproj version as-is"
+          }
 
-      - name: Update csproj version
+      - name: Update csproj version (tag/manual only)
+        if: env.PACKAGE_VERSION != ''
         shell: pwsh
         run: |
           $csproj = "CefSharp.Avalonia\CefSharp.Avalonia.csproj"
           (Get-Content $csproj) -replace '<Version>.*?</Version>', "<Version>$env:PACKAGE_VERSION</Version>" | Set-Content $csproj
+          Write-Host "Updated csproj version to $env:PACKAGE_VERSION"
 
       - name: CMake configure
         run: |
@@ -84,7 +94,8 @@ jobs:
       - name: Build .NET + Pack NuGet
         run: dotnet pack CefSharp.Avalonia\CefSharp.Avalonia.csproj -c Release -o artifacts
 
-      - name: Push to nuget.org
+      - name: Push to nuget.org (tags & manual only)
+        if: env.PACKAGE_VERSION != ''
         run: |
           dotnet nuget push artifacts\*.nupkg `
             --api-key "${{ secrets.NUGET_API_KEY }}" `
