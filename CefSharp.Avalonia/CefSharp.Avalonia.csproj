@@ -2,6 +2,9 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationManifest>app.manifest</ApplicationManifest>
@@ -18,4 +21,16 @@
       <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
     </PackageReference>
   </ItemGroup>
+
+  <Target Name="CopyCefBrowserNative" AfterTargets="Build">
+    <PropertyGroup>
+      <CefNativeDir>..\CefBrowser.Native\build\Release</CefNativeDir>
+      <CefTargetDir>$(OutputPath)</CefTargetDir>
+    </PropertyGroup>
+    <ItemGroup>
+      <CefBinFiles Include="$(CefNativeDir)\*.*" Exclude="$(CefNativeDir)\*.obj;$(CefNativeDir)\*.pdb;$(CefNativeDir)\*.ilk;$(CefNativeDir)\*.exp;$(CefNativeDir)\*.lib" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CefBinFiles)" DestinationFolder="$(CefTargetDir)" SkipUnchangedFiles="true" />
+    <Message Text="Copied CefBrowser.Native from Release to $(CefTargetDir)" Importance="high" />
+  </Target>
 </Project>

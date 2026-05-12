@@ -1,4 +1,0 @@
-<Solution>
-  <Project Path="CefSharp.Avalonia/CefSharp.Avalonia.csproj" />
-  <Project Path="CefSharpBrowser.WinForms/CefSharpBrowser.WinForms.csproj" />
-</Solution>

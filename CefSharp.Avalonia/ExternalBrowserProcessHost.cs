@@ -1,75 +1,79 @@
 using Avalonia.Controls;
 using Avalonia.Platform;
-using Avalonia.Threading;
 using System;
-using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using SWF = System.Windows.Forms;
 
 namespace CefSharp.Avalonia;
 
 public sealed class ExternalBrowserProcessHost : NativeControlHost
 {
-    private SWF.Panel? hostPanel;
+    private IntPtr hostPanelHwnd = IntPtr.Zero;
     private IntPtr embeddedHwnd = IntPtr.Zero;
 
     public bool IsEmbedded => embeddedHwnd != IntPtr.Zero;
 
     protected override IPlatformHandle CreateNativeControlCore(IPlatformHandle parent)
     {
-        hostPanel = new SWF.Panel();
-        hostPanel.CreateControl();
-
-        var style = GetWindowLong(hostPanel.Handle, GWL_STYLE);
-        style |= WS_CLIPCHILDREN;
-        SetWindowLong(hostPanel.Handle, GWL_STYLE, style);
-
-        return new PlatformHandle(hostPanel.Handle, "HWND");
+        hostPanelHwnd = parent.Handle;
+        Debug.WriteLine($"[EBPH] CreateNativeControlCore parent=0x{hostPanelHwnd.ToInt64():X}");
+        return new PlatformHandle(hostPanelHwnd, "HWND");
     }
 
     public void EmbedWindow(IntPtr childHwnd)
     {
-        if (hostPanel == null || hostPanel.IsDisposed) return;
+        if (hostPanelHwnd == IntPtr.Zero)
+        {
+            Debug.WriteLine($"[EBPH] EmbedWindow SKIP: no host panel");
+            return;
+        }
         embeddedHwnd = childHwnd;
+        Debug.WriteLine($"[EBPH] EmbedWindow child=0x{childHwnd.ToInt64():X8}, panel=0x{hostPanelHwnd.ToInt64():X8}");
 
-        Debug.WriteLine($"[EmbedWindow] child=0x{childHwnd.ToInt64():X}, panel=0x{hostPanel.Handle.ToInt64():X}, panelSize={hostPanel.Width}x{hostPanel.Height}");
-
-        SetParent(childHwnd, hostPanel.Handle);
-
+        // Step 1: Change style to WS_CHILD BEFORE reparenting
+        // This avoids the brief "popup" state where the window is a top-level window
+        // that has been reparented, which causes coordinate offset / black screen.
         var style = GetWindowLong(childHwnd, GWL_STYLE);
-        style |= WS_CHILD;
+        style &= ~WS_POPUP;
+        style |= WS_CHILD | WS_VISIBLE;
         SetWindowLong(childHwnd, GWL_STYLE, style);
+        Debug.WriteLine($"[EBPH] SetWindowLong(WS_CHILD|WS_VISIBLE) LastError={Marshal.GetLastWin32Error()}");
 
-        MoveWindow(childHwnd, 0, 0, hostPanel.Width, hostPanel.Height, true);
+        // Step 2: Reparent into the panel
+        var oldParent = SetParent(childHwnd, hostPanelHwnd);
+        Debug.WriteLine($"[EBPH] SetParent result=0x{oldParent.ToInt64():X8}, LastError={Marshal.GetLastWin32Error()}");
 
-        SetWindowLong(childHwnd, GWL_STYLE, style | WS_VISIBLE);
-        ShowWindow(childHwnd, SW_SHOW);
-    }
+        // Step 3: Force position/size to client-origin (0,0), no repaint needed
+        MoveWindow(childHwnd, 0, 0, (int)Bounds.Width, (int)Bounds.Height, false);
 
-    public void ResizeEmbedded()
-    {
-        if (hostPanel == null || embeddedHwnd == IntPtr.Zero) return;
-        Debug.WriteLine($"[ResizeEmbedded] panelSize={hostPanel.Width}x{hostPanel.Height}");
-        MoveWindow(embeddedHwnd, 0, 0, hostPanel.Width, hostPanel.Height, true);
+        // Step 4: Ensure correct Z-order within parent, show window
+        SetWindowPos(childHwnd, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+        // Step 5: Force immediate repaint of the parent area to eliminate black frames
+        RedrawWindow(hostPanelHwnd, IntPtr.Zero, IntPtr.Zero,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
     }
 
     protected override void DestroyNativeControlCore(IPlatformHandle control)
     {
         embeddedHwnd = IntPtr.Zero;
-        if (hostPanel != null && !hostPanel.IsDisposed)
-        {
-            hostPanel.Dispose();
-            hostPanel = null;
-        }
         base.DestroyNativeControlCore(control);
     }
 
     private const int GWL_STYLE = -16;
     private const uint WS_CHILD = 0x40000000;
+    private const uint WS_POPUP = 0x80000000;
     private const uint WS_VISIBLE = 0x10000000;
-    private const uint WS_CLIPCHILDREN = 0x02000000;
-    private const int SW_SHOW = 5;
+
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOACTIVATE = 0x0010;
+    private const uint SWP_SHOWWINDOW = 0x0040;
+
+    private const uint RDW_INVALIDATE = 0x0001;
+    private const uint RDW_UPDATENOW = 0x0100;
+    private const uint RDW_ALLCHILDREN = 0x0080;
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
@@ -81,8 +85,16 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
     private static extern uint SetWindowLong(IntPtr hWnd, int nIndex, uint dwNewLong);
 
     [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool MoveWindow(IntPtr hWnd, int x, int y, int nWidth, int nHeight, bool bRepaint);
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, [MarshalAs(UnmanagedType.Bool)] bool bRepaint);
 
     [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
+
+    private static readonly IntPtr HWND_TOP = new IntPtr(0);
 }
