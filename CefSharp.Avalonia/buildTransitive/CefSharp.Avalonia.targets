@@ -1,0 +1,26 @@
+<Project>
+  <!--
+    CefSharp.Avalonia.targets (transitive)
+
+    Same as build\CefSharp.Avalonia.targets but placed in buildTransitive\ so
+    that projects consuming a transitive dependency on CefSharp.Avalonia also
+    get the native binaries copied to their output directory.
+  -->
+
+  <PropertyGroup>
+    <_CefNativePackageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\nativeBinaries'))</_CefNativePackageDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <_CefNativeFile Include="$(_CefNativePackageDir)**\*" />
+  </ItemGroup>
+
+  <Target Name="CopyCefNativeBinaries" AfterTargets="Build" Inputs="@(_CefNativeFile)" Outputs="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')">
+    <Copy SourceFiles="@(_CefNativeFile)" DestinationFiles="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <Message Text="Copied CEF native binaries to $(OutDir)" Importance="high" />
+  </Target>
+
+  <Target Name="CleanCefNativeBinaries" AfterTargets="Clean">
+    <Delete Files="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')" Condition="Exists('%(Identity)')" />
+  </Target>
+</Project>

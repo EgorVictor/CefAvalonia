@@ -24,20 +24,8 @@
     </PackageReference>
   </ItemGroup>
 
-  <!-- Reference the BrowserView control project -->
+  <!-- Use the NuGet package instead of project reference -->
   <ItemGroup>
-    <ProjectReference Include="..\CefSharp.Avalonia\CefSharp.Avalonia.csproj" />
+    <PackageReference Include="CefSharp.Avalonia" Version="1.0.0" />
   </ItemGroup>
-
-  <!-- Copy native CEF binaries from CefBrowser.Native build output -->
-  <Target Name="CopyNativeDeps" AfterTargets="Build">
-    <PropertyGroup>
-      <CefNativeDir>..\CefBrowser.Native\build\Release</CefNativeDir>
-    </PropertyGroup>
-    <ItemGroup>
-      <CefFiles Include="$(CefNativeDir)\*.*" Exclude="$(CefNativeDir)\*.obj;$(CefNativeDir)\*.pdb;$(CefNativeDir)\*.ilk;$(CefNativeDir)\*.exp;$(CefNativeDir)\*.lib" />
-    </ItemGroup>
-    <Copy SourceFiles="@(CefFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
-    <Message Text="Copied CEF native files from $(CefNativeDir) to $(OutputPath)" Importance="high" />
-  </Target>
 </Project>

@@ -1,0 +1,91 @@
+name: Publish NuGet
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version (e.g., 1.0.1)'
+        required: true
+        type: string
+
+env:
+  DOTNET_VERSION: 8.0.x
+  CEF_VER: 109.1.11+g6d4fdb2+chromium-109.0.5414.87
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache CEF binaries
+        id: cache-cef
+        uses: actions/cache@v4
+        with:
+          path: C:\cef
+          key: cef-${{ env.CEF_VER }}
+
+      - name: Download & extract CEF
+        if: steps.cache-cef.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ver = "$env:CEF_VER"
+          $url = "https://cef-builds.spotifycdn.com/cef_binary_${ver}_windows64.tar.bz2"
+          New-Item C:\cef -ItemType Directory -Force
+          Write-Host "Downloading $url ..."
+          curl.exe -sL -o cef.tar.bz2 $url
+          tar -xf cef.tar.bz2 -C C:\cef
+          Remove-Item cef.tar.bz2
+          Write-Host "CEF extracted to C:\cef"
+
+      - name: Setup MSVC (VS 2022 v143)
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Set version (from tag or manual input)
+        shell: pwsh
+        run: |
+          $ver = "${{ github.event.inputs.version }}"
+          if (-not $ver) { $ver = "${{ github.ref_name }}" -replace '^v', '' }
+          if (-not $ver) { $ver = "1.0.0" }
+          Write-Host "Version=$ver"
+          "PACKAGE_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Update csproj version
+        shell: pwsh
+        run: |
+          $csproj = "CefSharp.Avalonia\CefSharp.Avalonia.csproj"
+          (Get-Content $csproj) -replace '<Version>.*?</Version>', "<Version>$env:PACKAGE_VERSION</Version>" | Set-Content $csproj
+
+      - name: CMake configure
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCEF_ROOT="C:/cef/cef_binary_${{ env.CEF_VER }}_windows64" `
+            -DCMAKE_MODULE_PATH="C:/cef/cef_binary_${{ env.CEF_VER }}_windows64/cmake"
+        working-directory: CefBrowser.Native
+
+      - name: Build native
+        run: cmake --build build --config Release
+        working-directory: CefBrowser.Native
+
+      # Note: CefBrowser.Native.exe must be built BEFORE the dotnet build,
+      # because the csproj's <Content> items reference ..\CefBrowser.Native\build\Release\*
+      - name: Build .NET + Pack NuGet
+        run: dotnet pack CefSharp.Avalonia\CefSharp.Avalonia.csproj -c Release -o artifacts
+
+      - name: Push to nuget.org
+        run: |
+          dotnet nuget push artifacts\*.nupkg `
+            --api-key "${{ secrets.NUGET_API_KEY }}" `
+            --source https://api.nuget.org/v3/index.json

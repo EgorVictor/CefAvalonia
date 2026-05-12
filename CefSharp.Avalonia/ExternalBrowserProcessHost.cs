@@ -6,11 +6,17 @@ using System.Runtime.InteropServices;
 
 namespace CefSharp.Avalonia;
 
+/// <summary>
+/// HWND interop host: embeds a foreign window (CEF browser HWND) into an Avalonia panel via
+/// SetParent with proper style flags (WS_CHILD) to avoid popup flash and coordinate issues.
+/// Uses NativeControlHost to obtain a native HWND from the Avalonia layout engine.
+/// </summary>
 public sealed class ExternalBrowserProcessHost : NativeControlHost
 {
     private IntPtr hostPanelHwnd = IntPtr.Zero;
     private IntPtr embeddedHwnd = IntPtr.Zero;
 
+    /// <summary>True once EmbedWindow has been called successfully.</summary>
     public bool IsEmbedded => embeddedHwnd != IntPtr.Zero;
 
     protected override IPlatformHandle CreateNativeControlCore(IPlatformHandle parent)

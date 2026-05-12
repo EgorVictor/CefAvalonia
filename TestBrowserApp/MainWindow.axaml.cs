@@ -25,7 +25,7 @@ public partial class MainWindow : Window
         // Create BrowserView in code (cross-project XAML not supported)
         browserControl = new BrowserView();
         container.Children.Add(browserControl);
-
+        
         browserControl.AddressChanged += url => Dispatcher.UIThread.Post(() => urlTextBox.Text = url);
         browserControl.TitleChanged += title => Dispatcher.UIThread.Post(() => Title = title);
         browserControl.LoadingStateChanged += loading => Dispatcher.UIThread.Post(() => goButton.IsEnabled = !loading);

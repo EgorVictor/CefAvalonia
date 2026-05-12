@@ -8,6 +8,11 @@ using System.Threading.Tasks;
 
 namespace CefSharp.Avalonia;
 
+/// <summary>
+/// Manages the CefBrowser.Native.exe subprocess lifecycle and Named Pipe IPC.
+/// Commands flow C#→C++ via _sendChannel→writer thread; events flow C++→C# via reader→_recvChannel→dispatch.
+/// Bounded channels (DropOldest) prevent unbounded memory growth when the pipe is backed up.
+/// </summary>
 public sealed class BrowserProcessManager : IDisposable
 {
     private readonly string pipeName;
@@ -19,8 +24,8 @@ public sealed class BrowserProcessManager : IDisposable
     private string? lastUrl;
     public string? LastUrl => lastUrl;
     private bool disposed;
-    // Bounded channels with DropOldest prevent unbounded memory growth.
-    // If the pipe is slow, stale messages are dropped instead of piling up.
+
+    // Bounded channels with DropOldest: if the pipe is slow, stale messages drop instead of piling up.
     private static BoundedChannelOptions BufOpts() => new(256) {
         SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest
     };
@@ -29,11 +34,17 @@ public sealed class BrowserProcessManager : IDisposable
     private readonly Channel<string> _recvChannel = Channel.CreateBounded<string>(BufOpts());
     private Task? _recvTask;
 
+    /// <summary>Raised on AddressChanged event from native process.</summary>
     public event Action<string>? AddressChanged;
+    /// <summary>Raised on page load error. Arg: "code|text|url".</summary>
     public event Action<string>? LoadError;
+    /// <summary>Raised when the native process exits unexpectedly.</summary>
     public event Action? BrowserCrashed;
+    /// <summary>Raised on Ready event with the CEF browser HWND (hex string).</summary>
     public event Action<IntPtr>? WindowHandleReceived;
+    /// <summary>Raised on NavState event. Bool = isLoading.</summary>
     public event Action<bool>? LoadingStateChanged;
+    /// <summary>Raised on TitleChanged event from native process.</summary>
     public event Action<string>? TitleChanged;
 
     public BrowserProcessManager()
@@ -42,6 +53,10 @@ public sealed class BrowserProcessManager : IDisposable
         exePath = ResolveExePath();
     }
 
+    /// <summary>
+    /// Locates CefBrowser.Native.exe: first alongside the managed assembly, then walks up 5 dir levels
+    /// looking for CefBrowser.Native\build\Release\ (useful during development).
+    /// </summary>
     private static string ResolveExePath()
     {
         var name = "CefBrowser.Native.exe";
@@ -60,15 +75,19 @@ public sealed class BrowserProcessManager : IDisposable
         return local;
     }
 
-    public async Task StartAsync(string url, string[]? cefArgs = null)
+    /// <summary>
+    /// Launches CefBrowser.Native.exe with pipe/url/pid arguments and CefSettings serialized as --cef-* args.
+    /// Waits for the named pipe connection (retries up to 15s).
+    /// </summary>
+    public async Task StartAsync(string url, CefSettings? settings = null)
     {
         lastUrl = url;
 
-        var extra = cefArgs != null ? " " + string.Join(" ", cefArgs) : "";
+        var settingsArgs = settings?.ToCommandLineArgs() ?? "";
         var psi = new ProcessStartInfo
         {
             FileName = exePath,
-            Arguments = $"--cef-pipe={pipeName} --cef-url={url} --cef-host-pid={Environment.ProcessId}{extra}",
+            Arguments = $"--cef-pipe={pipeName} --cef-url={url} --cef-host-pid={Environment.ProcessId}{settingsArgs}",
             WorkingDirectory = AppContext.BaseDirectory,
             UseShellExecute = false,
             CreateNoWindow = true
@@ -81,7 +100,6 @@ public sealed class BrowserProcessManager : IDisposable
         if (browserProcess == null)
             throw new InvalidOperationException("Failed to start browser process");
 
-        // Subscribe to process exit for crash detection
         browserProcess.EnableRaisingEvents = true;
         browserProcess.Exited += (_, _) =>
         {
@@ -92,6 +110,11 @@ public sealed class BrowserProcessManager : IDisposable
         await ConnectPipeAsync();
     }
 
+    /// <summary>
+    /// Connects to the named pipe created by CefBrowser.Native.exe.
+    /// Starts the writer/reader/dispatch background tasks once connected.
+    /// Retries every 500ms for up to 15s (the native process needs time to create CEF browser + pipe).
+    /// </summary>
     private async Task ConnectPipeAsync()
     {
         for (int i = 0; i < 30; i++)
@@ -119,6 +142,10 @@ public sealed class BrowserProcessManager : IDisposable
         throw new TimeoutException("Failed to connect to browser process via named pipe");
     }
 
+    /// <summary>
+    /// Background writer: reads from _sendChannel and writes to the pipe.
+    /// All SendAsync calls are non-blocking — they enqueue to the channel.
+    /// </summary>
     private async Task RunWriterAsync()
     {
         try
@@ -133,6 +160,10 @@ public sealed class BrowserProcessManager : IDisposable
         catch (ObjectDisposedException) { }
     }
 
+    /// <summary>
+    /// Background reader: reads lines from the pipe and enqueues to _recvChannel.
+    /// When the pipe breaks (process exit), fires BrowserCrashed unless disposed.
+    /// </summary>
     private async Task ReadPipeLoopAsync()
     {
         try
@@ -151,6 +182,10 @@ public sealed class BrowserProcessManager : IDisposable
             BrowserCrashed?.Invoke();
     }
 
+    /// <summary>
+    /// Background dispatcher: reads from _recvChannel and calls DispatchPipeMessage.
+    /// Separate from ReadPipeLoopAsync so deserialization doesn't block pipe I/O.
+    /// </summary>
     private async Task ProcessRecvChannelAsync()
     {
         try
@@ -161,6 +196,10 @@ public sealed class BrowserProcessManager : IDisposable
         catch { }
     }
 
+    /// <summary>
+    /// Parses a pipe message line ("Cmd|arg") and fires the corresponding event.
+    /// Supported commands: Ready, AddressChanged, LoadError, NavState, TitleChanged.
+    /// </summary>
     private void DispatchPipeMessage(string line)
     {
         var sep = line.IndexOf('|');
@@ -196,17 +235,26 @@ public sealed class BrowserProcessManager : IDisposable
         catch { }
     }
 
+    /// <summary>Send Navigate command to the native process.</summary>
     public Task NavigateAsync(string url)
     {
         lastUrl = url;
         return SendAsync("Navigate", url);
     }
 
+    /// <summary>Send Reload command.</summary>
     public Task ReloadAsync() => SendAsync("Reload", "");
+    /// <summary>Send Stop command.</summary>
     public Task StopAsync() => SendAsync("Stop", "");
+    /// <summary>Notify native process that HWND embedding is complete (shows the browser window).</summary>
     public Task SendEmbedDoneAsync() => SendAsync("EmbedDone", "");
+    /// <summary>Send resize notification to the native process.</summary>
     public Task SendResizeAsync(int w, int h) => SendAsync("Resize", $"{w}|{h}");
 
+    /// <summary>
+    /// Enqueue a command to the send channel. Non-blocking: the background writer thread
+    /// handles actual pipe I/O. If the channel is full, the oldest pending message is dropped.
+    /// </summary>
     private Task SendAsync(string cmd, string arg)
     {
         if (writer == null)
@@ -215,6 +263,10 @@ public sealed class BrowserProcessManager : IDisposable
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Forcefully terminates the native process and cleans up pipe resources.
+    /// Channels are completed so background tasks exit cleanly.
+    /// </summary>
     private void Kill()
     {
         _sendChannel.Writer.TryComplete();
@@ -224,10 +276,10 @@ public sealed class BrowserProcessManager : IDisposable
         {
             try
             {
-                    if (!browserProcess.HasExited)
-                        browserProcess.Kill();
+                if (!browserProcess.HasExited)
+                    browserProcess.Kill();
             }
-            catch (Exception ex)
+            catch
             {
             }
             browserProcess.Dispose();

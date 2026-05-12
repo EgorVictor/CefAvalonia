@@ -1,0 +1,33 @@
+<Project>
+  <!--
+    CefSharp.Avalonia.targets
+
+    Copies native CEF binaries and CefBrowser.Native.exe to the consuming
+    project's output directory at build time.  These files live inside the
+    NuGet package under nativeBinaries/ and are deployed alongside the managed
+    assembly so that CefBrowser.Native can be spawned as a subprocess.
+  -->
+
+  <PropertyGroup>
+    <!-- 
+      Path to the native binaries within the installed package.
+      MSBuildThisFileDirectory resolves to {packageRoot}\build\,
+      so ..\nativeBinaries\ points to {packageRoot}\nativeBinaries\.
+    -->
+    <_CefNativePackageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\nativeBinaries'))</_CefNativePackageDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <_CefNativeFile Include="$(_CefNativePackageDir)**\*" />
+  </ItemGroup>
+
+  <Target Name="CopyCefNativeBinaries" AfterTargets="Build" Inputs="@(_CefNativeFile)" Outputs="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')">
+    <Copy SourceFiles="@(_CefNativeFile)" DestinationFiles="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <Message Text="Copied CEF native binaries to $(OutDir)" Importance="high" />
+  </Target>
+
+  <!-- Clean up copied files -->
+  <Target Name="CleanCefNativeBinaries" AfterTargets="Clean">
+    <Delete Files="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')" Condition="Exists('%(Identity)')" />
+  </Target>
+</Project>

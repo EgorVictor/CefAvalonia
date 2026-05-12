@@ -6,11 +6,40 @@
     <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
+
+    <!-- NuGet package metadata -->
+    <PackageId>CefSharp.Avalonia</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>CefBrowser</Authors>
+    <Description>Avalonia CefBrowser wrapper control. Embeds a CEF (Chromium Embedded Framework) browser as an Avalonia control via named-pipe IPC.</Description>
+    <PackageTags>avalonia;cef;chromium;browser;webview</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/EgorVictor/CefAvalonia</PackageProjectUrl>
+    <IsPackable>true</IsPackable>
+    <IncludeBuildOutput>true</IncludeBuildOutput>
+    <NoDefaultExcludes>true</NoDefaultExcludes>
+    <NoWarn>NU5100</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="11.3.7" />
     <PackageReference Include="Avalonia.Desktop" Version="11.3.7" />
+  </ItemGroup>
+
+  <!-- Include build targets in the NuGet package -->
+  <ItemGroup>
+    <Content Include="build\*" Pack="true" PackagePath="build\" />
+    <Content Include="buildTransitive\*" Pack="true" PackagePath="buildTransitive\" />
+  </ItemGroup>
+
+  <!-- Native binary files to include in the NuGet package -->
+  <ItemGroup>
+    <Content Include="..\CefBrowser.Native\build\Release\*.*" Exclude="..\CefBrowser.Native\build\Release\*.ilk;..\CefBrowser.Native\build\Release\*.obj;..\CefBrowser.Native\build\Release\*.pdb;..\CefBrowser.Native\build\Release\*.exp;..\CefBrowser.Native\build\Release\*.lib" Pack="true" PackagePath="nativeBinaries\%(Filename)%(Extension)">
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="..\CefBrowser.Native\build\Release\locales\*.*" Pack="true" PackagePath="nativeBinaries\locales\%(Filename)%(Extension)">
+      <Visible>false</Visible>
+    </Content>
   </ItemGroup>
 
   <Target Name="CopyCefBrowserNative" AfterTargets="Build">
@@ -21,6 +50,11 @@
       <CefBinFiles Include="$(CefNativeDir)\*.*" Exclude="$(CefNativeDir)\*.obj;$(CefNativeDir)\*.pdb;$(CefNativeDir)\*.ilk;$(CefNativeDir)\*.exp;$(CefNativeDir)\*.lib" />
     </ItemGroup>
     <Copy SourceFiles="@(CefBinFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+    <!-- Copy locales directory recursively -->
+    <ItemGroup>
+      <CefLocales Include="$(CefNativeDir)\locales\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CefLocales)" DestinationFolder="$(OutputPath)\locales\" SkipUnchangedFiles="true" />
     <Message Text="Copied CefBrowser.Native from Release to $(OutputPath)" Importance="high" />
   </Target>
 </Project>

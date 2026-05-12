@@ -121,11 +121,11 @@ void PipeServer::ThreadProc(PipeCommandCallback onCommand,
         if (cmd == "Resize") {
             auto p = arg.find('|');
             if (p != std::string::npos) {
-                try {
-                    int w = std::stoi(arg.substr(0, p));
-                    int h = std::stoi(arg.substr(p + 1));
+                {
+                    int w = atoi(arg.substr(0, p).c_str());
+                    int h = atoi(arg.substr(p + 1).c_str());
                     if (w > 0 && h > 0 && onResize) onResize(w, h);
-                } catch (...) { }
+                }
             }
         } else {
             if (onCommand) onCommand(cmd, arg);

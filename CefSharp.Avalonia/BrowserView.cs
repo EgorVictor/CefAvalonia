@@ -7,17 +7,25 @@ using System.Threading.Tasks;
 
 namespace CefSharp.Avalonia;
 
+/// <summary>
+/// Avalonia UserControl that embeds a CEF browser instance via HWND interop.
+/// Uses ExternalBrowserProcessHost (NativeControlHost) + BrowserProcessManager (IPC).
+/// Lifecycle: OnAttachedToVisualTree → StartAsync → CefBrowser.Native.exe → Embed → events
+/// </summary>
 public class BrowserView : UserControl
 {
     private readonly ExternalBrowserProcessHost _browserHost = new();
     private BrowserProcessManager? _manager;
     private CancellationTokenSource? _resizeCts;
+
+    // Debounce stale AddressChanged events from intermediate redirects
     private string? _pendingNavUrl;
     private DateTime _pendingNavTime;
 
     public static readonly StyledProperty<string> UrlProperty =
         AvaloniaProperty.Register<BrowserView, string>(nameof(Url), defaultValue: "https://www.baidu.com");
 
+    /// <summary>Current URL. Setter normalizes (adds https://, www prefix).</summary>
     public string Url
     {
         get => GetValue(UrlProperty);
@@ -29,6 +37,7 @@ public class BrowserView : UserControl
         AvaloniaProperty.RegisterDirect<BrowserView, string>(nameof(Title),
             o => o.Title);
 
+    /// <summary>Browser tab title synced from CEF's OnTitleChange.</summary>
     public string Title
     {
         get => _title;
@@ -40,6 +49,7 @@ public class BrowserView : UserControl
         AvaloniaProperty.RegisterDirect<BrowserView, bool>(nameof(IsLoading),
             o => o.IsLoading);
 
+    /// <summary>Whether the browser is currently loading a page.</summary>
     public bool IsLoading
     {
         get => _isLoading;
@@ -47,16 +57,20 @@ public class BrowserView : UserControl
     }
 
     /// <summary>
-    /// Additional CEF command-line switches passed to the native subprocess.
-    /// Default: --disable-gpu --no-sandbox
+    /// CEF initialization settings mapped from CefSettings in CEF's cef_types.h.
     /// Set before BrowserView is attached to the visual tree.
     /// </summary>
-    public string[] CefArgs { get; set; } = { "--disable-gpu", "--no-sandbox" };
+    public CefSettings CefSettings { get; set; } = new() { NoSandbox = true };
 
+    /// <summary>Raised when the browser navigates to a new URL.</summary>
     public event Action<string>? AddressChanged;
+    /// <summary>Raised when the page title changes.</summary>
     public event Action<string>? TitleChanged;
+    /// <summary>Raised when loading state changes (true = loading, false = done).</summary>
     public event Action<bool>? LoadingStateChanged;
+    /// <summary>Raised when the native browser process exits unexpectedly.</summary>
     public event Action? BrowserCrashed;
+    /// <summary>Raised when a page load error occurs. Parameter: "code|text|url".</summary>
     public event Action<string>? LoadError;
 
     public BrowserView()
@@ -64,6 +78,10 @@ public class BrowserView : UserControl
         Content = _browserHost;
     }
 
+    /// <summary>
+    /// Lifecycle start: launches CefBrowser.Native.exe when this control is attached to the visual tree.
+    /// Skip with --no-cef command-line flag for UI-only testing.
+    /// </summary>
     protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
     {
         base.OnAttachedToVisualTree(e);
@@ -74,6 +92,9 @@ public class BrowserView : UserControl
         StartBrowser();
     }
 
+    /// <summary>
+    /// Lifecycle end: dispose the native process and pipe when control is removed.
+    /// </summary>
     protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
     {
         base.OnDetachedFromVisualTree(e);
@@ -90,6 +111,10 @@ public class BrowserView : UserControl
         _ = StartAsync();
     }
 
+    /// <summary>
+    /// Wires BrowserProcessManager events to UI thread and BrowserView properties.
+    /// AddressChanged filters out stale intermediate-redirect hosts within 3s of a pending navigation.
+    /// </summary>
     private void WireManagerEvents()
     {
         if (_manager == null) return;
@@ -134,6 +159,7 @@ public class BrowserView : UserControl
             });
         };
 
+        // On Ready event: embed the CEF browser HWND, then signal embed done + push initial size
         _manager.WindowHandleReceived += hwnd =>
         {
             Dispatcher.UIThread.Post(async () =>
@@ -155,16 +181,22 @@ public class BrowserView : UserControl
         };
     }
 
+    /// <summary>
+    /// Launches the native process with configured CefSettings.
+    /// </summary>
     private async Task StartAsync()
     {
         if (_manager == null) return;
         try
         {
-            await _manager.StartAsync(Url, CefArgs);
+            await _manager.StartAsync(Url, CefSettings);
         }
         catch { }
     }
 
+    /// <summary>
+    /// Normalizes a user-entered URL: adds https:// if missing, prepends www. for bare domains.
+    /// </summary>
     private static string NormalizeUrl(string url)
     {
         url = url.Trim();
@@ -180,6 +212,10 @@ public class BrowserView : UserControl
         return url;
     }
 
+    /// <summary>
+    /// Navigate to a URL. If the native process hasn't started yet, starts it first.
+    /// Immediately sets Url + fires AddressChanged for optimistic UI, then delegates to IPC.
+    /// </summary>
     public async Task NavigateAsync(string url)
     {
         url = NormalizeUrl(url);
@@ -198,9 +234,15 @@ public class BrowserView : UserControl
         await _manager.NavigateAsync(url);
     }
 
+    /// <summary>Reload the current page.</summary>
     public Task ReloadAsync() => _manager?.ReloadAsync() ?? Task.CompletedTask;
+    /// <summary>Stop the current page load.</summary>
     public Task StopAsync() => _manager?.StopAsync() ?? Task.CompletedTask;
 
+    /// <summary>
+    /// Debounced resize: when Bounds changes, wait 15ms then send Resize via IPC.
+    /// Cancels previous pending resize to avoid flooding the pipe during window dragging.
+    /// </summary>
     protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
     {
         base.OnPropertyChanged(change);

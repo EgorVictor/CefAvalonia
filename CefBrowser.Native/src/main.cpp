@@ -1,4 +1,14 @@
-﻿#include "browser_handler.h"
+﻿// CefBrowser.Native — CEF subprocess + browser host
+// Architecture:
+//   WinMain → CefExecuteProcess (subprocess) | CefInitialize (main process)
+//   Main process: creates hidden CEF browser, hosts named pipe server,
+//   pumps messages, dispatches commands/events between C# (pipe client) and CEF.
+// IPC protocol (pipe messages):
+//   C#→Native: Navigate|url, Reload, Stop, Close, EmbedDone, Resize|w|h
+//   Native→C#: Ready|HWND_HEX, AddressChanged|url, LoadError|code|text|url,
+//              NavState|isLoading|canGoBack|canGoForward, TitleChanged|title
+
+#include "browser_handler.h"
 #include "pipe_server.h"
 #include "include/cef_app.h"
 #include "include/cef_browser.h"
@@ -12,10 +22,11 @@
 #include <Windows.h>
 #include <shellapi.h>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <queue>
 #include <mutex>
-#include <chrono>
+
 
 // ---- Forward declarations ----
 static bool HasArg(LPCWSTR arg);
@@ -36,7 +47,7 @@ static const wchar_t kHiddenClass[] = L"CefHidden_{B3A0B1C2}";
 
 // ---- Navigation host tracking (filter stale OnAddressChange) ----
 static std::string g_lastNavigateHost;
-static std::chrono::steady_clock::time_point g_lastNavTime;
+static ULONGLONG g_lastNavTick = 0;  // GetTickCount64, Win7+
 
 static std::string GetHost(const std::string& url) {
     size_t start = url.find("://");
@@ -128,6 +139,70 @@ static std::string GetEnv(const char* name) {
     return val ? std::string(val) : std::string();
 }
 
+static void ApplyCefSettingsFromArgs(CefSettings& settings) {
+    auto setStr = [](CefSettings& s, const char* cefKey, cef_string_t& field) {
+        std::string val = GetArgValue(cefKey);
+        if (!val.empty()) CefString(&field).FromString(val);
+    };
+    auto setBool = [](const char* cefKey) -> int {
+        std::string val = GetArgValue(cefKey);
+        return (!val.empty() && (val == "true" || val == "1")) ? 1 : -1;
+    };
+
+    int b;
+    if ((b = setBool("--cef-no-sandbox")) >= 0) settings.no_sandbox = b;
+    setStr(settings, "--cef-browser-subprocess-path", settings.browser_subprocess_path);
+    setStr(settings, "--cef-framework-dir-path", settings.framework_dir_path);
+    setStr(settings, "--cef-main-bundle-path", settings.main_bundle_path);
+    if ((b = setBool("--cef-chrome-runtime")) >= 0) settings.chrome_runtime = b;
+    if ((b = setBool("--cef-multi-threaded-message-loop")) >= 0) settings.multi_threaded_message_loop = b;
+    if ((b = setBool("--cef-external-message-pump")) >= 0) settings.external_message_pump = b;
+    if ((b = setBool("--cef-windowless-rendering-enabled")) >= 0) settings.windowless_rendering_enabled = b;
+    if ((b = setBool("--cef-command-line-args-disabled")) >= 0) settings.command_line_args_disabled = b;
+    setStr(settings, "--cef-cache-path", settings.cache_path);
+    setStr(settings, "--cef-root-cache-path", settings.root_cache_path);
+    setStr(settings, "--cef-user-data-path", settings.user_data_path);
+    if ((b = setBool("--cef-persist-session-cookies")) >= 0) settings.persist_session_cookies = b;
+    if ((b = setBool("--cef-persist-user-preferences")) >= 0) settings.persist_user_preferences = b;
+    setStr(settings, "--cef-user-agent", settings.user_agent);
+    setStr(settings, "--cef-user-agent-product", settings.user_agent_product);
+    setStr(settings, "--cef-locale", settings.locale);
+    setStr(settings, "--cef-log-file", settings.log_file);
+
+    std::string ls = GetArgValue("--cef-log-severity");
+    if (!ls.empty()) {
+        if (ls == "verbose") settings.log_severity = LOGSEVERITY_VERBOSE;
+        else if (ls == "info") settings.log_severity = LOGSEVERITY_INFO;
+        else if (ls == "warning") settings.log_severity = LOGSEVERITY_WARNING;
+        else if (ls == "error") settings.log_severity = LOGSEVERITY_ERROR;
+        else if (ls == "fatal") settings.log_severity = LOGSEVERITY_FATAL;
+        else if (ls == "disable") settings.log_severity = LOGSEVERITY_DISABLE;
+        else if (ls == "default") settings.log_severity = LOGSEVERITY_DEFAULT;
+    }
+
+    setStr(settings, "--cef-javascript-flags", settings.javascript_flags);
+    setStr(settings, "--cef-resources-dir-path", settings.resources_dir_path);
+    setStr(settings, "--cef-locales-dir-path", settings.locales_dir_path);
+    if ((b = setBool("--cef-pack-loading-disabled")) >= 0) settings.pack_loading_disabled = b;
+
+    std::string rdp = GetArgValue("--cef-remote-debugging-port");
+    if (!rdp.empty()) settings.remote_debugging_port = atoi(rdp.c_str());
+
+    std::string ues = GetArgValue("--cef-uncaught-exception-stack-size");
+    if (!ues.empty()) settings.uncaught_exception_stack_size = atoi(ues.c_str());
+
+    std::string bc = GetArgValue("--cef-background-color");
+    if (!bc.empty()) {
+        unsigned long color = 0;
+        sscanf_s(bc.c_str(), "%lx", &color);
+        settings.background_color = (cef_color_t)color;
+    }
+
+    setStr(settings, "--cef-accept-language-list", settings.accept_language_list);
+    setStr(settings, "--cef-cookieable-schemes-list", settings.cookieable_schemes_list);
+    if ((b = setBool("--cef-cookieable-schemes-exclude-defaults")) >= 0) settings.cookieable_schemes_exclude_defaults = b;
+}
+
 static void StripTypeFromCommandLine() {
     LPWSTR cmd = GetCommandLineW();
     std::wstring wcmd(cmd);
@@ -170,7 +245,7 @@ static void ExecuteCmd(const Cmd& c) {
     switch (c.type) {
         case CmdType::Navigate:
             g_lastNavigateHost = GetHost(c.arg);
-            g_lastNavTime = std::chrono::steady_clock::now();
+            g_lastNavTick = GetTickCount64();
             CefPostTask(TID_UI, base::BindOnce(&DoNavigate, c.arg));
             break;
         case CmdType::Reload:
@@ -224,11 +299,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     if (!cliPipe.empty()) pipeName = cliPipe;
     if (!cliUrl.empty())  url      = cliUrl;
-    if (!cliHost.empty()) { try { hostPid = std::stoi(cliHost); } catch (...) {} }
+    if (!cliHost.empty()) { hostPid = atoi(cliHost.c_str()); }
 
     if (pipeName.empty()) pipeName = GetEnv("CEF_PIPE");
     if (url == "https://www.bing.com") { std::string e = GetEnv("CEF_URL"); if (!e.empty()) url = e; }
-    if (hostPid == 0) { std::string e = GetEnv("CEF_HOST_PID"); if (!e.empty()) { try { hostPid = std::stoi(e); } catch (...) {} } }
+    if (hostPid == 0) { std::string e = GetEnv("CEF_HOST_PID"); if (!e.empty()) { hostPid = atoi(e.c_str()); } }
 
     // ---- Step 3: Events ----
     g_browserReadyEvent  = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -256,6 +331,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     if (sep) strcpy_s(sep + 1, MAX_PATH - (sep - exePath), "cache");
     CefString(&settings.cache_path) = exePath;
 
+    ApplyCefSettingsFromArgs(settings);
+
     if (!CefInitialize(mainArgs, settings, nullptr, nullptr))
         return 1;
 
@@ -271,8 +348,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     };
     g_handler->OnAddressChanged = [](const std::string& u) {
         if (!g_lastNavigateHost.empty()) {
-            auto elapsed = std::chrono::steady_clock::now() - g_lastNavTime;
-            if (elapsed < std::chrono::seconds(5)) {
+            if (GetTickCount64() - g_lastNavTick < 5000) {
                 std::string host = GetHost(u);
                 bool matches = (host.find(g_lastNavigateHost) != std::string::npos ||
                                 g_lastNavigateHost.find(host) != std::string::npos);
