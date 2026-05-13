@@ -22,8 +22,12 @@
       <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
       <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="CefSharp.Avalonia" Version="1.0.0" />
   </ItemGroup>
 
-  <!-- Use the NuGet package instead of project reference -->
+  <!-- Local project reference for testing (switch to PackageReference when using NuGet) -->
+  <ItemGroup>
+    <ProjectReference Include="..\CefSharp.Avalonia\CefSharp.Avalonia.csproj" />
+  </ItemGroup>
+
+  <!-- Native files are copied by CefSharp.Avalonia's built-in build target -->
 </Project>

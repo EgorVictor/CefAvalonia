@@ -32,6 +32,9 @@ bld/
 build/
 out/
 
+## Logs
+*.log
+
 ## CEF runtime
 cache/
 DawnCache/

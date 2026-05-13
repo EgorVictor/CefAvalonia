@@ -28,6 +28,19 @@
 #include <mutex>
 
 
+// ---- Logger ----
+static void Log(const char* msg) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char buf[512];
+    int n = sprintf_s(buf, "[CefBrowser] %02d:%02d:%02d.%03d %s\n",
+                      st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+    OutputDebugStringA(buf);
+    static FILE* f = nullptr;
+    if (!f) fopen_s(&f, "cef_browser_debug.log", "a");
+    if (f) { fwrite(buf, 1, n, f); fflush(f); }
+}
+
 // ---- Forward declarations ----
 static bool HasArg(LPCWSTR arg);
 static std::string GetArgValue(const std::string& key);
@@ -48,6 +61,47 @@ static const wchar_t kHiddenClass[] = L"CefHidden_{B3A0B1C2}";
 // ---- Navigation host tracking (filter stale OnAddressChange) ----
 static std::string g_lastNavigateHost;
 static ULONGLONG g_lastNavTick = 0;  // GetTickCount64, Win7+
+
+// ---- URL normalization (all browser logic in C++) ----
+static std::string NormalizeUrl(const std::string& input) {
+    std::string url = input;
+    size_t s = url.find_first_not_of(" \t\r\n");
+    if (s == std::string::npos) return {};
+    size_t e = url.find_last_not_of(" \t\r\n");
+    url = url.substr(s, e - s + 1);
+    if (url.empty()) return {};
+    if (url.find("file://") == 0 || url.find("about:") == 0 ||
+        url.find("http://") == 0 || url.find("https://") == 0)
+        return url;
+    if (url.find('\\') != std::string::npos ||
+        url.find(":/") != std::string::npos || url[0] == '/') {
+        for (auto& c : url) if (c == '\\') c = '/';
+        if (url.find("file://") != 0) {
+            if (url[0] != '/') url = "/" + url;
+            url = "file://" + url;
+        }
+        return url;
+    }
+    url = "https://" + url;
+    size_t hostEnd = url.find('/', 8);
+    if (hostEnd == std::string::npos) hostEnd = url.length();
+    std::string host = url.substr(8, hostEnd - 8);
+    int dots = 0;
+    for (char c : host) if (c == '.') dots++;
+    if (dots == 1 && host.find("www.") != 0)
+        url.insert(8, "www.");
+    return url;
+}
+
+// Strip URL prefix for display (e.g. "file:///F:/test" → "/F:/test", "about:blank" → "blank")
+static std::string DisplayUrl(const std::string& url) {
+    const char* prefixes[] = {"file:///", "file://", "local://app/", "local://", "about:"};
+    for (auto p : prefixes) {
+        if (url.find(p) == 0)
+            return url.substr(strlen(p));
+    }
+    return url;
+}
 
 static std::string GetHost(const std::string& url) {
     size_t start = url.find("://");
@@ -222,8 +276,10 @@ static void StripTypeFromCommandLine() {
 }
 
 static void DoNavigate(const std::string& url) {
+    Log(("DoNavigate: " + url).c_str());
     auto b = g_handler ? g_handler->GetBrowser() : nullptr;
     if (b) b->GetMainFrame()->LoadURL(url);
+    else Log("DoNavigate: g_handler or browser is null!");
 }
 
 static void DoReload() {
@@ -242,6 +298,7 @@ static void DoCloseBrowser() {
 }
 
 static void ExecuteCmd(const Cmd& c) {
+    Log(("ExecuteCmd type=" + std::to_string((int)c.type) + " arg=" + c.arg).c_str());
     switch (c.type) {
         case CmdType::Navigate:
             g_lastNavigateHost = GetHost(c.arg);
@@ -275,19 +332,19 @@ static ATOM RegisterHiddenClass() {
 // ========================================================================
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
-    // ---- Step 1: Are we main process or CEF subprocess? ----
-    bool isMainProcess = HasArg(L"--cef-pipe");
+    // ---- Step 1: CEF subprocess detection ----
+    // If --type= is present (CEF-spawned child process: renderer, GPU, etc.),
+    // CefExecuteProcess handles the subprocess message loop and never returns.
+    // Otherwise it returns -1 and we continue as the main browser process.
+    CefMainArgs mainArgs(hInstance);
+    int cefRet = CefExecuteProcess(mainArgs, nullptr, nullptr);
+    if (cefRet >= 0)
+        return cefRet;
 
-    if (!isMainProcess) {
-        CefMainArgs subArgs(hInstance);
-        int ret = CefExecuteProcess(subArgs, nullptr, nullptr);
-        return ret >= 0 ? ret : 0;
-    }
-
-    // ---- Main process: strip CEF-injected --type=xxx ----
+    // ---- Main process: strip CEF-injected --type=xxx (shouldn't be present) ----
     StripTypeFromCommandLine();
 
-    // ---- Step 2: Read parameters (command line first, env var fallback) ----
+    // ---- Step 3: Read parameters (command line first, env var fallback) ----
     std::string pipeName;
     std::string url = "about:blank";
     int hostPid = 0;
@@ -298,14 +355,18 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     std::string cliHost = GetArgValue("--cef-host-pid");
 
     if (!cliPipe.empty()) pipeName = cliPipe;
-    if (!cliUrl.empty())  url      = cliUrl;
+    if (!cliUrl.empty())  url      = NormalizeUrl(cliUrl);
     if (!cliHost.empty()) { hostPid = atoi(cliHost.c_str()); }
 
+    Log(("Initial url = " + url).c_str());
+    Log(("Mode: " + std::string(standalone ? "standalone" : "pipe")).c_str());
+    Log(("Pipe: " + pipeName).c_str());
+    Log(("HostPID: " + std::to_string(hostPid)).c_str());
+
     if (pipeName.empty()) pipeName = GetEnv("CEF_PIPE");
-    if (url == "https://www.bing.com") { std::string e = GetEnv("CEF_URL"); if (!e.empty()) url = e; }
     if (hostPid == 0) { std::string e = GetEnv("CEF_HOST_PID"); if (!e.empty()) { hostPid = atoi(e.c_str()); } }
 
-    // ---- Step 3: Events ----
+    // ---- Step 4: Events ----
     g_browserReadyEvent  = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_shutdownEvent      = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_browserClosedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -314,12 +375,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     RegisterHiddenClass();
 
-    // ---- Step 4: CEF ExecuteProcess + Initialize ----
-    CefMainArgs mainArgs(hInstance);
-
-    int cefRet = CefExecuteProcess(mainArgs, nullptr, nullptr);
-    if (cefRet >= 0)
-        return cefRet;
+    // ---- Step 5: CEF Initialize ----
 
     CefSettings settings;
     settings.multi_threaded_message_loop = false;
@@ -347,9 +403,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         SetEvent(g_browserClosedEvent);
     };
     g_handler->OnAddressChanged = [](const std::string& u) {
+        Log(("OnAddressChanged: " + u).c_str());
+        std::string host = GetHost(u);
         if (!g_lastNavigateHost.empty()) {
             if (GetTickCount64() - g_lastNavTick < 5000) {
-                std::string host = GetHost(u);
+                if (host.empty())
+                    return;
                 bool matches = (host.find(g_lastNavigateHost) != std::string::npos ||
                                 g_lastNavigateHost.find(host) != std::string::npos);
                 if (!matches)
@@ -357,19 +416,22 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             }
         }
         if (g_pipeServer)
-            g_pipeServer->SendEvent("AddressChanged|" + u);
+            g_pipeServer->SendEvent("AddressChanged|" + DisplayUrl(u));
     };
     g_handler->OnLoadErrorEvent = [](const std::string& s) {
+        Log(("OnLoadError: " + s).c_str());
         if (g_pipeServer)
             g_pipeServer->SendEvent("LoadError|" + s);
     };
     g_handler->OnLoadingStateChanged = [](bool isLoading, bool canGoBack, bool canGoForward) {
+        Log(("OnLoadingStateChanged: " + std::string(isLoading ? "loading" : "done")).c_str());
         if (g_pipeServer)
             g_pipeServer->SendEvent("NavState|" + std::string(isLoading ? "1" : "0") + "|" +
                                     std::string(canGoBack ? "1" : "0") + "|" +
                                     std::string(canGoForward ? "1" : "0"));
     };
     g_handler->OnTitleChangedCB = [](const std::string& title) {
+        Log(("OnTitleChanged: " + title).c_str());
         if (g_pipeServer)
             g_pipeServer->SendEvent("TitleChanged|" + title);
     };
@@ -414,10 +476,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         ps->Start(
             [&](const std::string& cmd, const std::string& arg) {
                 if (cmd == "Navigate") {
-                    std::string navUrl = arg;
-                    if (navUrl.find("http://") != 0 && navUrl.find("https://") != 0
-                        && navUrl.find("file://") != 0)
-                        navUrl = "https://" + navUrl;
+                    std::string navUrl = NormalizeUrl(arg);
+                    if (navUrl.empty()) return;
                     PushCmd(CmdType::Navigate, navUrl);
                 } else if (cmd == "Reload") {
                     PushCmd(CmdType::Reload);

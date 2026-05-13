@@ -17,19 +17,16 @@ public class BrowserView : UserControl
     private readonly ExternalBrowserProcessHost _browserHost = new();
     private BrowserProcessManager? _manager;
     private CancellationTokenSource? _resizeCts;
-
-    // Debounce stale AddressChanged events from intermediate redirects
-    private string? _pendingNavUrl;
-    private DateTime _pendingNavTime;
+    private string? _lastNavigatedUrl;
 
     public static readonly StyledProperty<string> UrlProperty =
         AvaloniaProperty.Register<BrowserView, string>(nameof(Url), defaultValue: "");
 
-    /// <summary>Current URL. Setter normalizes (adds https://, www prefix).</summary>
+    /// <summary>Current URL. Set in C++ and passed through as-is.</summary>
     public string Url
     {
         get => GetValue(UrlProperty);
-        set => SetValue(UrlProperty, NormalizeUrl(value));
+        set => SetValue(UrlProperty, value ?? "");
     }
 
     private string _title = "";
@@ -123,19 +120,19 @@ public class BrowserView : UserControl
         {
             Dispatcher.UIThread.Post(() =>
             {
-                if (_pendingNavUrl != null &&
-                    (DateTime.UtcNow - _pendingNavTime).TotalSeconds < 3)
+                var last = _lastNavigatedUrl;
+                if (last != null)
                 {
-                    try
+                    var u = url.Replace('\\', '/');
+                    var l = last.Replace('\\', '/');
+                    if (!u.Contains(l, StringComparison.OrdinalIgnoreCase) &&
+                        !l.Contains(u, StringComparison.OrdinalIgnoreCase))
                     {
-                        var pendingHost = new Uri(_pendingNavUrl).Host;
-                        var eventHost = new Uri(url).Host;
-                        if (!eventHost.Contains(pendingHost) && !pendingHost.Contains(eventHost))
-                            return;
+                        _lastNavigatedUrl = null;
+                        return;
                     }
-                    catch { }
+                    _lastNavigatedUrl = null;
                 }
-                _pendingNavUrl = null;
                 Url = url;
                 AddressChanged?.Invoke(url);
             });
@@ -195,52 +192,20 @@ public class BrowserView : UserControl
     }
 
     /// <summary>
-    /// Normalizes a user-entered URL: adds https:// if missing, prepends www. for bare domains.
-    /// Recognizes file:// and local paths and converts them to file:/// URLs.
-    /// Returns empty string unchanged.
-    /// </summary>
-    private static string NormalizeUrl(string url)
-    {
-        url = url.Trim();
-        if (string.IsNullOrEmpty(url)) return url;
-        if (url.StartsWith("file://", StringComparison.OrdinalIgnoreCase)) return url;
-        if (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
-            url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return url;
-        // Local file path (e.g. C:\path or /path)
-        if (url.Contains('\\') || url.Contains(":/") || url.StartsWith("/"))
-        {
-            url = url.Replace('\\', '/');
-            if (!url.StartsWith("/")) url = "/" + url;
-            return "file://" + url;
-        }
-        url = "https://" + url;
-        try
-        {
-            var host = new Uri(url).Host;
-            if (host.Split('.').Length == 2 && !host.StartsWith("www."))
-                url = url.Replace(host, "www." + host);
-        }
-        catch { }
-        return url;
-    }
-
-    /// <summary>
-    /// Navigate to a URL. If the native process hasn't started yet, starts it first.
+    /// Navigate to a URL. C++ handles all normalization.
+    /// If the native process hasn't started yet, starts it first.
     /// Immediately sets Url + fires AddressChanged for optimistic UI, then delegates to IPC.
     /// </summary>
     public async Task NavigateAsync(string url)
     {
-        url = NormalizeUrl(url);
+        if (string.IsNullOrWhiteSpace(url)) return;
         if (_manager == null)
         {
             Url = url;
             StartBrowser();
             return;
         }
-        // Record pending navigation to filter stale AddressChanged events
-        _pendingNavUrl = url;
-        _pendingNavTime = DateTime.UtcNow;
-        // Immediately notify consumer of the requested URL
+        _lastNavigatedUrl = url;
         Url = url;
         AddressChanged?.Invoke(url);
         await _manager.NavigateAsync(url);

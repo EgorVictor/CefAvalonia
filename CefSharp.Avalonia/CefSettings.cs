@@ -90,6 +90,9 @@ public class CefSettings
     /// <summary>ARGB background color (0xAARRGGBB). Opaque or fully transparent.</summary>
     public uint? BackgroundColor { get; set; }
 
+    /// <summary>Additional CEF command-line switches (e.g., "--allow-file-access-from-files").</summary>
+    public List<string> CommandLineSwitches { get; set; } = new();
+
     /// <summary>
     /// Serializes all set properties to --cef-{name}={value} arguments.
     /// These are passed to CefBrowser.Native.exe and parsed in ApplyCefSettingsFromArgs().
@@ -128,6 +131,13 @@ public class CefSettings
         AddStr(parts, "accept-language-list", AcceptLanguageList);
         AddStr(parts, "cookieable-schemes-list", CookieableSchemesList);
         AddBool(parts, "cookieable-schemes-exclude-defaults", CookieableSchemesExcludeDefaults);
+
+        // Additional CEF command-line switches (passed directly to native process)
+        foreach (var sw in CommandLineSwitches)
+        {
+            if (!string.IsNullOrWhiteSpace(sw))
+                parts.Add(sw);
+        }
 
         return parts.Count > 0 ? " " + string.Join(" ", parts) : "";
     }
