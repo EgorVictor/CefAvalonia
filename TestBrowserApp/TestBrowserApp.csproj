@@ -25,10 +25,11 @@
     <PackageReference Include="ReactiveUI" Version="20.1.63" />
   </ItemGroup>
 
-  <!-- Local project reference for testing (switch to PackageReference when using NuGet) -->
   <ItemGroup>
     <ProjectReference Include="..\CefSharp.Avalonia\CefSharp.Avalonia.csproj" />
   </ItemGroup>
+
+  <!-- Local project reference for testing (switch to PackageReference when using NuGet) -->
 
   <!-- Native files are copied by CefSharp.Avalonia's built-in build target -->
 </Project>
