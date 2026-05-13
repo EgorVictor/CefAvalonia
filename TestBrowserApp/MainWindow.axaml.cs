@@ -29,7 +29,6 @@ public partial class MainWindow : Window
         try { File.WriteAllText(LogPath, $"--- TestBrowserApp started ---\n"); } catch { }
 
         var browserControl = BrowserControl;
-        browserControl.Address = "www.bing.com";
         browserControl.CefSettings.CommandLineSwitches.Add("--allow-file-access-from-files");
         browserControl.CefSettings.CommandLineSwitches.Add("--disable-web-security");
 

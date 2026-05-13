@@ -6,7 +6,7 @@ namespace TestBrowserApp;
 public class MainWindowViewModel : ReactiveObject
 {
     /// <summary>Programmatic navigation. Set this property to trigger browser navigation via Source binding.</summary>
-    private string? _address;
+    private string? _address="https://www.google.com";
     public string? Address
     {
         get => _address;
