@@ -1,9 +1,11 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Data;
 using Avalonia.Threading;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Input;
 
 namespace CefSharp.Avalonia;
 
@@ -29,6 +31,20 @@ public class BrowserView : UserControl
         set => SetValue(UrlProperty, value ?? "");
     }
 
+    /// <summary>
+    /// Bindable address. Setting this property triggers navigation via NavigateAsync.
+    /// Unlike Url (which is display-only from C++), Address is meant for ViewModel binding.
+    /// </summary>
+    public static readonly StyledProperty<string?> AddressProperty =
+        AvaloniaProperty.Register<BrowserView, string?>(nameof(Address),
+            defaultBindingMode: BindingMode.TwoWay);
+
+    public string? Address
+    {
+        get => GetValue(AddressProperty);
+        set => SetValue(AddressProperty, value);
+    }
+
     private string _title = "";
     public static readonly DirectProperty<BrowserView, string> TitleProperty =
         AvaloniaProperty.RegisterDirect<BrowserView, string>(nameof(Title),
@@ -51,6 +67,20 @@ public class BrowserView : UserControl
     {
         get => _isLoading;
         private set => SetAndRaise(IsLoadingProperty, ref _isLoading, value);
+    }
+
+    public static readonly StyledProperty<ICommand?> NavigateCommandProperty =
+        AvaloniaProperty.Register<BrowserView, ICommand?>(nameof(NavigateCommand));
+
+    /// <summary>
+    /// Bindable command. Bind your ViewModel's RelayCommand here.
+    /// When the user presses Enter / clicks Go, bind a Button to this command.
+    /// Your ViewModel is responsible for calling NavigateAsync.
+    /// </summary>
+    public ICommand? NavigateCommand
+    {
+        get => GetValue(NavigateCommandProperty);
+        set => SetValue(NavigateCommandProperty, value);
     }
 
     /// <summary>
@@ -223,7 +253,13 @@ public class BrowserView : UserControl
     protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
     {
         base.OnPropertyChanged(change);
-        if (change.Property == BoundsProperty && _manager != null)
+        if (change.Property == AddressProperty)
+        {
+            var newUrl = change.GetNewValue<string?>();
+            if (!string.IsNullOrEmpty(newUrl))
+                _ = NavigateAsync(newUrl);
+        }
+        else if (change.Property == BoundsProperty && _manager != null)
         {
             _resizeCts?.Cancel();
             _resizeCts = new CancellationTokenSource();

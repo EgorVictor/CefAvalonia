@@ -22,6 +22,7 @@
       <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
       <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
     </PackageReference>
+    <PackageReference Include="ReactiveUI" Version="20.1.63" />
   </ItemGroup>
 
   <!-- Local project reference for testing (switch to PackageReference when using NuGet) -->
