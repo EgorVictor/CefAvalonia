@@ -5,7 +5,7 @@
 
     <!-- NuGet package metadata -->
     <PackageId>CefSharp.Avalonia</PackageId>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <Authors>CefBrowser</Authors>
     <Description>Avalonia CefBrowser wrapper control. Embeds a CEF (Chromium Embedded Framework) browser as an Avalonia control via named-pipe IPC.</Description>
     <PackageTags>avalonia;cef;chromium;browser;webview</PackageTags>

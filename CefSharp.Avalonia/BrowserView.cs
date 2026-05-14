@@ -247,6 +247,12 @@ public class BrowserView : UserControl
     public Task StopAsync() => _manager?.StopAsync() ?? Task.CompletedTask;
 
     /// <summary>
+    /// Opens developer tools. BrowserView (HWND interop) does not support DevTools in-process.
+    /// Configure remote-debugging-port in CefSettings.CommandLineSwitches and access via browser.
+    /// </summary>
+    public void ShowDeveloperTools() { }
+
+    /// <summary>
     /// Debounced resize: when Bounds changes, wait 15ms then send Resize via IPC.
     /// Cancels previous pending resize to avoid flooding the pipe during window dragging.
     /// </summary>
