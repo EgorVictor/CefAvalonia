@@ -38,6 +38,9 @@ out/
 ## CEF runtime
 cache/
 DawnCache/
+GPUCache/
+publish-test/
+check_symbols.cs
 
 ## NuGet
 packages/
