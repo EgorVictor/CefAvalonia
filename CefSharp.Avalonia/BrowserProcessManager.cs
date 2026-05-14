@@ -51,6 +51,12 @@ public sealed class BrowserProcessManager : IDisposable
     {
         pipeName = $"CefAvalonia_{Environment.ProcessId}";
         exePath = ResolveExePath();
+        AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+    }
+
+    private void OnProcessExit(object? sender, EventArgs e)
+    {
+        Kill();
     }
 
     /// <summary>
@@ -277,7 +283,10 @@ public sealed class BrowserProcessManager : IDisposable
             try
             {
                 if (!browserProcess.HasExited)
-                    browserProcess.Kill();
+                {
+                    browserProcess.Kill(entireProcessTree: true);
+                    browserProcess.WaitForExit(3000);
+                }
             }
             catch
             {
@@ -299,6 +308,7 @@ public sealed class BrowserProcessManager : IDisposable
     {
         if (disposed) return;
         disposed = true;
+        AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
         Kill();
     }
 }
