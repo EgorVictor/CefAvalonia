@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
@@ -24,6 +25,10 @@ public sealed class BrowserProcessManager : IDisposable
     private string? lastUrl;
     public string? LastUrl => lastUrl;
     private bool disposed;
+
+    // Buffer for messages sent before the pipe is connected
+    private readonly List<string> _pendingBuffer = new();
+    private bool _pipeReady;
 
     // Bounded channels with DropOldest: if the pipe is slow, stale messages drop instead of piling up.
     private static BoundedChannelOptions BufOpts() => new(256) {
@@ -137,6 +142,15 @@ public sealed class BrowserProcessManager : IDisposable
                 _writerTask = Task.Run(RunWriterAsync);
                 _recvTask = Task.Run(ProcessRecvChannelAsync);
                 _ = ReadPipeLoopAsync();
+
+                // Flush any messages that were sent before the pipe connected
+                lock (_pendingBuffer)
+                {
+                    foreach (var msg in _pendingBuffer)
+                        _sendChannel.Writer.TryWrite(msg);
+                    _pendingBuffer.Clear();
+                    _pipeReady = true;
+                }
 
                 return;
             }
@@ -256,6 +270,8 @@ public sealed class BrowserProcessManager : IDisposable
     public Task SendEmbedDoneAsync() => SendAsync("EmbedDone", "");
     /// <summary>Send resize notification to the native process.</summary>
     public Task SendResizeAsync(int w, int h) => SendAsync("Resize", $"{w}|{h}");
+    /// <summary>Send resize notification synchronously (enqueue to channel).</summary>
+    public void SendResize(int w, int h) => SendSync("Resize", $"{w}|{h}");
 
     /// <summary>
     /// Enqueue a command to the send channel. Non-blocking: the background writer thread
@@ -263,10 +279,32 @@ public sealed class BrowserProcessManager : IDisposable
     /// </summary>
     private Task SendAsync(string cmd, string arg)
     {
-        if (writer == null)
-            return Task.CompletedTask;
-        _sendChannel.Writer.TryWrite($"{cmd}|{arg}");
+        var msg = $"{cmd}|{arg}";
+        lock (_pendingBuffer)
+        {
+            if (!_pipeReady)
+            {
+                _pendingBuffer.Add(msg);
+                return Task.CompletedTask;
+            }
+        }
+        _sendChannel.Writer.TryWrite(msg);
         return Task.CompletedTask;
+    }
+
+    /// <summary>Synchronous enqueue (no Task allocation).</summary>
+    private void SendSync(string cmd, string arg)
+    {
+        var msg = $"{cmd}|{arg}";
+        lock (_pendingBuffer)
+        {
+            if (!_pipeReady)
+            {
+                _pendingBuffer.Add(msg);
+                return;
+            }
+        }
+        _sendChannel.Writer.TryWrite(msg);
     }
 
     /// <summary>

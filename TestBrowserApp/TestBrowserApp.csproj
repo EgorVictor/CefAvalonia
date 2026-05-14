@@ -24,7 +24,30 @@
     <ProjectReference Include="..\CefSharp.Avalonia\CefSharp.Avalonia.csproj" />
   </ItemGroup>
 
-  <!-- Local project reference for testing (switch to PackageReference when using NuGet) -->
-
-  <!-- Native files are copied by CefSharp.Avalonia's built-in build target -->
+  <!-- Copy CEF native files from CefSharp.Avalonia output (its CopyCefBrowserNative target only copies to its own output) -->
+  <Target Name="CopyCefNativeFiles" AfterTargets="Build">
+    <ItemGroup>
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\libcef.dll" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\chrome_elf.dll" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\d3dcompiler_47.dll" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\icudtl.dat" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\libEGL.dll" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\libGLESv2.dll" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\resources.pak" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\chrome_100_percent.pak" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\chrome_200_percent.pak" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\snapshot_blob.bin" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\v8_context_snapshot.bin" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\vk_swiftshader.dll" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\vk_swiftshader_icd.json" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\vulkan-1.dll" />
+      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\CefBrowser.Native.exe" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CefNativeFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+    <!-- Copy locales -->
+    <ItemGroup>
+      <CefLocales Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\locales\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CefLocales)" DestinationFolder="$(OutputPath)\locales\" SkipUnchangedFiles="true" />
+  </Target>
 </Project>

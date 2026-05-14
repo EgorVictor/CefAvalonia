@@ -14,7 +14,7 @@ namespace CefSharp.Avalonia;
 /// Uses ExternalBrowserProcessHost (NativeControlHost) + BrowserProcessManager (IPC).
 /// Lifecycle: OnAttachedToVisualTree → StartAsync → CefBrowser.Native.exe → Embed → events
 /// </summary>
-public class BrowserView : UserControl
+public class WebView : UserControl
 {
     private readonly ExternalBrowserProcessHost _browserHost = new();
     private BrowserProcessManager? _manager;
@@ -22,7 +22,7 @@ public class BrowserView : UserControl
     private string? _lastNavigatedUrl;
 
     public static readonly StyledProperty<string> UrlProperty =
-        AvaloniaProperty.Register<BrowserView, string>(nameof(Url), defaultValue: "");
+        AvaloniaProperty.Register<WebView, string>(nameof(Url), defaultValue: "");
 
     /// <summary>Current URL. Set in C++ and passed through as-is.</summary>
     public string Url
@@ -36,7 +36,7 @@ public class BrowserView : UserControl
     /// Unlike Url (which is display-only from C++), Address is meant for ViewModel binding.
     /// </summary>
     public static readonly StyledProperty<string?> AddressProperty =
-        AvaloniaProperty.Register<BrowserView, string?>(nameof(Address),
+        AvaloniaProperty.Register<WebView, string?>(nameof(Address),
             defaultBindingMode: BindingMode.TwoWay);
 
     public string? Address
@@ -46,8 +46,8 @@ public class BrowserView : UserControl
     }
 
     private string _title = "";
-    public static readonly DirectProperty<BrowserView, string> TitleProperty =
-        AvaloniaProperty.RegisterDirect<BrowserView, string>(nameof(Title),
+    public static readonly DirectProperty<WebView, string> TitleProperty =
+        AvaloniaProperty.RegisterDirect<WebView, string>(nameof(Title),
             o => o.Title);
 
     /// <summary>Browser tab title synced from CEF's OnTitleChange.</summary>
@@ -58,8 +58,8 @@ public class BrowserView : UserControl
     }
 
     private bool _isLoading;
-    public static readonly DirectProperty<BrowserView, bool> IsLoadingProperty =
-        AvaloniaProperty.RegisterDirect<BrowserView, bool>(nameof(IsLoading),
+    public static readonly DirectProperty<WebView, bool> IsLoadingProperty =
+        AvaloniaProperty.RegisterDirect<WebView, bool>(nameof(IsLoading),
             o => o.IsLoading);
 
     /// <summary>Whether the browser is currently loading a page.</summary>
@@ -70,7 +70,7 @@ public class BrowserView : UserControl
     }
 
     public static readonly StyledProperty<ICommand?> NavigateCommandProperty =
-        AvaloniaProperty.Register<BrowserView, ICommand?>(nameof(NavigateCommand));
+        AvaloniaProperty.Register<WebView, ICommand?>(nameof(NavigateCommand));
 
     /// <summary>
     /// Bindable command. Bind your ViewModel's RelayCommand here.
@@ -85,7 +85,7 @@ public class BrowserView : UserControl
 
     /// <summary>
     /// CEF initialization settings mapped from CefSettings in CEF's cef_types.h.
-    /// Set before BrowserView is attached to the visual tree.
+    /// Set before WebView is attached to the visual tree.
     /// </summary>
     public CefSettings CefSettings { get; set; } = new() { NoSandbox = true };
 
@@ -100,9 +100,19 @@ public class BrowserView : UserControl
     /// <summary>Raised when a page load error occurs. Parameter: "code|text|url".</summary>
     public event Action<string>? LoadError;
 
-    public BrowserView()
+    public WebView()
     {
         Content = _browserHost;
+        LayoutUpdated += OnLayoutUpdated;
+    }
+
+    private bool _layoutDone;
+
+    private void OnLayoutUpdated(object? sender, EventArgs e)
+    {
+        if (_layoutDone) return;
+        _layoutDone = true;
+        _ = SendResizeAsync();
     }
 
     /// <summary>
@@ -139,7 +149,7 @@ public class BrowserView : UserControl
     }
 
     /// <summary>
-    /// Wires BrowserProcessManager events to UI thread and BrowserView properties.
+    /// Wires BrowserProcessManager events to UI thread and WebView properties.
     /// AddressChanged filters out stale intermediate-redirect hosts within 3s of a pending navigation.
     /// </summary>
     private void WireManagerEvents()
@@ -192,8 +202,8 @@ public class BrowserView : UserControl
             Dispatcher.UIThread.Post(async () =>
             {
                 _browserHost.EmbedWindow(hwnd);
-                await _manager.SendEmbedDoneAsync();
                 await SendResizeAsync();
+                await _manager.SendEmbedDoneAsync();
             });
         };
 
@@ -247,7 +257,7 @@ public class BrowserView : UserControl
     public Task StopAsync() => _manager?.StopAsync() ?? Task.CompletedTask;
 
     /// <summary>
-    /// Opens developer tools. BrowserView (HWND interop) does not support DevTools in-process.
+    /// Opens developer tools. WebView (HWND interop) does not support DevTools in-process.
     /// Configure remote-debugging-port in CefSettings.CommandLineSwitches and access via browser.
     /// </summary>
     public void ShowDeveloperTools() { }
@@ -282,12 +292,19 @@ public class BrowserView : UserControl
         }
     }
 
+    private void SendResize()
+    {
+        if (_manager == null) return;
+        var w = (int)_browserHost.Bounds.Width;
+        var h = (int)_browserHost.Bounds.Height;
+        if (w > 0 && h > 0)
+            _manager.SendResize(w, h);
+    }
+
     private async Task SendResizeAsync(CancellationToken ct = default)
     {
         if (ct.IsCancellationRequested) return;
-        var w = (int)_browserHost.Bounds.Width;
-        var h = (int)_browserHost.Bounds.Height;
-        if (w > 0 && h > 0 && _manager != null)
-            await _manager.SendResizeAsync(w, h);
+        SendResize();
+        await Task.CompletedTask;
     }
 }

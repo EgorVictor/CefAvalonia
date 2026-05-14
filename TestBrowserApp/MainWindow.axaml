@@ -14,6 +14,6 @@
       <Button Content="Go" Command="{Binding GoCommand}" Width="60"/>
       <Button Content="Reload" Command="{Binding ReloadCommand}" Width="70"/>
     </StackPanel>
-    <cc:BrowserView Name="BrowserControl" Address="{Binding Address}"/>
+    <cc:WebView Name="BrowserControl" Address="{Binding Address}"/>
   </DockPanel>
 </Window>

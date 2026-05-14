@@ -21,25 +21,11 @@
 #include "include/base/cef_callback_helpers.h"
 #include <Windows.h>
 #include <shellapi.h>
-#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <queue>
 #include <mutex>
 
-
-// ---- Logger ----
-static void Log(const char* msg) {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    char buf[512];
-    int n = sprintf_s(buf, "[CefBrowser] %02d:%02d:%02d.%03d %s\n",
-                      st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
-    OutputDebugStringA(buf);
-    static FILE* f = nullptr;
-    if (!f) fopen_s(&f, "cef_browser_debug.log", "a");
-    if (f) { fwrite(buf, 1, n, f); fflush(f); }
-}
 
 // ---- Forward declarations ----
 static bool HasArg(LPCWSTR arg);
@@ -276,10 +262,8 @@ static void StripTypeFromCommandLine() {
 }
 
 static void DoNavigate(const std::string& url) {
-    Log(("DoNavigate: " + url).c_str());
     auto b = g_handler ? g_handler->GetBrowser() : nullptr;
     if (b) b->GetMainFrame()->LoadURL(url);
-    else Log("DoNavigate: g_handler or browser is null!");
 }
 
 static void DoReload() {
@@ -298,7 +282,6 @@ static void DoCloseBrowser() {
 }
 
 static void ExecuteCmd(const Cmd& c) {
-    Log(("ExecuteCmd type=" + std::to_string((int)c.type) + " arg=" + c.arg).c_str());
     switch (c.type) {
         case CmdType::Navigate:
             g_lastNavigateHost = GetHost(c.arg);
@@ -358,11 +341,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     if (!cliUrl.empty())  url      = NormalizeUrl(cliUrl);
     if (!cliHost.empty()) { hostPid = atoi(cliHost.c_str()); }
 
-    Log(("Initial url = " + url).c_str());
-    Log(("Mode: " + std::string(standalone ? "standalone" : "pipe")).c_str());
-    Log(("Pipe: " + pipeName).c_str());
-    Log(("HostPID: " + std::to_string(hostPid)).c_str());
-
     if (pipeName.empty()) pipeName = GetEnv("CEF_PIPE");
     if (hostPid == 0) { std::string e = GetEnv("CEF_HOST_PID"); if (!e.empty()) { hostPid = atoi(e.c_str()); } }
 
@@ -403,7 +381,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         SetEvent(g_browserClosedEvent);
     };
     g_handler->OnAddressChanged = [](const std::string& u) {
-        Log(("OnAddressChanged: " + u).c_str());
         std::string host = GetHost(u);
         if (!g_lastNavigateHost.empty()) {
             if (GetTickCount64() - g_lastNavTick < 5000) {
@@ -419,19 +396,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             g_pipeServer->SendEvent("AddressChanged|" + DisplayUrl(u));
     };
     g_handler->OnLoadErrorEvent = [](const std::string& s) {
-        Log(("OnLoadError: " + s).c_str());
         if (g_pipeServer)
             g_pipeServer->SendEvent("LoadError|" + s);
     };
     g_handler->OnLoadingStateChanged = [](bool isLoading, bool canGoBack, bool canGoForward) {
-        Log(("OnLoadingStateChanged: " + std::string(isLoading ? "loading" : "done")).c_str());
         if (g_pipeServer)
             g_pipeServer->SendEvent("NavState|" + std::string(isLoading ? "1" : "0") + "|" +
                                     std::string(canGoBack ? "1" : "0") + "|" +
                                     std::string(canGoForward ? "1" : "0"));
     };
     g_handler->OnTitleChangedCB = [](const std::string& title) {
-        Log(("OnTitleChanged: " + title).c_str());
         if (g_pipeServer)
             g_pipeServer->SendEvent("TitleChanged|" + title);
     };
@@ -486,7 +460,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 } else if (cmd == "Close") {
                     PushCmd(CmdType::Close);
                 } else if (cmd == "EmbedDone") {
-                    if (g_browserHwnd) ShowWindow(g_browserHwnd, SW_SHOW);
+                    if (g_browserHwnd) {
+                        ShowWindow(g_browserHwnd, SW_SHOW);
+                        {
+                            std::lock_guard<std::mutex> lock(g_resizeMutex);
+                            if (g_resizeDirty && g_resizeW > 0 && g_resizeH > 0) {
+                                MoveWindow(g_browserHwnd, 0, 0, g_resizeW, g_resizeH, TRUE);
+                                g_resizeDirty = false;
+                            }
+                        }
+                    }
                 }
             },
             [](int w, int h) {
