@@ -6,6 +6,12 @@
     <Nullable>enable</Nullable>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
+  <ItemGroup>
+    <AvaloniaXaml Remove="publish\**" />
+    <Compile Remove="publish\**" />
+    <EmbeddedResource Remove="publish\**" />
+    <None Remove="publish\**" />
+  </ItemGroup>
 
   <ItemGroup>
     <!-- Must use same Avalonia version as CefSharp.Avalonia -->
@@ -24,30 +30,43 @@
     <ProjectReference Include="..\CefSharp.Avalonia\CefSharp.Avalonia.csproj" />
   </ItemGroup>
 
-  <!-- Copy CEF native files from CefSharp.Avalonia output (its CopyCefBrowserNative target only copies to its own output) -->
+  <!-- Copy CEF native files from NuGet cache -->
   <Target Name="CopyCefNativeFiles" AfterTargets="Build">
+    <PropertyGroup>
+      <_CefNativeSource>$(NuGetPackageRoot)cefsharp.avalonia\1.0.3\nativeBinaries\</_CefNativeSource>
+    </PropertyGroup>
     <ItemGroup>
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\libcef.dll" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\chrome_elf.dll" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\d3dcompiler_47.dll" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\icudtl.dat" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\libEGL.dll" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\libGLESv2.dll" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\resources.pak" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\chrome_100_percent.pak" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\chrome_200_percent.pak" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\snapshot_blob.bin" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\v8_context_snapshot.bin" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\vk_swiftshader.dll" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\vk_swiftshader_icd.json" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\vulkan-1.dll" />
-      <CefNativeFiles Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\CefBrowser.Native.exe" />
+      <CefNativeFiles Include="$(_CefNativeSource)CefBrowser.Native.exe" />
+      <CefNativeFiles Include="$(_CefNativeSource)libcef.dll" />
+      <CefNativeFiles Include="$(_CefNativeSource)chrome_elf.dll" />
+      <CefNativeFiles Include="$(_CefNativeSource)d3dcompiler_47.dll" />
+      <CefNativeFiles Include="$(_CefNativeSource)icudtl.dat" />
+      <CefNativeFiles Include="$(_CefNativeSource)libEGL.dll" />
+      <CefNativeFiles Include="$(_CefNativeSource)libGLESv2.dll" />
+      <CefNativeFiles Include="$(_CefNativeSource)resources.pak" />
+      <CefNativeFiles Include="$(_CefNativeSource)chrome_100_percent.pak" />
+      <CefNativeFiles Include="$(_CefNativeSource)chrome_200_percent.pak" />
+      <CefNativeFiles Include="$(_CefNativeSource)snapshot_blob.bin" />
+      <CefNativeFiles Include="$(_CefNativeSource)v8_context_snapshot.bin" />
+      <CefNativeFiles Include="$(_CefNativeSource)vk_swiftshader.dll" />
+      <CefNativeFiles Include="$(_CefNativeSource)vk_swiftshader_icd.json" />
+      <CefNativeFiles Include="$(_CefNativeSource)vulkan-1.dll" />
     </ItemGroup>
     <Copy SourceFiles="@(CefNativeFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
     <!-- Copy locales -->
     <ItemGroup>
-      <CefLocales Include="..\CefSharp.Avalonia\bin\$(Configuration)\net8.0\locales\*.*" />
+      <CefLocales Include="$(NuGetPackageRoot)cefsharp.avalonia\1.0.3\nativeBinaries\locales\*.*" />
     </ItemGroup>
     <Copy SourceFiles="@(CefLocales)" DestinationFolder="$(OutputPath)\locales\" SkipUnchangedFiles="true" />
+    <ItemGroup>
+      <ResolvedFileToPublish Include="@(CefNativeFiles)">
+        <RelativePath>%(CefNativeFiles.Filename)%(CefNativeFiles.Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+      <ResolvedFileToPublish Include="@(CefLocales)">
+        <RelativePath>locales\%(CefLocales.Filename)%(CefLocales.Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
   </Target>
 </Project>

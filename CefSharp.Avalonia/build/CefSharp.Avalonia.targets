@@ -23,6 +23,12 @@
 
   <Target Name="CopyCefNativeBinaries" AfterTargets="Build" Inputs="@(_CefNativeFile)" Outputs="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')">
     <Copy SourceFiles="@(_CefNativeFile)" DestinationFiles="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <ItemGroup>
+      <ResolvedFileToPublish Include="@(_CefNativeFile)">
+        <RelativePath>%(_CefNativeFile.RecursiveDir)%(_CefNativeFile.Filename)%(_CefNativeFile.Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
     <Message Text="Copied CEF native binaries to $(OutDir)" Importance="high" />
   </Target>
 

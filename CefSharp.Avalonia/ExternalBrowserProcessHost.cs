@@ -1,3 +1,4 @@
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Platform;
 using System;
@@ -50,7 +51,9 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
         Debug.WriteLine($"[EBPH] SetParent result=0x{oldParent.ToInt64():X8}, LastError={Marshal.GetLastWin32Error()}");
 
         // Step 3: Force position/size to client-origin (0,0), no repaint needed
-        MoveWindow(childHwnd, 0, 0, (int)Bounds.Width, (int)Bounds.Height, false);
+        // Convert DIPs to physical pixels for MoveWindow
+        var scaling = TopLevel.GetTopLevel(this)?.RenderScaling ?? 1.0;
+        MoveWindow(childHwnd, 0, 0, (int)(Bounds.Width * scaling), (int)(Bounds.Height * scaling), false);
 
         // Step 4: Ensure correct Z-order within parent, show window
         SetWindowPos(childHwnd, HWND_TOP, 0, 0, 0, 0,

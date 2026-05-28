@@ -295,8 +295,9 @@ public class WebView : UserControl
     private void SendResize()
     {
         if (_manager == null) return;
-        var w = (int)_browserHost.Bounds.Width;
-        var h = (int)_browserHost.Bounds.Height;
+        var scaling = TopLevel.GetTopLevel(this)?.RenderScaling ?? 1.0;
+        var w = (int)(_browserHost.Bounds.Width * scaling);
+        var h = (int)(_browserHost.Bounds.Height * scaling);
         if (w > 0 && h > 0)
             _manager.SendResize(w, h);
     }
