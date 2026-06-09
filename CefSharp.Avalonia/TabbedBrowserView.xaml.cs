@@ -107,19 +107,22 @@ public class TabbedBrowserView : UserControl
             Background = new SolidColorBrush(Color.Parse("#F9F9F9")),
             BorderBrush = new SolidColorBrush(Color.Parse("#E0E0E0")),
             BorderThickness = new Thickness(0, 0, 0, 1),
-            Padding = new Thickness(8, 4)
+            Padding = new Thickness(4, 2)
         };
 
-        var addressBarPanel = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto") };
+        var addressBarPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 4
+        };
 
         _addressBar = new TextBox
         {
-            Watermark = "Enter URL... (press Enter to navigate)",
+            Watermark = "输入网址 (例如: https://www.google.com) - 按Enter导航",
             Height = 28,
-            Margin = new Thickness(0)
+            MinWidth = 400
         };
-        _addressBar.KeyDown += OnAddressBarKeyDown;  // ← 添加Enter键处理
-        Grid.SetColumn(_addressBar, 0);
+        _addressBar.KeyDown += OnAddressBarKeyDown;
         addressBarPanel.Children.Add(_addressBar);
 
         // "Go" 按钮
@@ -127,11 +130,9 @@ public class TabbedBrowserView : UserControl
         {
             Content = "Go",
             Width = 50,
-            Height = 28,
-            Margin = new Thickness(4, 0, 0, 0)
+            Height = 28
         };
-        goBtn.Click += OnGoButtonClick;  // ← 添加Go按钮处理
-        Grid.SetColumn(goBtn, 1);
+        goBtn.Click += OnGoButtonClick;
         addressBarPanel.Children.Add(goBtn);
 
         addressBarBorder.Child = addressBarPanel;
@@ -244,39 +245,79 @@ public class TabbedBrowserView : UserControl
     /// <summary>地址栏Enter键导航</summary>
     private void OnAddressBarKeyDown(object? sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Return && _tabManager?.ActiveTab != null)
+        Debug.WriteLine($"[TabbedBrowserView] AddressBar KeyDown: Key={e.Key}");
+
+        if (e.Key == Key.Return)
         {
-            var url = _addressBar.Text;
-            if (!string.IsNullOrWhiteSpace(url))
+            Debug.WriteLine("[TabbedBrowserView] Enter key pressed in address bar");
+            var url = _addressBar?.Text;
+
+            if (string.IsNullOrWhiteSpace(url))
             {
-                NavigateCurrentTab(url);
+                Debug.WriteLine("[TabbedBrowserView] URL is empty");
+                return;
             }
+
+            if (_tabManager?.ActiveTab == null)
+            {
+                Debug.WriteLine("[TabbedBrowserView] No active tab");
+                return;
+            }
+
+            Debug.WriteLine($"[TabbedBrowserView] Navigating to: {url}");
+            NavigateCurrentTab(url);
+            e.Handled = true;
         }
     }
 
     /// <summary>Go按钮点击导航</summary>
     private void OnGoButtonClick(object? sender, RoutedEventArgs e)
     {
-        var url = _addressBar.Text;
-        if (!string.IsNullOrWhiteSpace(url) && _tabManager?.ActiveTab != null)
+        Debug.WriteLine("[TabbedBrowserView] Go button clicked");
+        var url = _addressBar?.Text;
+
+        if (string.IsNullOrWhiteSpace(url))
         {
-            NavigateCurrentTab(url);
+            Debug.WriteLine("[TabbedBrowserView] URL is empty");
+            return;
         }
+
+        if (_tabManager?.ActiveTab == null)
+        {
+            Debug.WriteLine("[TabbedBrowserView] No active tab");
+            return;
+        }
+
+        Debug.WriteLine($"[TabbedBrowserView] Navigating to: {url}");
+        NavigateCurrentTab(url);
     }
 
     /// <summary>导航当前活跃标签页</summary>
     private void NavigateCurrentTab(string url)
     {
-        if (_tabManager?.ActiveTab == null) return;
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            Debug.WriteLine("[TabbedBrowserView] NavigateCurrentTab: URL is empty");
+            return;
+        }
+
+        if (_tabManager?.ActiveTab == null)
+        {
+            Debug.WriteLine("[TabbedBrowserView] NavigateCurrentTab: No active tab");
+            return;
+        }
 
         var tab = _tabManager.ActiveTab;
+        Debug.WriteLine($"[TabbedBrowserView] NavigateCurrentTab({url}) for tab {tab.Title}");
+
         if (_tabWebViews.TryGetValue(tab.Id, out var webView))
         {
+            Debug.WriteLine($"[TabbedBrowserView] Found WebView for tab, navigating...");
             _ = webView.NavigateAsync(url);
         }
         else
         {
-            Debug.WriteLine($"[TabbedBrowserView] No WebView found for tab {tab.Title}");
+            Debug.WriteLine($"[TabbedBrowserView] ERROR: No WebView found for tab {tab.Title}");
         }
     }
 
