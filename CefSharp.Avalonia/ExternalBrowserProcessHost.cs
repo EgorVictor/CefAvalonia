@@ -4,6 +4,7 @@ using Avalonia.Platform;
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 
 namespace CefSharp.Avalonia;
 
@@ -34,34 +35,71 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
             Debug.WriteLine($"[EBPH] EmbedWindow SKIP: no host panel");
             return;
         }
-        embeddedHwnd = childHwnd;
-        Debug.WriteLine($"[EBPH] EmbedWindow child=0x{childHwnd.ToInt64():X8}, panel=0x{hostPanelHwnd.ToInt64():X8}");
+        _ = EmbedWindowAsync(childHwnd);
+    }
 
-        // Step 1: Change style to WS_CHILD BEFORE reparenting
-        // This avoids the brief "popup" state where the window is a top-level window
-        // that has been reparented, which causes coordinate offset / black screen.
-        var style = GetWindowLong(childHwnd, GWL_STYLE);
-        style &= ~WS_POPUP;
-        style |= WS_CHILD | WS_VISIBLE;
-        SetWindowLong(childHwnd, GWL_STYLE, style);
-        Debug.WriteLine($"[EBPH] SetWindowLong(WS_CHILD|WS_VISIBLE) LastError={Marshal.GetLastWin32Error()}");
+    /// <summary>
+    /// Async version of EmbedWindow with enhanced refresh sequence to eliminate black screen.
+    /// Implements double-redraw with delays to ensure complete HWND embedding and visibility.
+    /// </summary>
+    private async Task EmbedWindowAsync(IntPtr childHwnd)
+    {
+        try
+        {
+            if (hostPanelHwnd == IntPtr.Zero) return;
 
-        // Step 2: Reparent into the panel
-        var oldParent = SetParent(childHwnd, hostPanelHwnd);
-        Debug.WriteLine($"[EBPH] SetParent result=0x{oldParent.ToInt64():X8}, LastError={Marshal.GetLastWin32Error()}");
+            embeddedHwnd = childHwnd;
+            Debug.WriteLine($"[EBPH] EmbedWindowAsync START: child=0x{childHwnd.ToInt64():X8}, panel=0x{hostPanelHwnd.ToInt64():X8}");
 
-        // Step 3: Force position/size to client-origin (0,0), no repaint needed
-        // Convert DIPs to physical pixels for MoveWindow
-        var scaling = TopLevel.GetTopLevel(this)?.RenderScaling ?? 1.0;
-        MoveWindow(childHwnd, 0, 0, (int)(Bounds.Width * scaling), (int)(Bounds.Height * scaling), false);
+            // Step 1: Change style to WS_CHILD BEFORE reparenting (prevents popup flash)
+            var style = GetWindowLong(childHwnd, GWL_STYLE);
+            style &= ~WS_POPUP;
+            style |= WS_CHILD | WS_VISIBLE;
+            SetWindowLong(childHwnd, GWL_STYLE, style);
+            Debug.WriteLine($"[EBPH] Step 1: SetWindowLong(WS_CHILD|WS_VISIBLE) done");
 
-        // Step 4: Ensure correct Z-order within parent, show window
-        SetWindowPos(childHwnd, HWND_TOP, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            // Step 2: Reparent into the panel
+            var oldParent = SetParent(childHwnd, hostPanelHwnd);
+            Debug.WriteLine($"[EBPH] Step 2: SetParent done, oldParent=0x{oldParent.ToInt64():X8}");
 
-        // Step 5: Force immediate repaint of the parent area to eliminate black frames
-        RedrawWindow(hostPanelHwnd, IntPtr.Zero, IntPtr.Zero,
-            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+            // Step 3: Wait for OS to process SetParent (25ms buffer ensures kernel completes reparent)
+            await Task.Delay(25);
+            Debug.WriteLine($"[EBPH] Step 3: Delay 25ms after SetParent");
+
+            // Step 4: Force position/size with DPI scaling
+            var scaling = TopLevel.GetTopLevel(this)?.RenderScaling ?? 1.0;
+            var w = (int)(Bounds.Width * scaling);
+            var h = (int)(Bounds.Height * scaling);
+            if (w > 0 && h > 0)
+            {
+                MoveWindow(childHwnd, 0, 0, w, h, false);
+                Debug.WriteLine($"[EBPH] Step 4: MoveWindow({w}x{h}) with scaling={scaling}");
+            }
+
+            // Step 5: Set Z-order and make visible
+            SetWindowPos(childHwnd, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            Debug.WriteLine($"[EBPH] Step 5: SetWindowPos(HWND_TOP) done");
+
+            // Step 6: First RedrawWindow on parent container
+            RedrawWindow(hostPanelHwnd, IntPtr.Zero, IntPtr.Zero,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+            Debug.WriteLine($"[EBPH] Step 6: RedrawWindow(parent) - first pass");
+
+            // Step 7: Brief delay to ensure first redraw processes
+            await Task.Delay(10);
+
+            // Step 8: Second RedrawWindow directly on the child HWND (critical for eliminating black frame)
+            RedrawWindow(childHwnd, IntPtr.Zero, IntPtr.Zero,
+                RDW_INVALIDATE | RDW_UPDATENOW);
+            Debug.WriteLine($"[EBPH] Step 8: RedrawWindow(child) - second pass");
+
+            Debug.WriteLine($"[EBPH] EmbedWindowAsync COMPLETE");
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[EBPH] EmbedWindowAsync ERROR: {ex}");
+        }
     }
 
     protected override void DestroyNativeControlCore(IPlatformHandle control)

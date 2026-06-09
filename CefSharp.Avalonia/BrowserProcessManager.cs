@@ -25,6 +25,9 @@ public sealed class BrowserProcessManager : IDisposable
     private string? lastUrl;
     public string? LastUrl => lastUrl;
     private bool disposed;
+    private bool _ipcFrozen;  // New: IPC freeze state for multi-tab support
+    private int _lastWidth = 1024;  // Cache for resize on unfreeze
+    private int _lastHeight = 768;
 
     // Buffer for messages sent before the pipe is connected
     private readonly List<string> _pendingBuffer = new();
@@ -172,12 +175,28 @@ public sealed class BrowserProcessManager : IDisposable
         {
             await foreach (var msg in _sendChannel.Reader.ReadAllAsync())
             {
+                if (_ipcFrozen) continue;  // Skip message if IPC is frozen (tab not visible)
                 if (writer == null) break;
-                await writer.WriteLineAsync(msg);
+
+                try
+                {
+                    await writer.WriteLineAsync(msg);
+                }
+                catch (IOException ex)
+                {
+                    Debug.WriteLine($"[BPM] Writer IO error: {ex.Message}");
+                    break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
             }
         }
-        catch (IOException) { }
-        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[BPM] RunWriterAsync error: {ex}");
+        }
     }
 
     /// <summary>
@@ -191,15 +210,35 @@ public sealed class BrowserProcessManager : IDisposable
             while (!disposed && reader != null)
             {
                 var line = await reader.ReadLineAsync();
-                if (line == null) break;
-                _recvChannel.Writer.TryWrite(line);
+                if (line == null)
+                {
+                    Debug.WriteLine("[BPM] Pipe closed by native process");
+                    break;
+                }
+                if (!_ipcFrozen)  // Only queue if IPC not frozen
+                {
+                    _recvChannel.Writer.TryWrite(line);
+                }
             }
         }
-        catch (IOException) { }
-        catch (ObjectDisposedException) { }
+        catch (IOException ex)
+        {
+            Debug.WriteLine($"[BPM] ReadPipeLoop IO error: {ex.Message}");
+        }
+        catch (ObjectDisposedException ex)
+        {
+            Debug.WriteLine($"[BPM] ReadPipeLoop disposed: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[BPM] ReadPipeLoop error: {ex}");
+        }
 
         if (!disposed)
+        {
+            Debug.WriteLine("[BPM] Browser process crashed unexpectedly");
             BrowserCrashed?.Invoke();
+        }
     }
 
     /// <summary>
@@ -211,9 +250,17 @@ public sealed class BrowserProcessManager : IDisposable
         try
         {
             await foreach (var msg in _recvChannel.Reader.ReadAllAsync())
-                DispatchPipeMessage(msg);
+            {
+                if (!_ipcFrozen)  // Only dispatch if not frozen
+                {
+                    DispatchPipeMessage(msg);
+                }
+            }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[BPM] ProcessRecvChannel error: {ex}");
+        }
     }
 
     /// <summary>
@@ -222,12 +269,12 @@ public sealed class BrowserProcessManager : IDisposable
     /// </summary>
     private void DispatchPipeMessage(string line)
     {
-        var sep = line.IndexOf('|');
-        var cmd = sep >= 0 ? line[..sep] : line;
-        var arg = sep >= 0 ? line[(sep + 1)..] : "";
-
         try
         {
+            var sep = line.IndexOf('|');
+            var cmd = sep >= 0 ? line[..sep] : line;
+            var arg = sep >= 0 ? line[(sep + 1)..] : "";
+
             switch (cmd)
             {
                 case "Ready":
@@ -250,9 +297,15 @@ public sealed class BrowserProcessManager : IDisposable
                 case "TitleChanged":
                     TitleChanged?.Invoke(arg);
                     break;
+                default:
+                    Debug.WriteLine($"[BPM] Unknown pipe message: {cmd}");
+                    break;
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[BPM] DispatchPipeMessage error: {ex}");
+        }
     }
 
     /// <summary>Send Navigate command to the native process.</summary>
@@ -271,7 +324,34 @@ public sealed class BrowserProcessManager : IDisposable
     /// <summary>Send resize notification to the native process.</summary>
     public Task SendResizeAsync(int w, int h) => SendAsync("Resize", $"{w}|{h}");
     /// <summary>Send resize notification synchronously (enqueue to channel).</summary>
-    public void SendResize(int w, int h) => SendSync("Resize", $"{w}|{h}");
+    public void SendResize(int w, int h)
+    {
+        _lastWidth = w;  // Cache for resume
+        _lastHeight = h;
+        SendSync("Resize", $"{w}|{h}");
+    }
+
+    /// <summary>
+    /// Freeze IPC communication. Used when tab becomes hidden.
+    /// Maintains pipe connection but stops processing messages.
+    /// </summary>
+    public void FreezeIpc()
+    {
+        _ipcFrozen = true;
+        Debug.WriteLine("[BPM] IPC frozen");
+    }
+
+    /// <summary>
+    /// Resume IPC communication after freeze. Used when tab becomes visible.
+    /// Re-sends Resize to force CEF layout update.
+    /// </summary>
+    public async Task ResumeIpcAsync()
+    {
+        _ipcFrozen = false;
+        Debug.WriteLine("[BPM] IPC resuming");
+        // Force CEF to recalculate layout by sending current size
+        await SendAsync("Resize", $"{_lastWidth}|{_lastHeight}");
+    }
 
     /// <summary>
     /// Enqueue a command to the send channel. Non-blocking: the background writer thread

@@ -1,0 +1,79 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:cc="clr-namespace:CefSharp.Avalonia"
+             x:Class="CefSharp.Avalonia.TabbedBrowserView"
+             Background="White">
+
+  <Grid RowDefinitions="Auto,Auto,*,Auto">
+
+    <!-- Top Menu Bar -->
+    <Grid Grid.Row="0" ColumnDefinitions="*,Auto,Auto,Auto,Auto" Background="#F5F5F5" Height="32" Padding="8,4">
+      <TextBlock Grid.Column="0" Text="CefBrowser" VerticalAlignment="Center" FontWeight="Bold" Foreground="#333"/>
+      <Button Grid.Column="1" Content="⊕" Width="28" Height="28" Margin="4,0" ToolTip.Tip="New Tab" Click="OnNewTabClick"/>
+      <Button Grid.Column="2" Content="🔄" Width="28" Height="28" Margin="4,0" ToolTip.Tip="Reload"/>
+      <Button Grid.Column="3" Content="✕" Width="28" Height="28" Margin="4,0" ToolTip.Tip="Close Tab"/>
+      <Button Grid.Column="4" Content="⋮" Width="28" Height="28" Margin="4,0" ToolTip.Tip="Menu"/>
+    </Grid>
+
+    <!-- Tab Bar -->
+    <ScrollViewer Grid.Row="1" Background="#ECECEC" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled" Height="36">
+      <ItemsControl x:Name="TabBar" ItemsSource="{Binding Tabs}">
+        <ItemsControl.ItemsPanel>
+          <ItemsPanelTemplate>
+            <StackPanel Orientation="Horizontal"/>
+          </ItemsPanelTemplate>
+        </ItemsControl.ItemsPanel>
+        <ItemsControl.ItemTemplate>
+          <DataTemplate>
+            <Border x:Name="TabContainer" Width="200" Height="36"
+                    Background="#ECECEC" BorderBrush="#D0D0D0" BorderThickness="0,0,1,1"
+                    Padding="8,4" Cursor="Hand">
+              <Grid ColumnDefinitions="*,Auto">
+                <TextBlock Grid.Column="0" Text="{Binding Title}"
+                          VerticalAlignment="Center" FontSize="12"
+                          Foreground="#333" TextTrimming="CharacterEllipsis"/>
+                <Button Grid.Column="1" Content="✕" Width="16" Height="16"
+                       Padding="0" Margin="4,0,0,0" FontSize="10"
+                       Background="Transparent" Foreground="#999"
+                       VerticalAlignment="Center"/>
+              </Grid>
+            </Border>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+    </ScrollViewer>
+
+    <!-- Address Bar -->
+    <Grid Grid.Row="2" RowDefinitions="36,*" Background="White">
+      <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto,Auto" Padding="8,4" Background="#F9F9F9" BorderBrush="#E0E0E0" BorderThickness="0,0,0,1">
+        <Button Grid.Column="0" Content="◀" Width="28" Height="28" Margin="0,0,4,0" ToolTip.Tip="Back"/>
+        <TextBox x:Name="AddressBar" Grid.Column="1" Text="{Binding CurrentUrl, Mode=TwoWay}"
+                Watermark="Enter URL..." Margin="4,0" Height="28"
+                Background="White" BorderBrush="#D0D0D0" CornerRadius="4"/>
+        <Button Grid.Column="2" Content="🔍" Width="28" Height="28" Margin="4,0" ToolTip.Tip="Search"/>
+        <Button Grid.Column="3" Content="⭐" Width="28" Height="28" Margin="4,0" ToolTip.Tip="Bookmark"/>
+      </Grid>
+
+      <!-- Browser Content Area -->
+      <Border Grid.Row="1" Background="White" BorderBrush="#E0E0E0" BorderThickness="0,1,0,0">
+        <Grid>
+          <!-- Placeholder when no tab is active -->
+          <TextBlock x:Name="NoTabPlaceholder"
+                    Text="No tab open. Click '⊕' to create a new tab."
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Foreground="#999" FontSize="14"/>
+
+          <!-- Active tab's WebView goes here -->
+          <ContentControl x:Name="BrowserContainer" Content="{Binding ActiveTab.Content}"/>
+        </Grid>
+      </Border>
+    </Grid>
+
+    <!-- Status Bar -->
+    <TextBlock Grid.Row="3" x:Name="StatusBar" Text="Ready"
+              Padding="8,4" Background="#F5F5F5" Foreground="#666" FontSize="11"
+              BorderBrush="#E0E0E0" BorderThickness="0,1,0,0"/>
+
+  </Grid>
+
+</UserControl>

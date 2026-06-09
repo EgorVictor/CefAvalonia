@@ -3,6 +3,7 @@ using Avalonia.Controls;
 using Avalonia.Data;
 using Avalonia.Threading;
 using System;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Input;
@@ -218,17 +219,19 @@ public class WebView : UserControl
         };
     }
 
-    /// <summary>
-    /// Launches the native process with configured CefSettings.
-    /// </summary>
     private async Task StartAsync()
     {
         if (_manager == null) return;
         try
         {
+            Debug.WriteLine("[WebView] StartAsync: Starting browser process");
             await _manager.StartAsync(Url, CefSettings);
+            Debug.WriteLine("[WebView] StartAsync: Browser process started successfully");
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[WebView] StartAsync error: {ex}");
+        }
     }
 
     /// <summary>
@@ -239,16 +242,26 @@ public class WebView : UserControl
     public async Task NavigateAsync(string url)
     {
         if (string.IsNullOrWhiteSpace(url)) return;
-        if (_manager == null)
+
+        try
         {
+            if (_manager == null)
+            {
+                Debug.WriteLine($"[WebView] NavigateAsync: Manager is null, starting browser");
+                Url = url;
+                StartBrowser();
+                return;
+            }
+            _lastNavigatedUrl = url;
             Url = url;
-            StartBrowser();
-            return;
+            AddressChanged?.Invoke(url);
+            Debug.WriteLine($"[WebView] NavigateAsync: Navigating to {url}");
+            await _manager.NavigateAsync(url);
         }
-        _lastNavigatedUrl = url;
-        Url = url;
-        AddressChanged?.Invoke(url);
-        await _manager.NavigateAsync(url);
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[WebView] NavigateAsync error: {ex}");
+        }
     }
 
     /// <summary>Reload the current page.</summary>
