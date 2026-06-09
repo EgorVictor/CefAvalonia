@@ -5,8 +5,24 @@
         xmlns:cc="clr-namespace:CefSharp.Avalonia;assembly=CefSharp.Avalonia"
         mc:Ignorable="d" d:DesignWidth="1024" d:DesignHeight="768"
         x:Class="TestBrowserApp.MainWindow"
-        Title="CefBrowser - Multi-Tab Browser"
+        Title="CefBrowser - WebView Test"
         Width="1280" Height="800">
-  <!-- Multi-tab browser with built-in tab bar, address bar, and WebView hosting -->
-  <cc:TabbedBrowserView x:Name="BrowserControl"/>
+  <Grid RowDefinitions="Auto,*" Background="White">
+    <!-- Address bar -->
+    <Border Grid.Row="0" Background="#F5F5F5" Padding="8" BorderThickness="0,0,0,1" BorderBrush="#E0E0E0">
+      <StackPanel Orientation="Horizontal" Spacing="4">
+        <TextBox x:Name="AddressBar"
+                 Watermark="Enter URL..."
+                 MinWidth="400"
+                 Height="32"/>
+        <Button x:Name="GoButton"
+                Content="Go"
+                Width="60"
+                Height="32"/>
+      </StackPanel>
+    </Border>
+
+    <!-- WebView -->
+    <cc:WebView Grid.Row="1" x:Name="BrowserView"/>
+  </Grid>
 </Window>
