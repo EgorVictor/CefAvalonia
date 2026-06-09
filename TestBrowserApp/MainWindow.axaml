@@ -5,15 +5,8 @@
         xmlns:cc="clr-namespace:CefSharp.Avalonia;assembly=CefSharp.Avalonia"
         mc:Ignorable="d" d:DesignWidth="1024" d:DesignHeight="768"
         x:Class="TestBrowserApp.MainWindow"
-        Title="{Binding Title}"
-        Width="1024" Height="768">
-  <DockPanel>
-    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="6" Spacing="6">
-      <TextBox Name="UrlTextBox" Width="750"
-               Watermark="Enter URL and press Enter..."/>
-      <Button Content="Go" Command="{Binding GoCommand}" Width="60"/>
-      <Button Content="Reload" Command="{Binding ReloadCommand}" Width="70"/>
-    </StackPanel>
-    <cc:WebView Name="BrowserControl" Address="{Binding Address}"/>
-  </DockPanel>
+        Title="CefBrowser - Multi-Tab Browser"
+        Width="1280" Height="800">
+  <!-- Multi-tab browser with built-in tab bar, address bar, and WebView hosting -->
+  <cc:TabbedBrowserView x:Name="BrowserControl"/>
 </Window>
