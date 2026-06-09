@@ -88,20 +88,9 @@
     </Border>
 
     <!-- TabControl for multiple WebViews -->
-    <Border Grid.Row="2" Background="White">
-      <Grid RowDefinitions="Auto,*">
-        <!-- Tab headers background -->
-        <Border Grid.Row="0" Background="#EEEEEE" BorderThickness="0,0,0,1" BorderBrush="#D0D0D0">
-          <TabControl x:Name="BrowserTabs" Grid.Row="0"/>
-        </Border>
-
-        <!-- Tab content container -->
-        <Border Grid.Row="1" Background="White">
-          <ContentControl Content="{Binding SelectedItem.Content, ElementName=BrowserTabs}"/>
-        </Border>
-      </Grid>
-    </Border>
+    <TabControl Grid.Row="2" x:Name="BrowserTabs" Background="White"/>
   </Grid>
 </Window>
+
 
 
