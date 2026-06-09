@@ -1,9 +1,11 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading.Tasks;
 
@@ -21,6 +23,7 @@ public class TabbedBrowserView : UserControl
     private TextBox? _addressBar;
     private Grid? _browserContainer;
     private TextBlock? _statusBar;
+    private readonly Dictionary<Guid, WebView> _tabWebViews = new();  // ← 存储每个tab的WebView
 
     public static readonly StyledProperty<CefSettings> CefSettingsProperty =
         AvaloniaProperty.Register<TabbedBrowserView, CefSettings>(nameof(CefSettings),
@@ -98,7 +101,8 @@ public class TabbedBrowserView : UserControl
         // Row 2: Address bar + content
         var contentGrid = new Grid { RowDefinitions = new RowDefinitions("36,*"), Background = Brushes.White };
 
-        var addressBar = new Border
+        // Address bar container with Grid inside for TextBox + Button
+        var addressBarBorder = new Border
         {
             Background = new SolidColorBrush(Color.Parse("#F9F9F9")),
             BorderBrush = new SolidColorBrush(Color.Parse("#E0E0E0")),
@@ -106,16 +110,33 @@ public class TabbedBrowserView : UserControl
             Padding = new Thickness(8, 4)
         };
 
+        var addressBarPanel = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto") };
+
         _addressBar = new TextBox
         {
-            Watermark = "Enter URL...",
+            Watermark = "Enter URL... (press Enter to navigate)",
             Height = 28,
-            Margin = new Thickness(4, 0)
+            Margin = new Thickness(0)
         };
-        addressBar.Child = _addressBar;
+        _addressBar.KeyDown += OnAddressBarKeyDown;  // ← 添加Enter键处理
+        Grid.SetColumn(_addressBar, 0);
+        addressBarPanel.Children.Add(_addressBar);
 
-        Grid.SetRow(addressBar, 0);
-        contentGrid.Children.Add(addressBar);
+        // "Go" 按钮
+        var goBtn = new Button
+        {
+            Content = "Go",
+            Width = 50,
+            Height = 28,
+            Margin = new Thickness(4, 0, 0, 0)
+        };
+        goBtn.Click += OnGoButtonClick;  // ← 添加Go按钮处理
+        Grid.SetColumn(goBtn, 1);
+        addressBarPanel.Children.Add(goBtn);
+
+        addressBarBorder.Child = addressBarPanel;
+        Grid.SetRow(addressBarBorder, 0);
+        contentGrid.Children.Add(addressBarBorder);
 
         // Row 2, Content area
         _browserContainer = new Grid { Background = Brushes.White };
@@ -169,7 +190,45 @@ public class TabbedBrowserView : UserControl
         try
         {
             var tab = await _tabManager.AddTabAsync("about:blank", "New Tab");
+
+            // 创建WebView并关联到Tab
+            var webView = new WebView
+            {
+                Url = tab.Url,
+                CefSettings = CefSettings
+            };
+
+            // 保存WebView引用供后续显示
+            if (!_tabWebViews.ContainsKey(tab.Id))
+                _tabWebViews[tab.Id] = webView;
+
+            // 绑定事件
+            webView.AddressChanged += url =>
+            {
+                tab.Url = url;
+                tab.Title = url.Length > 30 ? url.Substring(0, 30) + "..." : url;
+                _addressBar.Text = url;  // 同步地址栏
+            };
+
+            webView.TitleChanged += title =>
+            {
+                tab.Title = title;
+            };
+
+            webView.LoadingStateChanged += loading =>
+            {
+                _statusBar.Text = loading ? "Loading..." : "Ready";
+            };
+
+            webView.LoadError += info =>
+            {
+                _statusBar.Text = $"Error: {info}";
+            };
+
             Debug.WriteLine($"[TabbedBrowserView] Created tab: {tab.Title}");
+
+            // 自动选中新创建的tab
+            await _tabManager.SelectTabAsync(tab.Id);
         }
         catch (Exception ex)
         {
@@ -182,9 +241,73 @@ public class TabbedBrowserView : UserControl
         _ = CreateNewTabAsync();
     }
 
+    /// <summary>地址栏Enter键导航</summary>
+    private void OnAddressBarKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Return && _tabManager?.ActiveTab != null)
+        {
+            var url = _addressBar.Text;
+            if (!string.IsNullOrWhiteSpace(url))
+            {
+                NavigateCurrentTab(url);
+            }
+        }
+    }
+
+    /// <summary>Go按钮点击导航</summary>
+    private void OnGoButtonClick(object? sender, RoutedEventArgs e)
+    {
+        var url = _addressBar.Text;
+        if (!string.IsNullOrWhiteSpace(url) && _tabManager?.ActiveTab != null)
+        {
+            NavigateCurrentTab(url);
+        }
+    }
+
+    /// <summary>导航当前活跃标签页</summary>
+    private void NavigateCurrentTab(string url)
+    {
+        if (_tabManager?.ActiveTab == null) return;
+
+        var tab = _tabManager.ActiveTab;
+        if (_tabWebViews.TryGetValue(tab.Id, out var webView))
+        {
+            _ = webView.NavigateAsync(url);
+        }
+        else
+        {
+            Debug.WriteLine($"[TabbedBrowserView] No WebView found for tab {tab.Title}");
+        }
+    }
+
     private void OnActiveTabChanged(TabItem? tab)
     {
-        Debug.WriteLine($"[TabbedBrowserView] Active tab: {tab?.Title ?? "None"}");
+        try
+        {
+            if (tab == null)
+            {
+                // 清空浏览器容器
+                _browserContainer?.Children.Clear();
+                _addressBar.Text = "";
+                Debug.WriteLine("[TabbedBrowserView] No active tab");
+                return;
+            }
+
+            Debug.WriteLine($"[TabbedBrowserView] Switched to tab: {tab.Title}");
+            _addressBar.Text = tab.Url;
+
+            // 显示当前tab的WebView
+            if (_tabWebViews.TryGetValue(tab.Id, out var webView))
+            {
+                _browserContainer?.Children.Clear();
+                _browserContainer?.Children.Add(webView);
+                Debug.WriteLine($"[TabbedBrowserView] Displayed WebView for tab {tab.Title}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[TabbedBrowserView] OnActiveTabChanged error: {ex}");
+        }
     }
 
     private void OnTabAdded(TabItem tab)
