@@ -21,6 +21,8 @@ public class WebView : UserControl
     private BrowserProcessManager? _manager;
     private CancellationTokenSource? _resizeCts;
     private string? _lastNavigatedUrl;
+    private IntPtr _cefHwnd = IntPtr.Zero;
+    private bool _disposed;
 
     public static readonly StyledProperty<string> UrlProperty =
         AvaloniaProperty.Register<WebView, string>(nameof(Url), defaultValue: "");
@@ -100,6 +102,8 @@ public class WebView : UserControl
     public event Action? BrowserCrashed;
     /// <summary>Raised when a page load error occurs. Parameter: "code|text|url".</summary>
     public event Action<string>? LoadError;
+    /// <summary>Raised when a web page requests to open a popup/new window. URL should open in a new tab.</summary>
+    public event Action<string>? OpenPopup;
 
     public WebView()
     {
@@ -117,27 +121,48 @@ public class WebView : UserControl
     }
 
     /// <summary>
-    /// Lifecycle start: launches CefBrowser.Native.exe when this control is attached to the visual tree.
+    /// Lifecycle start: launches CefBrowser.Native.exe or re-embeds existing HWND.
     /// Skip with --no-cef command-line flag for UI-only testing.
     /// </summary>
     protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
     {
+        Debug.WriteLine($"[WebView] OnAttachedToVisualTree - URL={Url}, HasManager={_manager != null}, HasHwnd={_cefHwnd != IntPtr.Zero}");
         base.OnAttachedToVisualTree(e);
         var cmdArgs = Environment.GetCommandLineArgs();
         if (Array.IndexOf(cmdArgs, "--no-cef") >= 0)
             return;
 
-        StartBrowser();
+        if (_manager != null && _cefHwnd != IntPtr.Zero)
+        {
+            // Tab switch back: re-embed existing CEF HWND into new panel
+            Debug.WriteLine($"[WebView] RE-EMBEDDING existing HWND=0x{_cefHwnd.ToInt64():X}");
+            _layoutDone = false;
+            _browserHost.EmbedWindow(_cefHwnd);
+            _ = SendResizeAsync();
+            _ = _manager.SendEmbedDoneAsync();
+        }
+        else if (_manager != null)
+        {
+            // Manager exists but HWND not ready yet — reset layout, embed on WindowHandleReceived
+            Debug.WriteLine($"[WebView] Manager exists, waiting for HWND");
+            _layoutDone = false;
+        }
+        else
+        {
+            Debug.WriteLine($"[WebView] Starting new browser");
+            StartBrowser();
+        }
     }
 
     /// <summary>
-    /// Lifecycle end: dispose the native process and pipe when control is removed.
+    /// Lifecycle end: keep the native process alive for tab switch.
+    /// Actual cleanup happens via Dispose() or process exit.
     /// </summary>
     protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
     {
+        Debug.WriteLine($"[WebView] OnDetachedFromVisualTree");
         base.OnDetachedFromVisualTree(e);
-        _manager?.Dispose();
-        _manager = null;
+        // Don't dispose manager — keep CEF process for tab switch re-embed
     }
 
     private void StartBrowser()
@@ -197,9 +222,15 @@ public class WebView : UserControl
             });
         };
 
-        // On Ready event: embed the CEF browser HWND, then signal embed done + push initial size
+        _manager.OpenPopup += url =>
+        {
+            Dispatcher.UIThread.Post(() => OpenPopup?.Invoke(url));
+        };
+
+        // On Ready event: save HWND, embed, then signal embed done + push initial size
         _manager.WindowHandleReceived += hwnd =>
         {
+            _cefHwnd = hwnd;
             Dispatcher.UIThread.Post(async () =>
             {
                 _browserHost.EmbedWindow(hwnd);
@@ -243,6 +274,7 @@ public class WebView : UserControl
     {
         if (string.IsNullOrWhiteSpace(url)) return;
 
+        Console.Error.WriteLine($"DIAG: WEBVIEW NavigateAsync url={url} manager={_manager != null}");
         try
         {
             if (_manager == null)
@@ -276,6 +308,18 @@ public class WebView : UserControl
     public void ShowDeveloperTools() { }
 
     /// <summary>
+    /// Clean up the native process. Call when the tab is permanently closed (not on tab switch).
+    /// </summary>
+    public void Cleanup()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _manager?.Dispose();
+        _manager = null;
+        _cefHwnd = IntPtr.Zero;
+    }
+
+    /// <summary>
     /// Debounced resize: when Bounds changes, wait 15ms then send Resize via IPC.
     /// Cancels previous pending resize to avoid flooding the pipe during window dragging.
     /// </summary>
@@ -288,8 +332,9 @@ public class WebView : UserControl
             if (!string.IsNullOrEmpty(newUrl))
                 _ = NavigateAsync(newUrl);
         }
-        else if (change.Property == BoundsProperty && _manager != null)
+        else if (change.Property == BoundsProperty && _manager != null && IsVisible)
         {
+            // Only send resize if this WebView is visible to avoid IPC flooding
             _resizeCts?.Cancel();
             _resizeCts = new CancellationTokenSource();
             var token = _resizeCts.Token;
@@ -298,9 +343,14 @@ public class WebView : UserControl
                 try
                 {
                     await Task.Delay(15, token);
-                    await Dispatcher.UIThread.InvokeAsync(() => SendResizeAsync(token));
+                    if (!token.IsCancellationRequested)
+                        await Dispatcher.UIThread.InvokeAsync(() => SendResizeAsync(token));
                 }
                 catch (OperationCanceledException) { }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[WebView] Resize task error: {ex}");
+                }
             }, token);
         }
     }

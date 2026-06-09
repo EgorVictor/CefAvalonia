@@ -47,6 +47,24 @@ void BrowserHandler::OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
         OnLoadingStateChanged(isLoading, canGoBack, canGoForward);
 }
 
+bool BrowserHandler::OnBeforePopup(CefRefPtr<CefBrowser> browser,
+                                    CefRefPtr<CefFrame> frame,
+                                    const CefString& target_url,
+                                    const CefString& target_frame_name,
+                                    WindowOpenDisposition target_disposition,
+                                    bool user_gesture,
+                                    const CefPopupFeatures& popupFeatures,
+                                    CefWindowInfo& windowInfo,
+                                    CefRefPtr<CefClient>& client,
+                                    CefBrowserSettings& settings,
+                                    CefRefPtr<CefDictionaryValue>& extra_info,
+                                    bool* no_javascript_access)
+{
+    if (OnBeforePopupCB && !target_url.empty())
+        OnBeforePopupCB(target_url.ToString());
+    return true; // cancel popup, we handle it in C#
+}
+
 void BrowserHandler::OnLoadError(CefRefPtr<CefBrowser> browser,
                                  CefRefPtr<CefFrame> frame,
                                  ErrorCode errorCode,

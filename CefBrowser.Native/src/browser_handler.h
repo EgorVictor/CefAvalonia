@@ -21,6 +21,18 @@ public:
     // CefLifeSpanHandler
     void OnAfterCreated(CefRefPtr<CefBrowser> browser) override;
     void OnBeforeClose(CefRefPtr<CefBrowser> browser) override;
+    bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
+                       CefRefPtr<CefFrame> frame,
+                       const CefString& target_url,
+                       const CefString& target_frame_name,
+                       WindowOpenDisposition target_disposition,
+                       bool user_gesture,
+                       const CefPopupFeatures& popupFeatures,
+                       CefWindowInfo& windowInfo,
+                       CefRefPtr<CefClient>& client,
+                       CefBrowserSettings& settings,
+                       CefRefPtr<CefDictionaryValue>& extra_info,
+                       bool* no_javascript_access) override;
 
     // CefLoadHandler
     void OnLoadError(CefRefPtr<CefBrowser> browser,
@@ -52,6 +64,7 @@ public:
     std::function<void()> OnBrowserClosed;
     std::function<void(bool, bool, bool)> OnLoadingStateChanged;
     std::function<void(const std::string&)> OnTitleChangedCB;
+    std::function<void(const std::string&)> OnBeforePopupCB;
 
 private:
     CefRefPtr<CefBrowser> browser_;

@@ -17,14 +17,26 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
 {
     private IntPtr hostPanelHwnd = IntPtr.Zero;
     private IntPtr embeddedHwnd = IntPtr.Zero;
+    private IntPtr _pendingEmbedHwnd = IntPtr.Zero;
 
     /// <summary>True once EmbedWindow has been called successfully.</summary>
     public bool IsEmbedded => embeddedHwnd != IntPtr.Zero;
 
+    /// <summary>Current host panel HWND. Used to detect panel changes during tab switch.</summary>
+    public IntPtr HostPanelHandle => hostPanelHwnd;
+
     protected override IPlatformHandle CreateNativeControlCore(IPlatformHandle parent)
     {
         hostPanelHwnd = parent.Handle;
-        Debug.WriteLine($"[EBPH] CreateNativeControlCore parent=0x{hostPanelHwnd.ToInt64():X}");
+        Console.Error.WriteLine($"DIAG: [EBPH] CreateNativeControlCore panel=0x{hostPanelHwnd.ToInt64():X} pending=0x{_pendingEmbedHwnd.ToInt64():X}");
+        // Process any pending embed from tab switch
+        if (_pendingEmbedHwnd != IntPtr.Zero)
+        {
+            var hwnd = _pendingEmbedHwnd;
+            _pendingEmbedHwnd = IntPtr.Zero;
+            Console.Error.WriteLine($"DIAG: [EBPH] Processing deferred embed of HWND=0x{hwnd.ToInt64():X}");
+            _ = EmbedWindowAsync(hwnd);
+        }
         return new PlatformHandle(hostPanelHwnd, "HWND");
     }
 
@@ -32,7 +44,8 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
     {
         if (hostPanelHwnd == IntPtr.Zero)
         {
-            Debug.WriteLine($"[EBPH] EmbedWindow SKIP: no host panel");
+            Console.Error.WriteLine($"DIAG: [EBPH] EmbedWindow DEFERRED hwnd=0x{childHwnd.ToInt64():X}");
+            _pendingEmbedHwnd = childHwnd;
             return;
         }
         _ = EmbedWindowAsync(childHwnd);
@@ -102,9 +115,23 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
         }
     }
 
+    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        // Reparent CEF child to desktop BEFORE base destroys DumbWindow (which would cascade-destroy child windows)
+        if (embeddedHwnd != IntPtr.Zero)
+        {
+            Console.Error.WriteLine($"DIAG: [EBPH] OnDetachedFromVisualTree reparenting CEF child 0x{embeddedHwnd.ToInt64():X} to desktop");
+            SetParent(embeddedHwnd, IntPtr.Zero);
+            ShowWindow(embeddedHwnd, SW_HIDE);
+        }
+        base.OnDetachedFromVisualTree(e);
+    }
+
     protected override void DestroyNativeControlCore(IPlatformHandle control)
     {
+        _pendingEmbedHwnd = IntPtr.Zero;
         embeddedHwnd = IntPtr.Zero;
+        hostPanelHwnd = IntPtr.Zero;  // Force defer on next attach until CreateNativeControlCore provides new panel
         base.DestroyNativeControlCore(control);
     }
 
@@ -144,4 +171,9 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
     private static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
 
     private static readonly IntPtr HWND_TOP = new IntPtr(0);
+    private const int SW_HIDE = 0;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 }

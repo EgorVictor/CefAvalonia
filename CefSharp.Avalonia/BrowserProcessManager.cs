@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.IO.Pipes;
+using System.Text;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -10,30 +10,25 @@ using System.Threading.Tasks;
 namespace CefSharp.Avalonia;
 
 /// <summary>
-/// Manages the CefBrowser.Native.exe subprocess lifecycle and Named Pipe IPC.
-/// Commands flow C#→C++ via _sendChannel→writer thread; events flow C++→C# via reader→_recvChannel→dispatch.
-/// Bounded channels (DropOldest) prevent unbounded memory growth when the pipe is backed up.
+/// Manages CefBrowser.Native.exe subprocess using stdin/stdout IPC (cross-platform, no named pipes).
+/// Commands: C# → stdin
+/// Events:   stdout → C#
+/// This eliminates IPC bottlenecks and works on Windows/Linux/macOS.
 /// </summary>
 public sealed class BrowserProcessManager : IDisposable
 {
-    private readonly string pipeName;
     private readonly string exePath;
     private Process? browserProcess;
-    private NamedPipeClientStream? pipe;
-    private StreamReader? reader;
-    private StreamWriter? writer;
+    private StreamWriter? stdin;
+    private StreamReader? stdout;
     private string? lastUrl;
     public string? LastUrl => lastUrl;
     private bool disposed;
-    private bool _ipcFrozen;  // New: IPC freeze state for multi-tab support
-    private int _lastWidth = 1024;  // Cache for resize on unfreeze
+    private bool _ipcFrozen;
+    private int _lastWidth = 1024;
     private int _lastHeight = 768;
 
-    // Buffer for messages sent before the pipe is connected
-    private readonly List<string> _pendingBuffer = new();
-    private bool _pipeReady;
-
-    // Bounded channels with DropOldest: if the pipe is slow, stale messages drop instead of piling up.
+    // Bounded channels with DropOldest
     private static BoundedChannelOptions BufOpts() => new(256) {
         SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest
     };
@@ -41,6 +36,8 @@ public sealed class BrowserProcessManager : IDisposable
     private Task? _writerTask;
     private readonly Channel<string> _recvChannel = Channel.CreateBounded<string>(BufOpts());
     private Task? _recvTask;
+    private static readonly string _diagLogPath = Path.Combine(
+        AppContext.BaseDirectory, "cef_browser_diag.log");
 
     /// <summary>Raised on AddressChanged event from native process.</summary>
     public event Action<string>? AddressChanged;
@@ -48,32 +45,22 @@ public sealed class BrowserProcessManager : IDisposable
     public event Action<string>? LoadError;
     /// <summary>Raised when the native process exits unexpectedly.</summary>
     public event Action? BrowserCrashed;
-    /// <summary>Raised on Ready event with the CEF browser HWND (hex string).</summary>
+    /// <summary>Raised when the browser window HWND is ready.</summary>
     public event Action<IntPtr>? WindowHandleReceived;
-    /// <summary>Raised on NavState event. Bool = isLoading.</summary>
-    public event Action<bool>? LoadingStateChanged;
-    /// <summary>Raised on TitleChanged event from native process.</summary>
+    /// <summary>Raised when page title changes.</summary>
     public event Action<string>? TitleChanged;
+    public event Action<string>? OpenPopup;
+    /// <summary>Raised when loading state changes (true=loading, false=done).</summary>
+    public event Action<bool>? LoadingStateChanged;
 
     public BrowserProcessManager()
     {
-        pipeName = $"CefAvalonia_{Environment.ProcessId}";
-        exePath = ResolveExePath();
-        AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+        exePath = GetCefPath("CefBrowser.Native.exe");
+        Debug.WriteLine($"[BPM] CefBrowser.Native path: {exePath}");
     }
 
-    private void OnProcessExit(object? sender, EventArgs e)
+    private string GetCefPath(string name)
     {
-        Kill();
-    }
-
-    /// <summary>
-    /// Locates CefBrowser.Native.exe: first alongside the managed assembly, then walks up 5 dir levels
-    /// looking for CefBrowser.Native\build\Release\ (useful during development).
-    /// </summary>
-    private static string ResolveExePath()
-    {
-        var name = "CefBrowser.Native.exe";
         var local = Path.Combine(AppContext.BaseDirectory, name);
         if (File.Exists(local)) return local;
 
@@ -90,8 +77,8 @@ public sealed class BrowserProcessManager : IDisposable
     }
 
     /// <summary>
-    /// Launches CefBrowser.Native.exe with pipe/url/pid arguments and CefSettings serialized as --cef-* args.
-    /// Waits for the named pipe connection (retries up to 15s).
+    /// Launches CefBrowser.Native.exe with URL and CefSettings args.
+    /// Pipes are connected via stdio (Process.StandardInput/StandardOutput).
     /// </summary>
     public async Task StartAsync(string url, CefSettings? settings = null)
     {
@@ -101,14 +88,15 @@ public sealed class BrowserProcessManager : IDisposable
         var psi = new ProcessStartInfo
         {
             FileName = exePath,
-            Arguments = $"--cef-pipe={pipeName} --cef-url={url} --cef-host-pid={Environment.ProcessId}{settingsArgs}",
+            Arguments = $"--cef-url={url}{settingsArgs}",
             WorkingDirectory = AppContext.BaseDirectory,
             UseShellExecute = false,
-            CreateNoWindow = true
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8
         };
-        psi.EnvironmentVariables["CEF_PIPE"] = pipeName;
-        psi.EnvironmentVariables["CEF_URL"] = url;
-        psi.EnvironmentVariables["CEF_HOST_PID"] = Environment.ProcessId.ToString();
 
         browserProcess = Process.Start(psi);
         if (browserProcess == null)
@@ -121,117 +109,95 @@ public sealed class BrowserProcessManager : IDisposable
                 BrowserCrashed?.Invoke();
         };
 
-        await ConnectPipeAsync();
-    }
+        stdin = browserProcess.StandardInput;
+        stdout = browserProcess.StandardOutput;
 
-    /// <summary>
-    /// Connects to the named pipe created by CefBrowser.Native.exe.
-    /// Starts the writer/reader/dispatch background tasks once connected.
-    /// Retries every 500ms for up to 15s (the native process needs time to create CEF browser + pipe).
-    /// </summary>
-    private async Task ConnectPipeAsync()
-    {
-        for (int i = 0; i < 30; i++)
+        // Read stderr to a diagnostic log file
+        _ = Task.Run(async () =>
         {
             try
             {
-                pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut,
-                    PipeOptions.Asynchronous);
-                await pipe.ConnectAsync(1000);
-                pipe.ReadMode = System.IO.Pipes.PipeTransmissionMode.Message;
-                reader = new StreamReader(pipe);
-                writer = new StreamWriter(pipe) { AutoFlush = true };
-
-                _writerTask = Task.Run(RunWriterAsync);
-                _recvTask = Task.Run(ProcessRecvChannelAsync);
-                _ = ReadPipeLoopAsync();
-
-                // Flush any messages that were sent before the pipe connected
-                lock (_pendingBuffer)
+                using var stderrReader = browserProcess.StandardError;
+                string? errLine;
+                while ((errLine = await stderrReader.ReadLineAsync()) != null)
                 {
-                    foreach (var msg in _pendingBuffer)
-                        _sendChannel.Writer.TryWrite(msg);
-                    _pendingBuffer.Clear();
-                    _pipeReady = true;
+                    try { File.AppendAllText(_diagLogPath, errLine + "\n"); } catch { }
                 }
+            }
+            catch { }
+        });
 
-                return;
-            }
-            catch
-            {
-                await Task.Delay(500);
-            }
-        }
-        throw new TimeoutException("Failed to connect to browser process via named pipe");
+        _writerTask = Task.Run(WriterThreadProc);
+        _recvTask = Task.Run(ReadStdoutLoopAsync);
+        _ = Task.Run(ProcessRecvChannelAsync);
+
+        // Send initial Ready signal (wait for browser to be ready)
+        await Task.Delay(500);
+        Debug.WriteLine("[BPM] StartAsync complete");
     }
 
     /// <summary>
-    /// Background writer: reads from _sendChannel and writes to the pipe.
-    /// All SendAsync calls are non-blocking — they enqueue to the channel.
+    /// Background writer: reads from _sendChannel and writes to stdin.
+    /// Non-blocking: all SendAsync calls are queued to the channel.
     /// </summary>
-    private async Task RunWriterAsync()
+    private async Task WriterThreadProc()
     {
         try
         {
             await foreach (var msg in _sendChannel.Reader.ReadAllAsync())
             {
-                if (_ipcFrozen) continue;  // Skip message if IPC is frozen (tab not visible)
-                if (writer == null) break;
+                if (_ipcFrozen) continue;
+                if (stdin == null) break;
 
                 try
                 {
-                    await writer.WriteLineAsync(msg);
+                    stdin.WriteLine(msg);
+                    Console.Error.WriteLine($"DIAG: BPM Sent: {msg}");
+                    Debug.WriteLine($"[BPM] Sent: {msg}");
                 }
-                catch (IOException ex)
+                catch (Exception ex)
                 {
-                    Debug.WriteLine($"[BPM] Writer IO error: {ex.Message}");
-                    break;
-                }
-                catch (ObjectDisposedException)
-                {
+                    Debug.WriteLine($"[BPM] Write error: {ex.Message}");
                     break;
                 }
             }
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[BPM] RunWriterAsync error: {ex}");
+            Debug.WriteLine($"[BPM] WriterThread error: {ex}");
         }
     }
 
     /// <summary>
-    /// Background reader: reads lines from the pipe and enqueues to _recvChannel.
-    /// When the pipe breaks (process exit), fires BrowserCrashed unless disposed.
+    /// Background reader: reads lines from stdout and dispatches events.
+    /// Protocol: "Cmd|arg" or "Cmd"
     /// </summary>
-    private async Task ReadPipeLoopAsync()
+    private async Task ReadStdoutLoopAsync()
     {
         try
         {
-            while (!disposed && reader != null)
+            if (stdout == null) return;
+
+            string? line;
+            while ((line = await stdout.ReadLineAsync()) != null)
             {
-                var line = await reader.ReadLineAsync();
-                if (line == null)
-                {
-                    Debug.WriteLine("[BPM] Pipe closed by native process");
-                    break;
-                }
-                if (!_ipcFrozen)  // Only queue if IPC not frozen
-                {
-                    _recvChannel.Writer.TryWrite(line);
-                }
+                if (string.IsNullOrEmpty(line)) continue;
+
+                Debug.WriteLine($"[BPM] Received: {line}");
+                _recvChannel.Writer.TryWrite(line);
             }
         }
         catch (IOException ex)
         {
-            Debug.WriteLine($"[BPM] ReadPipeLoop IO error: {ex.Message}");
+            Debug.WriteLine($"[BPM] ReadStdout IO error: {ex.Message}");
         }
         catch (ObjectDisposedException ex)
         {
-            Debug.WriteLine($"[BPM] ReadPipeLoop disposed: {ex.Message}");
+            Debug.WriteLine($"[BPM] ReadStdout disposed: {ex.Message}");
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[BPM] ReadPipeLoop error: {ex}");
+            Debug.WriteLine($"[BPM] ReadStdout error: {ex}");
         }
 
         if (!disposed)
@@ -242,8 +208,7 @@ public sealed class BrowserProcessManager : IDisposable
     }
 
     /// <summary>
-    /// Background dispatcher: reads from _recvChannel and calls DispatchPipeMessage.
-    /// Separate from ReadPipeLoopAsync so deserialization doesn't block pipe I/O.
+    /// Background dispatcher: processes received messages.
     /// </summary>
     private async Task ProcessRecvChannelAsync()
     {
@@ -251,9 +216,9 @@ public sealed class BrowserProcessManager : IDisposable
         {
             await foreach (var msg in _recvChannel.Reader.ReadAllAsync())
             {
-                if (!_ipcFrozen)  // Only dispatch if not frozen
+                if (!_ipcFrozen)
                 {
-                    DispatchPipeMessage(msg);
+                    DispatchMessage(msg);
                 }
             }
         }
@@ -264,10 +229,9 @@ public sealed class BrowserProcessManager : IDisposable
     }
 
     /// <summary>
-    /// Parses a pipe message line ("Cmd|arg") and fires the corresponding event.
-    /// Supported commands: Ready, AddressChanged, LoadError, NavState, TitleChanged.
+    /// Parse and dispatch messages from native process.
     /// </summary>
-    private void DispatchPipeMessage(string line)
+    private void DispatchMessage(string line)
     {
         try
         {
@@ -278,6 +242,7 @@ public sealed class BrowserProcessManager : IDisposable
             switch (cmd)
             {
                 case "Ready":
+                    Console.Error.WriteLine($"DIAG: BPM Received Ready HWND={arg}");
                     if (!string.IsNullOrEmpty(arg) &&
                         long.TryParse(arg, System.Globalization.NumberStyles.HexNumber, null, out var hwnd))
                         WindowHandleReceived?.Invoke(new IntPtr(hwnd));
@@ -291,106 +256,70 @@ public sealed class BrowserProcessManager : IDisposable
                     break;
                 case "NavState":
                     var parts = arg.Split('|');
-                    if (parts.Length == 3)
+                    if (parts.Length >= 1)
                         LoadingStateChanged?.Invoke(parts[0] == "1");
                     break;
                 case "TitleChanged":
                     TitleChanged?.Invoke(arg);
                     break;
+                case "OpenPopup":
+                    OpenPopup?.Invoke(arg);
+                    break;
                 default:
-                    Debug.WriteLine($"[BPM] Unknown pipe message: {cmd}");
+                    Debug.WriteLine($"[BPM] Unknown message: {cmd}");
                     break;
             }
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[BPM] DispatchPipeMessage error: {ex}");
+            Debug.WriteLine($"[BPM] DispatchMessage error: {ex}");
         }
     }
 
-    /// <summary>Send Navigate command to the native process.</summary>
     public Task NavigateAsync(string url)
     {
         lastUrl = url;
         return SendAsync("Navigate", url);
     }
 
-    /// <summary>Send Reload command.</summary>
     public Task ReloadAsync() => SendAsync("Reload", "");
-    /// <summary>Send Stop command.</summary>
     public Task StopAsync() => SendAsync("Stop", "");
-    /// <summary>Notify native process that HWND embedding is complete (shows the browser window).</summary>
     public Task SendEmbedDoneAsync() => SendAsync("EmbedDone", "");
-    /// <summary>Send resize notification to the native process.</summary>
     public Task SendResizeAsync(int w, int h) => SendAsync("Resize", $"{w}|{h}");
-    /// <summary>Send resize notification synchronously (enqueue to channel).</summary>
+
     public void SendResize(int w, int h)
     {
-        _lastWidth = w;  // Cache for resume
+        _lastWidth = w;
         _lastHeight = h;
         SendSync("Resize", $"{w}|{h}");
     }
 
-    /// <summary>
-    /// Freeze IPC communication. Used when tab becomes hidden.
-    /// Maintains pipe connection but stops processing messages.
-    /// </summary>
     public void FreezeIpc()
     {
         _ipcFrozen = true;
         Debug.WriteLine("[BPM] IPC frozen");
     }
 
-    /// <summary>
-    /// Resume IPC communication after freeze. Used when tab becomes visible.
-    /// Re-sends Resize to force CEF layout update.
-    /// </summary>
     public async Task ResumeIpcAsync()
     {
         _ipcFrozen = false;
         Debug.WriteLine("[BPM] IPC resuming");
-        // Force CEF to recalculate layout by sending current size
         await SendAsync("Resize", $"{_lastWidth}|{_lastHeight}");
     }
 
-    /// <summary>
-    /// Enqueue a command to the send channel. Non-blocking: the background writer thread
-    /// handles actual pipe I/O. If the channel is full, the oldest pending message is dropped.
-    /// </summary>
     private Task SendAsync(string cmd, string arg)
     {
         var msg = $"{cmd}|{arg}";
-        lock (_pendingBuffer)
-        {
-            if (!_pipeReady)
-            {
-                _pendingBuffer.Add(msg);
-                return Task.CompletedTask;
-            }
-        }
         _sendChannel.Writer.TryWrite(msg);
         return Task.CompletedTask;
     }
 
-    /// <summary>Synchronous enqueue (no Task allocation).</summary>
     private void SendSync(string cmd, string arg)
     {
         var msg = $"{cmd}|{arg}";
-        lock (_pendingBuffer)
-        {
-            if (!_pipeReady)
-            {
-                _pendingBuffer.Add(msg);
-                return;
-            }
-        }
         _sendChannel.Writer.TryWrite(msg);
     }
 
-    /// <summary>
-    /// Forcefully terminates the native process and cleans up pipe resources.
-    /// Channels are completed so background tasks exit cleanly.
-    /// </summary>
     private void Kill()
     {
         _sendChannel.Writer.TryComplete();
@@ -401,32 +330,30 @@ public sealed class BrowserProcessManager : IDisposable
             try
             {
                 if (!browserProcess.HasExited)
-                {
-                    browserProcess.Kill(entireProcessTree: true);
-                    browserProcess.WaitForExit(3000);
-                }
+                    browserProcess.Kill();
             }
-            catch
-            {
-            }
+            catch (Exception ex) { Debug.WriteLine($"[BPM] Kill error: {ex.Message}"); }
             browserProcess.Dispose();
             browserProcess = null;
         }
 
-        if (pipe != null)
-        {
-            pipe.Dispose();
-            pipe = null;
-            reader = null;
-            writer = null;
-        }
+        stdin?.Dispose();
+        stdout?.Dispose();
     }
 
     public void Dispose()
     {
         if (disposed) return;
         disposed = true;
-        AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
+
         Kill();
+
+        if (_writerTask != null)
+            _writerTask.Wait(2000);
+        if (_recvTask != null)
+            _recvTask.Wait(2000);
+
+        _sendChannel.Writer.TryComplete();
+        _recvChannel.Writer.TryComplete();
     }
 }

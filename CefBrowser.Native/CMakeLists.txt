@@ -13,7 +13,7 @@ endif()
 set(BROWSER_SRCS
     src/main.cpp
     src/browser_handler.cpp
-    src/pipe_server.cpp
+    src/stdio_server.cpp
 )
 
 SET_CEF_TARGET_OUT_DIR()

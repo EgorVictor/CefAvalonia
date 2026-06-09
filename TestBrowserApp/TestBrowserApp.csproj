@@ -30,10 +30,10 @@
     <ProjectReference Include="..\CefSharp.Avalonia\CefSharp.Avalonia.csproj" />
   </ItemGroup>
 
-  <!-- Copy CEF native files from NuGet cache -->
+  <!-- Copy CEF native files from C++ build output -->
   <Target Name="CopyCefNativeFiles" AfterTargets="Build">
     <PropertyGroup>
-      <_CefNativeSource>$(NuGetPackageRoot)cefsharp.avalonia\1.0.3\nativeBinaries\</_CefNativeSource>
+      <_CefNativeSource>..\CefBrowser.Native\build\Release\</_CefNativeSource>
     </PropertyGroup>
     <ItemGroup>
       <CefNativeFiles Include="$(_CefNativeSource)CefBrowser.Native.exe" />
@@ -55,16 +55,12 @@
     <Copy SourceFiles="@(CefNativeFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
     <!-- Copy locales -->
     <ItemGroup>
-      <CefLocales Include="$(NuGetPackageRoot)cefsharp.avalonia\1.0.3\nativeBinaries\locales\*.*" />
+      <CefLocales Include="$(_CefNativeSource)locales\*.*" />
     </ItemGroup>
     <Copy SourceFiles="@(CefLocales)" DestinationFolder="$(OutputPath)\locales\" SkipUnchangedFiles="true" />
     <ItemGroup>
       <ResolvedFileToPublish Include="@(CefNativeFiles)">
         <RelativePath>%(CefNativeFiles.Filename)%(CefNativeFiles.Extension)</RelativePath>
-        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
-      </ResolvedFileToPublish>
-      <ResolvedFileToPublish Include="@(CefLocales)">
-        <RelativePath>locales\%(CefLocales.Filename)%(CefLocales.Extension)</RelativePath>
         <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       </ResolvedFileToPublish>
     </ItemGroup>

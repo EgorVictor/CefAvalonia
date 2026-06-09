@@ -9,7 +9,7 @@
 //              NavState|isLoading|canGoBack|canGoForward, TitleChanged|title
 
 #include "browser_handler.h"
-#include "pipe_server.h"
+#include "stdio_server.h"
 #include "include/cef_app.h"
 #include "include/cef_browser.h"
 #include "include/cef_command_line.h"
@@ -35,7 +35,7 @@ static void StripTypeFromCommandLine();
 
 // ---- Globals ----
 static CefRefPtr<BrowserHandler> g_handler;
-static PipeServer* g_pipeServer = nullptr;
+static StdioServer* g_stdioServer = nullptr;
 static HANDLE g_browserReadyEvent = nullptr;
 static HANDLE g_shutdownEvent = nullptr;
 static HANDLE g_browserClosedEvent = nullptr;
@@ -262,7 +262,9 @@ static void StripTypeFromCommandLine() {
 }
 
 static void DoNavigate(const std::string& url) {
+    fprintf(stderr, "DIAG: [C++] DoNavigate url=%s handler=%p\n", url.c_str(), (void*)g_handler.get());
     auto b = g_handler ? g_handler->GetBrowser() : nullptr;
+    fprintf(stderr, "DIAG: [C++] DoNavigate browser=%p\n", (void*)b.get());
     if (b) b->GetMainFrame()->LoadURL(url);
 }
 
@@ -282,10 +284,12 @@ static void DoCloseBrowser() {
 }
 
 static void ExecuteCmd(const Cmd& c) {
+    fprintf(stderr, "DIAG: [C++] ExecuteCmd type=%d arg=%s\n", (int)c.type, c.arg.c_str()); fflush(stderr);
     switch (c.type) {
         case CmdType::Navigate:
             g_lastNavigateHost = GetHost(c.arg);
             g_lastNavTick = GetTickCount64();
+            fprintf(stderr, "DIAG: [C++] PostTask DoNavigate url=%s\n", c.arg.c_str()); fflush(stderr);
             CefPostTask(TID_UI, base::BindOnce(&DoNavigate, c.arg));
             break;
         case CmdType::Reload:
@@ -367,8 +371,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     ApplyCefSettingsFromArgs(settings);
 
-    if (!CefInitialize(mainArgs, settings, nullptr, nullptr))
+    fprintf(stderr, "DIAG: [C++] Calling CefInitialize\n"); fflush(stderr);
+    if (!CefInitialize(mainArgs, settings, nullptr, nullptr)) {
+        fprintf(stderr, "DIAG: [C++] CefInitialize FAILED\n"); fflush(stderr);
         return 1;
+    }
+    fprintf(stderr, "DIAG: [C++] CefInitialize OK, creating browser\n"); fflush(stderr);
 
     // ---- Step 5: Create Browser ----
     g_handler = new BrowserHandler();
@@ -392,22 +400,26 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     return;
             }
         }
-        if (g_pipeServer)
-            g_pipeServer->SendEvent("AddressChanged|" + DisplayUrl(u));
+        if (g_stdioServer)
+            g_stdioServer->SendEvent("AddressChanged|" + DisplayUrl(u));
     };
     g_handler->OnLoadErrorEvent = [](const std::string& s) {
-        if (g_pipeServer)
-            g_pipeServer->SendEvent("LoadError|" + s);
+        if (g_stdioServer)
+            g_stdioServer->SendEvent("LoadError|" + s);
     };
     g_handler->OnLoadingStateChanged = [](bool isLoading, bool canGoBack, bool canGoForward) {
-        if (g_pipeServer)
-            g_pipeServer->SendEvent("NavState|" + std::string(isLoading ? "1" : "0") + "|" +
+        if (g_stdioServer)
+            g_stdioServer->SendEvent("NavState|" + std::string(isLoading ? "1" : "0") + "|" +
                                     std::string(canGoBack ? "1" : "0") + "|" +
                                     std::string(canGoForward ? "1" : "0"));
     };
     g_handler->OnTitleChangedCB = [](const std::string& title) {
-        if (g_pipeServer)
-            g_pipeServer->SendEvent("TitleChanged|" + title);
+        if (g_stdioServer)
+            g_stdioServer->SendEvent("TitleChanged|" + title);
+    };
+    g_handler->OnBeforePopupCB = [](const std::string& url) {
+        if (g_stdioServer)
+            g_stdioServer->SendEvent("OpenPopup|" + url);
     };
 
     {
@@ -424,7 +436,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     CefWindowInfo wi;
     wi.SetAsChild(g_hiddenParent, CefRect(0, 0, 1280, 800));
     CefBrowserSettings bs;
+    fprintf(stderr, "DIAG: [C++] CreateBrowserSync url=%s\n", url.c_str()); fflush(stderr);
     CefBrowserHost::CreateBrowserSync(wi, g_handler, url, bs, nullptr, nullptr);
+    fprintf(stderr, "DIAG: [C++] CreateBrowserSync returned\n"); fflush(stderr);
 
     MSG msg;
     while (WaitForSingleObject(g_browserReadyEvent, 0) != WAIT_OBJECT_0) {
@@ -440,17 +454,21 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         Sleep(1);
     }
 
-    // ---- Step 6: Pipe server (skipped in standalone mode) ----
-    PipeServer* ps = nullptr;
-    if (!pipeName.empty() && !standalone) {
+    fprintf(stderr, "DIAG: [C++] Browser ready, starting StdioServer\n"); fflush(stderr);
 
-        ps = new PipeServer(pipeName, hostPid);
-        g_pipeServer = ps;
+    // ---- Step 6: Stdio server (skipped in standalone mode) ----
+    StdioServer* ps = nullptr;
+    if (!standalone) {
+
+        ps = new StdioServer();
+        g_stdioServer = ps;
 
         ps->Start(
             [&](const std::string& cmd, const std::string& arg) {
+                fprintf(stderr, "DIAG: [C++] onCommand cmd=%s arg=%s\n", cmd.c_str(), arg.c_str()); fflush(stderr);
                 if (cmd == "Navigate") {
                     std::string navUrl = NormalizeUrl(arg);
+                    fprintf(stderr, "DIAG: [C++] Normalized url=%s\n", navUrl.c_str()); fflush(stderr);
                     if (navUrl.empty()) return;
                     PushCmd(CmdType::Navigate, navUrl);
                 } else if (cmd == "Reload") {
@@ -485,7 +503,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             }
         );
     } else {
-        if (standalone && g_browserHwnd)
+        if (g_browserHwnd)
             ShowWindow(g_browserHwnd, SW_SHOW);
     }
 
@@ -530,10 +548,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         g_handler->OnTitleChangedCB = nullptr;
     }
 
-    if (g_pipeServer) {
-        g_pipeServer->Stop();
-        delete g_pipeServer;
-        g_pipeServer = nullptr;
+    if (g_stdioServer) {
+        g_stdioServer->Stop();
+        delete g_stdioServer;
+        g_stdioServer = nullptr;
     }
 
     CefPostTask(TID_UI, base::BindOnce(&DoCloseBrowser));
