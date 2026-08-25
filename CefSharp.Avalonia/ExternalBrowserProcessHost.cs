@@ -135,6 +135,17 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
         base.DestroyNativeControlCore(control);
     }
 
+    /// <summary>
+    /// Forget the embedded HWND. Call during permanent teardown (WebView.Cleanup) so that
+    /// a subsequent detach/destroy never calls SetParent/ShowWindow on a destroyed window.
+    /// </summary>
+    public void DetachEmbedded()
+    {
+        _pendingEmbedHwnd = IntPtr.Zero;
+        embeddedHwnd = IntPtr.Zero;
+        hostPanelHwnd = IntPtr.Zero;
+    }
+
     private const int GWL_STYLE = -16;
     private const uint WS_CHILD = 0x40000000;
     private const uint WS_POPUP = 0x80000000;

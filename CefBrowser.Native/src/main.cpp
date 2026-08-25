@@ -1,12 +1,17 @@
-﻿// CefBrowser.Native — CEF subprocess + browser host
+﻿// CefBrowser.Native — CEF subprocess + shared browser host
 // Architecture:
 //   WinMain → CefExecuteProcess (subprocess) | CefInitialize (main process)
-//   Main process: creates hidden CEF browser, hosts named pipe server,
-//   pumps messages, dispatches commands/events between C# (pipe client) and CEF.
-// IPC protocol (pipe messages):
-//   C#→Native: Navigate|url, Reload, Stop, Close, EmbedDone, Resize|w|h
-//   Native→C#: Ready|HWND_HEX, AddressChanged|url, LoadError|code|text|url,
-//              NavState|isLoading|canGoBack|canGoForward, TitleChanged|title
+//   Main process: hosts MULTIPLE CefBrowser instances (Chrome-style shared model),
+//   pumps messages, dispatches commands/events between C# (stdio) and CEF.
+//   Shared across browsers: GPU process, network service, storage service.
+//   Isolated per browser: renderer processes + optional RequestContext (own cache dir).
+// IPC protocol v2 (pipe messages, all commands/events carry a browser id):
+//   C#→Native: Create|{id}|{cachePath}|{url}, Navigate|{id}|{url}, Reload|{id},
+//              Stop|{id}, Resize|{id}|{w}|{h}, EmbedDone|{id}, Close|{id}, Quit
+//   Native→C#: Ready|{id}|{HWND_HEX}, AddressChanged|{id}|{url},
+//              LoadError|{id}|{code}|{text}|{url}, NavState|{id}|{l}|{b}|{f},
+//              TitleChanged|{id}|{title}, OpenPopup|{id}|{url}
+//   The process exits when the last browser closes or Quit is received.
 
 #include "browser_handler.h"
 #include "stdio_server.h"
@@ -14,6 +19,8 @@
 #include "include/cef_browser.h"
 #include "include/cef_command_line.h"
 #include "include/cef_frame.h"
+#include "include/cef_request_context.h"
+#include "include/cef_request_context_handler.h"
 #include "include/internal/cef_types_wrappers.h"
 #include "include/cef_task.h"
 #include "include/wrapper/cef_closure_task.h"
@@ -22,7 +29,12 @@
 #include <Windows.h>
 #include <shellapi.h>
 #include <cstdlib>
+#include <cstdint>
+#include <cstdarg>
+#include <cstdio>
 #include <string>
+#include <map>
+#include <vector>
 #include <queue>
 #include <mutex>
 
@@ -44,9 +56,64 @@ static HWND g_hiddenParent = nullptr;
 
 static const wchar_t kHiddenClass[] = L"CefHidden_{B3A0B1C2}";
 
-// ---- Navigation host tracking (filter stale OnAddressChange) ----
-static std::string g_lastNavigateHost;
-static ULONGLONG g_lastNavTick = 0;  // GetTickCount64, Win7+
+// ---- DIAG logging (silent unless CEF_DIAG=1) ----
+static bool g_diagEnabled = false;
+static void DiagLog(const char* fmt, ...) {
+    if (!g_diagEnabled) return;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+// ---- External message pump state ----
+// With external_message_pump=true CEF asks us (OnScheduleMessagePumpWork) to run
+// CefDoMessageLoopWork within delay_ms. We park the main thread on kernel waits
+// instead of the old Sleep(1) poll loop: idle CPU drops to ~0%.
+static HANDLE g_pumpWakeEvent = nullptr;   // auto-reset, wakes pump for early deadlines / IPC
+static std::mutex g_pumpMutex;
+static ULONGLONG g_pumpDueTick = 0;        // absolute GetTickCount64 deadline; 0 = nothing pending
+static uint32_t g_pumpGen = 0;             // bumped on every schedule request
+
+class PumpApp : public CefApp, public CefBrowserProcessHandler {
+public:
+    PumpApp() = default;
+
+    CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return this; }
+
+    void OnScheduleMessagePumpWork(int64 delay_ms) override {
+        if (delay_ms < 0) delay_ms = 0;
+        ULONGLONG due = GetTickCount64() + (ULONGLONG)delay_ms;
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> lock(g_pumpMutex);
+            if (g_pumpDueTick == 0 || due < g_pumpDueTick) { g_pumpDueTick = due; wake = true; }
+            g_pumpGen++;
+        }
+        if (wake && g_pumpWakeEvent) SetEvent(g_pumpWakeEvent);
+    }
+private:
+    IMPLEMENT_REFCOUNTING(PumpApp);
+};
+static CefRefPtr<PumpApp> g_pumpApp;
+
+static void WakePump() {
+    if (g_pumpWakeEvent) SetEvent(g_pumpWakeEvent);
+}
+
+static uint32_t PumpGenSnapshot() {
+    std::lock_guard<std::mutex> lock(g_pumpMutex);
+    return g_pumpGen;
+}
+
+static DWORD PumpWaitTimeoutMs() {
+    std::lock_guard<std::mutex> lock(g_pumpMutex);
+    if (g_pumpDueTick == 0) return INFINITE;
+    ULONGLONG now = GetTickCount64();
+    return now >= g_pumpDueTick ? 0 : (DWORD)(g_pumpDueTick - now);
+}
 
 // ---- URL normalization (all browser logic in C++) ----
 static std::string NormalizeUrl(const std::string& input) {
@@ -103,14 +170,17 @@ static std::string GetHost(const std::string& url) {
 }
 
 // ---- Command queue (pipe thread -> main pump) ----
-enum class CmdType { Navigate, Reload, Stop, Close, None };
-struct Cmd { CmdType type; std::string arg; };
+enum class CmdType { Create, Navigate, Reload, Stop, CloseOne, Resize, EmbedDone, Quit, None };
+struct Cmd { CmdType type; int id = 0; std::string arg; };
 static std::queue<Cmd> g_cmdQueue;
 static std::mutex g_cmdMutex;
 
-static void PushCmd(CmdType type, const std::string& arg = "") {
-    std::lock_guard<std::mutex> lock(g_cmdMutex);
-    g_cmdQueue.push({type, arg});
+static void PushCmd(CmdType type, int id = 0, const std::string& arg = "") {
+    {
+        std::lock_guard<std::mutex> lock(g_cmdMutex);
+        g_cmdQueue.push({type, id, arg});
+    }
+    WakePump();
 }
 
 static Cmd PopCmd() {
@@ -121,18 +191,23 @@ static Cmd PopCmd() {
     return c;
 }
 
-// ---- Resize overwrite semantics ----
-static std::mutex g_resizeMutex;
-static bool g_resizeDirty = false;
-static int g_resizeW = 0, g_resizeH = 0;
+// ---- Browser instance registry (shared host, N browsers) ----
+struct BrowserInstance {
+    int id = 0;
+    CefRefPtr<BrowserHandler> handler;
+    HWND parentHwnd = nullptr;
+    // Navigation host filter state (per browser, was global before multi-browser)
+    std::string lastNavigateHost;
+    ULONGLONG lastNavTick = 0;
+};
+static std::map<int, BrowserInstance> g_browsers;
+static std::mutex g_browsersMutex;
 
-static void PushResize(int w, int h) {
-    if (w <= 0 || h <= 0) return;
-    std::lock_guard<std::mutex> lock(g_resizeMutex);
-    g_resizeW = w;
-    g_resizeH = h;
-    g_resizeDirty = true;
+static void SendEv(const std::string& line) {
+    if (g_stdioServer) g_stdioServer->SendEvent(line);
 }
+
+static bool g_standaloneMode = false;
 
 static bool HasArg(LPCWSTR arg) {
     int argc = 0;
@@ -261,44 +336,190 @@ static void StripTypeFromCommandLine() {
     }
 }
 
-static void DoNavigate(const std::string& url) {
-    fprintf(stderr, "DIAG: [C++] DoNavigate url=%s handler=%p\n", url.c_str(), (void*)g_handler.get());
-    auto b = g_handler ? g_handler->GetBrowser() : nullptr;
-    fprintf(stderr, "DIAG: [C++] DoNavigate browser=%p\n", (void*)b.get());
+static CefRefPtr<CefBrowser> FindBrowser(int id) {
+    std::lock_guard<std::mutex> lock(g_browsersMutex);
+    auto it = g_browsers.find(id);
+    return it != g_browsers.end() ? it->second.handler->GetBrowser() : nullptr;
+}
+
+static void DoNavigate(int id, const std::string& url) {
+    DiagLog("DIAG: [C++] DoNavigate id=%d url=%s", id, url.c_str());
+    auto b = FindBrowser(id);
     if (b) b->GetMainFrame()->LoadURL(url);
 }
 
-static void DoReload() {
-    auto b = g_handler ? g_handler->GetBrowser() : nullptr;
+static void DoReload(int id) {
+    auto b = FindBrowser(id);
     if (b) b->Reload();
 }
 
-static void DoStop() {
-    auto b = g_handler ? g_handler->GetBrowser() : nullptr;
+static void DoStop(int id) {
+    auto b = FindBrowser(id);
     if (b) b->StopLoad();
 }
 
-static void DoCloseBrowser() {
-    auto b = g_handler ? g_handler->GetBrowser() : nullptr;
+static void DoCloseBrowser(int id) {
+    auto b = FindBrowser(id);
     if (b) b->GetHost()->CloseBrowser(true);
 }
 
+static void RequestCloseAllBrowsers() {
+    std::vector<int> ids;
+    {
+        std::lock_guard<std::mutex> lock(g_browsersMutex);
+        for (auto& [k, v] : g_browsers) ids.push_back(k);
+    }
+    for (int id : ids)
+        CefPostTask(TID_UI, base::BindOnce(&DoCloseBrowser, id));
+}
+
+// Create a browser on the UI thread. cachePath empty → shared default context,
+// otherwise a dedicated RequestContext (isolated cookies/storage per browser).
+static void DoCreateBrowser(int id, const std::string& cachePath, const std::string& url) {
+    {
+        std::lock_guard<std::mutex> lock(g_browsersMutex);
+        if (g_browsers.count(id)) { DiagLog("DIAG: [C++] Create id=%d already exists", id); return; }
+    }
+
+    DWORD style = WS_POPUP | WS_CLIPCHILDREN;   // hidden 1x1 parent; Resize moves the child
+    HWND parent = CreateWindowExW(0, kHiddenClass, L"", style, 0, 0, 1, 1,
+                                  nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!parent) { DiagLog("DIAG: [C++] Create id=%d parent window FAILED", id); SendEv("LoadError|" + std::to_string(id) + "|-100|CreateWindow failed|"); return; }
+
+    auto handler = new BrowserHandler();
+    handler->OnBrowserReady = [id](HWND hwnd) {
+        char hwndHex[32];
+        sprintf_s(hwndHex, "%I64X", (unsigned long long)(LONG_PTR)hwnd);
+        SendEv("Ready|" + std::to_string(id) + "|" + hwndHex);
+    };
+    handler->OnBrowserClosed = [id]() {
+        HWND parentToDestroy = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_browsersMutex);
+            auto it = g_browsers.find(id);
+            if (it != g_browsers.end()) {
+                parentToDestroy = it->second.parentHwnd;
+                g_browsers.erase(it);
+            }
+        }
+        if (parentToDestroy) DestroyWindow(parentToDestroy);
+        // Host lifetime is owned by the C# side: it stays alive until an explicit
+        // Quit or stdin EOF (parent process death). Do NOT exit just because the
+        // last browser closed — the app may open a new tab afterwards.
+    };
+    handler->OnAddressChanged = [id](const std::string& u) {
+        std::string host = GetHost(u);
+        ULONGLONG nowTick = GetTickCount64();
+        {
+            std::lock_guard<std::mutex> lock(g_browsersMutex);
+            auto it = g_browsers.find(id);
+            if (it != g_browsers.end()) {
+                auto& bi = it->second;
+                if (!bi.lastNavigateHost.empty() && nowTick - bi.lastNavTick < 5000) {
+                    if (host.empty()) return;
+                    bool matches = (host.find(bi.lastNavigateHost) != std::string::npos ||
+                                    bi.lastNavigateHost.find(host) != std::string::npos);
+                    if (!matches) return;
+                }
+            }
+        }
+        SendEv("AddressChanged|" + std::to_string(id) + "|" + DisplayUrl(u));
+    };
+    handler->OnLoadErrorEvent = [id](const std::string& s) {
+        SendEv("LoadError|" + std::to_string(id) + "|" + s);
+    };
+    handler->OnLoadingStateChanged = [id](bool isLoading, bool canGoBack, bool canGoForward) {
+        SendEv("NavState|" + std::to_string(id) + "|" + std::string(isLoading ? "1" : "0") + "|" +
+               std::string(canGoBack ? "1" : "0") + "|" + std::string(canGoForward ? "1" : "0"));
+    };
+    handler->OnTitleChangedCB = [id](const std::string& title) {
+        SendEv("TitleChanged|" + std::to_string(id) + "|" + title);
+    };
+    handler->OnBeforePopupCB = [id](const std::string& popupUrl) {
+        SendEv("OpenPopup|" + std::to_string(id) + "|" + popupUrl);
+    };
+
+    CefRequestContextSettings rcs;
+    CefRefPtr<CefRequestContext> requestCtx;
+    if (!cachePath.empty()) {
+        CefString(&rcs.cache_path) = cachePath;
+        requestCtx = CefRequestContext::CreateContext(rcs, nullptr);
+    }
+
+    CefWindowInfo wi;
+    wi.SetAsChild(parent, CefRect(0, 0, 1280, 800));
+    CefBrowserSettings bs;
+    DiagLog("DIAG: [C++] CreateBrowserSync id=%d url=%s cache=%s", id, url.c_str(), cachePath.c_str());
+
+    {
+        std::lock_guard<std::mutex> lock(g_browsersMutex);
+        g_browsers[id] = {id, handler, parent};
+    }
+    CefBrowserHost::CreateBrowserSync(wi, handler, url.empty() ? "about:blank" : url, bs, nullptr, requestCtx);
+}
+
 static void ExecuteCmd(const Cmd& c) {
-    fprintf(stderr, "DIAG: [C++] ExecuteCmd type=%d arg=%s\n", (int)c.type, c.arg.c_str()); fflush(stderr);
+    DiagLog("DIAG: [C++] ExecuteCmd type=%d id=%d arg=%s", (int)c.type, c.id, c.arg.c_str());
     switch (c.type) {
+        case CmdType::Create: {
+            // "cachePath|url" (either may be empty)
+            auto sep = c.arg.find('|');
+            std::string cachePath = sep != std::string::npos ? c.arg.substr(0, sep) : "";
+            std::string url = sep != std::string::npos ? c.arg.substr(sep + 1) : c.arg;
+            DoCreateBrowser(c.id, cachePath, NormalizeUrl(url));
+            break;
+        }
         case CmdType::Navigate:
-            g_lastNavigateHost = GetHost(c.arg);
-            g_lastNavTick = GetTickCount64();
-            fprintf(stderr, "DIAG: [C++] PostTask DoNavigate url=%s\n", c.arg.c_str()); fflush(stderr);
-            CefPostTask(TID_UI, base::BindOnce(&DoNavigate, c.arg));
+            {
+                std::lock_guard<std::mutex> lock(g_browsersMutex);
+                auto it = g_browsers.find(c.id);
+                if (it != g_browsers.end()) {
+                    it->second.lastNavigateHost = GetHost(c.arg);
+                    it->second.lastNavTick = GetTickCount64();
+                }
+            }
+            DiagLog("DIAG: [C++] PostTask DoNavigate id=%d url=%s", c.id, c.arg.c_str());
+            CefPostTask(TID_UI, base::BindOnce(&DoNavigate, c.id, c.arg));
             break;
         case CmdType::Reload:
-            CefPostTask(TID_UI, base::BindOnce(&DoReload));
+            CefPostTask(TID_UI, base::BindOnce(&DoReload, c.id));
             break;
         case CmdType::Stop:
-            CefPostTask(TID_UI, base::BindOnce(&DoStop));
+            CefPostTask(TID_UI, base::BindOnce(&DoStop, c.id));
             break;
-        case CmdType::Close:
+        case CmdType::CloseOne:
+            CefPostTask(TID_UI, base::BindOnce(&DoCloseBrowser, c.id));
+            break;
+        case CmdType::Resize: {
+            // "w|h" — apply directly to this browser's HWND (latest wins)
+            HWND target = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_browsersMutex);
+                auto it = g_browsers.find(c.id);
+                if (it != g_browsers.end()) {
+                    // coalesce via per-instance dirty handled inline; direct move is fine here
+                    target = it->second.handler->GetBrowserHwnd();
+                }
+            }
+            if (!target) break;
+            auto sep2 = c.arg.find('|');
+            if (sep2 == std::string::npos) break;
+            int w = atoi(c.arg.substr(0, sep2).c_str());
+            int h = atoi(c.arg.substr(sep2 + 1).c_str());
+            if (w > 0 && h > 0) MoveWindow(target, 0, 0, w, h, FALSE);
+            break;
+        }
+        case CmdType::EmbedDone: {
+            HWND target = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_browsersMutex);
+                auto it = g_browsers.find(c.id);
+                if (it != g_browsers.end()) target = it->second.handler->GetBrowserHwnd();
+            }
+            if (target) ShowWindow(target, SW_SHOW);
+            break;
+        }
+        case CmdType::Quit:
             SetEvent(g_shutdownEvent);
             break;
         default: break;
@@ -319,12 +540,15 @@ static ATOM RegisterHiddenClass() {
 // ========================================================================
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
+    g_diagEnabled = GetEnv("CEF_DIAG") == "1";
+
     // ---- Step 1: CEF subprocess detection ----
     // If --type= is present (CEF-spawned child process: renderer, GPU, etc.),
     // CefExecuteProcess handles the subprocess message loop and never returns.
     // Otherwise it returns -1 and we continue as the main browser process.
     CefMainArgs mainArgs(hInstance);
-    int cefRet = CefExecuteProcess(mainArgs, nullptr, nullptr);
+    g_pumpApp = new PumpApp();
+    int cefRet = CefExecuteProcess(mainArgs, g_pumpApp, nullptr);
     if (cefRet >= 0)
         return cefRet;
 
@@ -352,7 +576,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     g_browserReadyEvent  = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_shutdownEvent      = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_browserClosedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_browserReadyEvent || !g_shutdownEvent || !g_browserClosedEvent)
+    g_pumpWakeEvent      = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // auto-reset
+    if (!g_browserReadyEvent || !g_shutdownEvent || !g_browserClosedEvent || !g_pumpWakeEvent)
         return 1;
 
     RegisterHiddenClass();
@@ -361,6 +586,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     CefSettings settings;
     settings.multi_threaded_message_loop = false;
+    // Event-driven pump: idle main thread blocks on kernel objects instead of
+    // polling CefDoMessageLoopWork at 1kHz. Overridable via --cef-external-message-pump=false.
+    settings.external_message_pump = true;
     settings.no_sandbox = true;
 
     char exePath[MAX_PATH];
@@ -371,92 +599,70 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     ApplyCefSettingsFromArgs(settings);
 
-    fprintf(stderr, "DIAG: [C++] Calling CefInitialize\n"); fflush(stderr);
-    if (!CefInitialize(mainArgs, settings, nullptr, nullptr)) {
-        fprintf(stderr, "DIAG: [C++] CefInitialize FAILED\n"); fflush(stderr);
+    DiagLog("DIAG: [C++] Calling CefInitialize");
+    if (!CefInitialize(mainArgs, settings, g_pumpApp, nullptr)) {
+        DiagLog("DIAG: [C++] CefInitialize FAILED");
         return 1;
     }
-    fprintf(stderr, "DIAG: [C++] CefInitialize OK, creating browser\n"); fflush(stderr);
+    DiagLog("DIAG: [C++] CefInitialize OK");
+    g_standaloneMode = standalone;
 
-    // ---- Step 5: Create Browser ----
-    g_handler = new BrowserHandler();
+    // ---- Step 5b: Standalone mode auto-creates a single visible browser ----
+    if (standalone) {
+        g_handler = new BrowserHandler();
+        g_handler->OnBrowserReady = [](HWND hwnd) {
+            g_browserHwnd = hwnd;
+            SetEvent(g_browserReadyEvent);
+        };
+        g_handler->OnAddressChanged = [](const std::string& u) {
+            SendEv("AddressChanged|" + DisplayUrl(u));
+        };
 
-    g_handler->OnBrowserReady = [](HWND hwnd) {
-        g_browserHwnd = hwnd;
-        SetEvent(g_browserReadyEvent);
-    };
-    g_handler->OnBrowserClosed = []() {
-        SetEvent(g_browserClosedEvent);
-    };
-    g_handler->OnAddressChanged = [](const std::string& u) {
-        std::string host = GetHost(u);
-        if (!g_lastNavigateHost.empty()) {
-            if (GetTickCount64() - g_lastNavTick < 5000) {
-                if (host.empty())
-                    return;
-                bool matches = (host.find(g_lastNavigateHost) != std::string::npos ||
-                                g_lastNavigateHost.find(host) != std::string::npos);
-                if (!matches)
-                    return;
-            }
-        }
-        if (g_stdioServer)
-            g_stdioServer->SendEvent("AddressChanged|" + DisplayUrl(u));
-    };
-    g_handler->OnLoadErrorEvent = [](const std::string& s) {
-        if (g_stdioServer)
-            g_stdioServer->SendEvent("LoadError|" + s);
-    };
-    g_handler->OnLoadingStateChanged = [](bool isLoading, bool canGoBack, bool canGoForward) {
-        if (g_stdioServer)
-            g_stdioServer->SendEvent("NavState|" + std::string(isLoading ? "1" : "0") + "|" +
-                                    std::string(canGoBack ? "1" : "0") + "|" +
-                                    std::string(canGoForward ? "1" : "0"));
-    };
-    g_handler->OnTitleChangedCB = [](const std::string& title) {
-        if (g_stdioServer)
-            g_stdioServer->SendEvent("TitleChanged|" + title);
-    };
-    g_handler->OnBeforePopupCB = [](const std::string& url) {
-        if (g_stdioServer)
-            g_stdioServer->SendEvent("OpenPopup|" + url);
-    };
-
-    {
-        DWORD style = standalone ? (WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE)
-                                 : (WS_POPUP | WS_CLIPCHILDREN);
-        int w = standalone ? 1280 : 1;
-        int h = standalone ? 800 : 1;
-        g_hiddenParent = CreateWindowExW(0, kHiddenClass,
-            standalone ? L"CEF Browser Test" : L"",
-            style, CW_USEDEFAULT, CW_USEDEFAULT, w, h,
+        DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE;
+        g_hiddenParent = CreateWindowExW(0, kHiddenClass, L"CEF Browser Test",
+            style, CW_USEDEFAULT, CW_USEDEFAULT, 1280, 800,
             nullptr, nullptr, hInstance, nullptr);
-    }
 
-    CefWindowInfo wi;
-    wi.SetAsChild(g_hiddenParent, CefRect(0, 0, 1280, 800));
-    CefBrowserSettings bs;
-    fprintf(stderr, "DIAG: [C++] CreateBrowserSync url=%s\n", url.c_str()); fflush(stderr);
-    CefBrowserHost::CreateBrowserSync(wi, g_handler, url, bs, nullptr, nullptr);
-    fprintf(stderr, "DIAG: [C++] CreateBrowserSync returned\n"); fflush(stderr);
+        CefWindowInfo wi;
+        wi.SetAsChild(g_hiddenParent, CefRect(0, 0, 1280, 800));
+        CefBrowserSettings bs;
+        DiagLog("DIAG: [C++] CreateBrowserSync url=%s", url.c_str());
+        CefBrowserHost::CreateBrowserSync(wi, g_handler, url, bs, nullptr, nullptr);
+        DiagLog("DIAG: [C++] CreateBrowserSync returned");
 
-    MSG msg;
-    while (WaitForSingleObject(g_browserReadyEvent, 0) != WAIT_OBJECT_0) {
-        if (WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0) {
-            CefShutdown();
-            return 1;
+        // Wait for browser ready: event-driven pump (50ms cap is a safety floor only).
+        HANDLE waits[3] = { g_shutdownEvent, g_pumpWakeEvent, g_browserReadyEvent };
+        while (WaitForSingleObject(g_browserReadyEvent, 0) != WAIT_OBJECT_0) {
+            DWORD waitMs = PumpWaitTimeoutMs();
+            if (waitMs > 50) waitMs = 50;
+            uint32_t genBefore = PumpGenSnapshot();
+            DWORD wr = MsgWaitForMultipleObjectsEx(3, waits, waitMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if (wr == WAIT_OBJECT_0) {           // shutdown requested
+                CefShutdown();
+                return 1;
+            }
+            if (wr == WAIT_OBJECT_0 + 2) break;  // browser ready
+
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            bool timerDue = false;
+            {
+                std::lock_guard<std::mutex> lock(g_pumpMutex);
+                if (g_pumpDueTick != 0 && GetTickCount64() >= g_pumpDueTick) { g_pumpDueTick = 0; timerDue = true; }
+            }
+            if (timerDue || PumpGenSnapshot() != genBefore || wr == WAIT_OBJECT_0 + 1)
+                CefDoMessageLoopWork();
         }
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        CefDoMessageLoopWork();
-        Sleep(1);
+        DiagLog("DIAG: [C++] Browser ready");
     }
-
-    fprintf(stderr, "DIAG: [C++] Browser ready, starting StdioServer\n"); fflush(stderr);
 
     // ---- Step 6: Stdio server (skipped in standalone mode) ----
+    // Protocol v2: every command carries a browser id.
+    //   Create|{id}|{cachePath}|{url}   Navigate|{id}|{url}   Reload|{id}
+    //   Stop|{id}   Resize|{id}|{w}|{h}   EmbedDone|{id}   Close|{id}   Quit
     StdioServer* ps = nullptr;
     if (!standalone) {
 
@@ -465,41 +671,53 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
         ps->Start(
             [&](const std::string& cmd, const std::string& arg) {
-                fprintf(stderr, "DIAG: [C++] onCommand cmd=%s arg=%s\n", cmd.c_str(), arg.c_str()); fflush(stderr);
-                if (cmd == "Navigate") {
-                    std::string navUrl = NormalizeUrl(arg);
-                    fprintf(stderr, "DIAG: [C++] Normalized url=%s\n", navUrl.c_str()); fflush(stderr);
+                DiagLog("DIAG: [C++] onCommand cmd=%s arg=%s", cmd.c_str(), arg.c_str());
+                // Helper: split leading "{id}|" off arg. Returns -1 on malformed input.
+                auto splitId = [](const std::string& s, int& idOut, std::string& restOut) -> bool {
+                    auto sp = s.find('|');
+                    if (sp == std::string::npos) return false;
+                    idOut = atoi(s.substr(0, sp).c_str());
+                    restOut = s.substr(sp + 1);
+                    return idOut > 0;
+                };
+
+                if (cmd == "Create") {
+                    int id; std::string rest;
+                    if (!splitId(arg, id, rest)) return;
+                    // rest = "{cachePath}|{url}" (either may be empty)
+                    PushCmd(CmdType::Create, id, rest);
+                } else if (cmd == "Navigate") {
+                    int id; std::string navUrl;
+                    if (!splitId(arg, id, navUrl)) return;
+                    navUrl = NormalizeUrl(navUrl);
+                    DiagLog("DIAG: [C++] Normalized url=%s", navUrl.c_str());
                     if (navUrl.empty()) return;
-                    PushCmd(CmdType::Navigate, navUrl);
-                } else if (cmd == "Reload") {
-                    PushCmd(CmdType::Reload);
-                } else if (cmd == "Stop") {
-                    PushCmd(CmdType::Stop);
+                    PushCmd(CmdType::Navigate, id, navUrl);
+                } else if (cmd == "Reload" || cmd == "Stop" || cmd == "EmbedDone") {
+                    int id = atoi(arg.c_str());
+                    if (id <= 0) return;
+                    CmdType t = cmd == "Reload" ? CmdType::Reload
+                              : cmd == "Stop"   ? CmdType::Stop
+                                                : CmdType::EmbedDone;
+                    PushCmd(t, id);
+                } else if (cmd == "Resize") {
+                    // arg = "{id}|{w}|{h}"
+                    int id; std::string wh;
+                    if (!splitId(arg, id, wh)) return;
+                    PushCmd(CmdType::Resize, id, wh);
                 } else if (cmd == "Close") {
-                    PushCmd(CmdType::Close);
-                } else if (cmd == "EmbedDone") {
-                    if (g_browserHwnd) {
-                        ShowWindow(g_browserHwnd, SW_SHOW);
-                        {
-                            std::lock_guard<std::mutex> lock(g_resizeMutex);
-                            if (g_resizeDirty && g_resizeW > 0 && g_resizeH > 0) {
-                                MoveWindow(g_browserHwnd, 0, 0, g_resizeW, g_resizeH, TRUE);
-                                g_resizeDirty = false;
-                            }
-                        }
-                    }
+                    int id = atoi(arg.c_str());
+                    if (id <= 0) return;
+                    PushCmd(CmdType::CloseOne, id);
+                } else if (cmd == "Quit") {
+                    PushCmd(CmdType::Quit);
                 }
             },
-            [](int w, int h) {
-                PushResize(w, h);
+            [&]() {
+                SetEvent(g_shutdownEvent);   // host disconnected → shut down
             },
             [&]() {
-                SetEvent(g_shutdownEvent);
-            },
-            [&]() {
-                char hwndHex[32];
-                sprintf_s(hwndHex, "%I64X", (unsigned long long)(LONG_PTR)g_browserHwnd);
-                ps->SendEvent("Ready|" + std::string(hwndHex));
+                // No handshake needed: Ready events are sent per browser after Create.
             }
         );
     } else {
@@ -507,66 +725,111 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ShowWindow(g_browserHwnd, SW_SHOW);
     }
 
-    // ---- Step 7: Main message pump ----
-    while (true) {
+    // ---- Step 7: Main message pump (event-driven external_message_pump) ----
+    // Blocks on {shutdown, pump-wake} + Win32 input. Wakes for: CEF scheduled work,
+    // IPC commands/resizes (WakePump), OS messages. Idle = 0% CPU.
+    bool running = true;
+    while (running) {
+        uint32_t genBefore = PumpGenSnapshot();
+        DWORD waitMs = PumpWaitTimeoutMs();
+
+        HANDLE waits[2] = { g_shutdownEvent, g_pumpWakeEvent };
+        DWORD wr = MsgWaitForMultipleObjectsEx(2, waits, waitMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+
+        if (wr == WAIT_OBJECT_0)
+            break;                                   // shutdown requested
+
+        // Drain pending Win32 messages
+        MSG msg;
+        bool haveMsgs = false;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) break;
+            haveMsgs = true;
+            if (msg.message == WM_QUIT) { running = false; break; }
             if (standalone && msg.message == WM_CLOSE) {
                 SetEvent(g_shutdownEvent);
+                running = false;
                 break;
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
-        if (WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0)
-            break;
-
-        {
-            std::lock_guard<std::mutex> lock(g_resizeMutex);
-            if (g_resizeDirty && g_browserHwnd) {
-                MoveWindow(g_browserHwnd, 0, 0, g_resizeW, g_resizeH, FALSE);
-                g_resizeDirty = false;
-            }
-        }
-
+        // IPC commands (PushCmd woke the pump)
         for (;;) {
             auto c = PopCmd();
             if (c.type == CmdType::None) break;
             ExecuteCmd(c);
         }
 
-        CefDoMessageLoopWork();
-        Sleep(1);
+        // CEF work: due timer elapsed, or new work was scheduled, or OS input arrived
+        bool timerDue = false;
+        {
+            std::lock_guard<std::mutex> lock(g_pumpMutex);
+            if (g_pumpDueTick != 0 && GetTickCount64() >= g_pumpDueTick) { g_pumpDueTick = 0; timerDue = true; }
+        }
+        if (timerDue || PumpGenSnapshot() != genBefore || haveMsgs || wr == WAIT_OBJECT_0 + 1)
+            CefDoMessageLoopWork();
     }
 
     // ---- Step 8: Shutdown ----
-    if (g_handler) {
-        g_handler->OnAddressChanged = nullptr;
-        g_handler->OnLoadErrorEvent = nullptr;
-        g_handler->OnLoadingStateChanged = nullptr;
-        g_handler->OnTitleChangedCB = nullptr;
-    }
-
-    if (g_stdioServer) {
-        g_stdioServer->Stop();
-        delete g_stdioServer;
-        g_stdioServer = nullptr;
-    }
-
-    CefPostTask(TID_UI, base::BindOnce(&DoCloseBrowser));
+    // Detach all instance callbacks so late CEF events don't touch dead pipes.
     {
-        int pumps = 0;
-        while (WaitForSingleObject(g_browserClosedEvent, 10) == WAIT_TIMEOUT && pumps < 500) {
-            CefDoMessageLoopWork();
-            pumps++;
+        std::lock_guard<std::mutex> lock(g_browsersMutex);
+        for (auto& [k, inst] : g_browsers) {
+            if (inst.handler) {
+                inst.handler->OnAddressChanged = nullptr;
+                inst.handler->OnLoadErrorEvent = nullptr;
+                inst.handler->OnLoadingStateChanged = nullptr;
+                inst.handler->OnTitleChangedCB = nullptr;
+                inst.handler->OnBeforePopupCB = nullptr;
+                inst.handler->OnBrowserReady = nullptr;
+            }
         }
     }
 
-    g_handler = nullptr;
-    CefShutdown();
+    // Gracefully close every remaining browser FIRST (server still up for events),
+    // then tear down stdio LAST — Stop() unblocks the reader via CancelIoEx.
+    RequestCloseAllBrowsers();
+    {
+        ULONGLONG deadline = GetTickCount64() + 5000;
+        for (;;) {
+            bool empty = false;
+            {
+                std::lock_guard<std::mutex> lock(g_browsersMutex);
+                empty = g_browsers.empty();
+            }
+            if (empty) break;
+            ULONGLONG now = GetTickCount64();
+            if (now >= deadline) break;
+
+            DWORD waitMs = PumpWaitTimeoutMs();
+            if (waitMs > (DWORD)(deadline - now)) waitMs = (DWORD)(deadline - now);
+            if (waitMs > 50) waitMs = 50;
+            uint32_t genBefore = PumpGenSnapshot();
+
+            MSG msg;
+            bool haveMsgs = false;
+            if (MsgWaitForMultipleObjectsEx(0, nullptr, waitMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+                == WAIT_OBJECT_0) {
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    haveMsgs = true;
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            bool timerDue = false;
+            {
+                std::lock_guard<std::mutex> lock(g_pumpMutex);
+                if (g_pumpDueTick != 0 && GetTickCount64() >= g_pumpDueTick) { g_pumpDueTick = 0; timerDue = true; }
+            }
+            if (timerDue || PumpGenSnapshot() != genBefore || haveMsgs)
+                CefDoMessageLoopWork();
+        }
+    }
 
     if (g_hiddenParent) DestroyWindow(g_hiddenParent);
 
+    CefShutdown();
     return 0;
 }

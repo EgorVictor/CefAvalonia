@@ -12,14 +12,14 @@ StdioServer::~StdioServer()
     Stop();
 }
 
-void StdioServer::Start(StdioCommandCallback onCommand, std::function<void(int, int)> onResize,
+void StdioServer::Start(StdioCommandCallback onCommand,
                         std::function<void()> onDisconnect, std::function<void()> onConnected)
 {
     running_ = true;
     writer_running_ = true;
 
     reader_thread_ = std::thread(&StdioServer::ReaderThreadProc, this,
-                                 std::move(onCommand), std::move(onResize),
+                                 std::move(onCommand),
                                  std::move(onDisconnect), std::move(onConnected));
     writer_thread_ = std::thread(&StdioServer::WriterThreadProc, this);
 }
@@ -28,6 +28,14 @@ void StdioServer::Stop()
 {
     running_ = false;
     writer_running_ = false;
+
+    // Unblock the reader thread if it is parked in getline(stdin): cancel the
+    // pending read on the standard input handle. Without this, Stop() would
+    // deadlock whenever the C# side keeps its stdin StreamWriter open (e.g.
+    // Quit-after-last-browser path where the host process is still alive).
+    HANDLE stdIn = GetStdHandle(STD_INPUT_HANDLE);
+    if (stdIn && stdIn != INVALID_HANDLE_VALUE)
+        CancelIoEx(stdIn, nullptr);
 
     if (reader_thread_.joinable())
         reader_thread_.join();
@@ -41,7 +49,7 @@ void StdioServer::SendEvent(const std::string& message)
     write_queue_.push(message);
 }
 
-void StdioServer::ReaderThreadProc(StdioCommandCallback onCommand, std::function<void(int, int)> onResize,
+void StdioServer::ReaderThreadProc(StdioCommandCallback onCommand,
                                    std::function<void()> onDisconnect, std::function<void()> onConnected)
 {
     if (onConnected) onConnected();
@@ -55,20 +63,20 @@ void StdioServer::ReaderThreadProc(StdioCommandCallback onCommand, std::function
         std::string cmd = (sep != std::string::npos) ? line.substr(0, sep) : line;
         std::string arg = (sep != std::string::npos) ? line.substr(sep + 1) : "";
 
-        fprintf(stderr, "DIAG: [C++] Recv cmd=%s arg=%s\n", cmd.c_str(), arg.c_str()); fflush(stderr);
-
-        if (cmd == "Resize" && onResize)
         {
-            // Parse "w|h" from arg
-            auto sep2 = arg.find('|');
-            if (sep2 != std::string::npos)
-            {
-                int w = std::stoi(arg.substr(0, sep2));
-                int h = std::stoi(arg.substr(sep2 + 1));
-                onResize(w, h);
+            // DIAG logging is silent unless CEF_DIAG=1 (avoids per-message stderr flush cost)
+            static const bool diagEnabled = [] {
+                const char* e = std::getenv("CEF_DIAG");
+                return e && e[0] == '1';
+            }();
+            if (diagEnabled) {
+                fprintf(stderr, "DIAG: [C++] Recv cmd=%s arg=%s\n", cmd.c_str(), arg.c_str());
+                fflush(stderr);
             }
         }
-        else if (onCommand)
+
+        // All commands (including Resize|id|w|h) flow through onCommand
+        if (onCommand)
         {
             onCommand(cmd, arg);
         }

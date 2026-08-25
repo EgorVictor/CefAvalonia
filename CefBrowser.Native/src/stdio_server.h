@@ -13,13 +13,13 @@ public:
     StdioServer();
     ~StdioServer();
 
-    void Start(StdioCommandCallback onCommand, std::function<void(int, int)> onResize,
+    void Start(StdioCommandCallback onCommand,
                std::function<void()> onDisconnect, std::function<void()> onConnected);
     void Stop();
     void SendEvent(const std::string& message);
 
 private:
-    void ReaderThreadProc(StdioCommandCallback onCommand, std::function<void(int, int)> onResize,
+    void ReaderThreadProc(StdioCommandCallback onCommand,
                           std::function<void()> onDisconnect, std::function<void()> onConnected);
     void WriterThreadProc();
 

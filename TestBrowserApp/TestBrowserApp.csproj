@@ -28,41 +28,26 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CefSharp.Avalonia\CefSharp.Avalonia.csproj" />
+    <!-- CEF 运行时二进制与语言资源来自 NuGet，新机器 restore 后即可编译 -->
+    <PackageReference Include="ChromiumEmbeddedFramework.runtime" Version="109.1.11" />
+    <PackageReference Include="ChromiumEmbeddedFramework.runtime.win-x64" Version="109.1.11" GeneratePathProperty="true" />
   </ItemGroup>
 
-  <!-- Copy CEF native files from C++ build output -->
+  <!-- Copy CEF native files: 原生子进程 exe 用 git 内的 prebuilt（或本机重新构建的新产物），其余 CEF 二进制来自 NuGet -->
   <Target Name="CopyCefNativeFiles" AfterTargets="Build">
     <PropertyGroup>
-      <_CefNativeSource>..\CefBrowser.Native\build\Release\</_CefNativeSource>
+      <_NativeExeSource Condition="Exists('..\CefBrowser.Native\build\Release\CefBrowser.Native.exe')">..\CefBrowser.Native\build\Release\CefBrowser.Native.exe</_NativeExeSource>
+      <_NativeExeSource Condition="'$(_NativeExeSource)' == ''">..\CefBrowser.Native\prebuilt\CefBrowser.Native.exe</_NativeExeSource>
+      <_CefNativeDir>$(Pkgchromiumembeddedframework_runtime_win-x64)\runtimes\win-x64\native\</_CefNativeDir>
     </PropertyGroup>
     <ItemGroup>
-      <CefNativeFiles Include="$(_CefNativeSource)CefBrowser.Native.exe" />
-      <CefNativeFiles Include="$(_CefNativeSource)libcef.dll" />
-      <CefNativeFiles Include="$(_CefNativeSource)chrome_elf.dll" />
-      <CefNativeFiles Include="$(_CefNativeSource)d3dcompiler_47.dll" />
-      <CefNativeFiles Include="$(_CefNativeSource)icudtl.dat" />
-      <CefNativeFiles Include="$(_CefNativeSource)libEGL.dll" />
-      <CefNativeFiles Include="$(_CefNativeSource)libGLESv2.dll" />
-      <CefNativeFiles Include="$(_CefNativeSource)resources.pak" />
-      <CefNativeFiles Include="$(_CefNativeSource)chrome_100_percent.pak" />
-      <CefNativeFiles Include="$(_CefNativeSource)chrome_200_percent.pak" />
-      <CefNativeFiles Include="$(_CefNativeSource)snapshot_blob.bin" />
-      <CefNativeFiles Include="$(_CefNativeSource)v8_context_snapshot.bin" />
-      <CefNativeFiles Include="$(_CefNativeSource)vk_swiftshader.dll" />
-      <CefNativeFiles Include="$(_CefNativeSource)vk_swiftshader_icd.json" />
-      <CefNativeFiles Include="$(_CefNativeSource)vulkan-1.dll" />
+      <CefNativeFiles Include="$(_CefNativeDir)*" />
+      <_NativeExe Include="$(_NativeExeSource)" />
+      <CefLocales Include="@(CefRuntimeWin64Locales)" />
     </ItemGroup>
+    <Copy SourceFiles="@(_NativeExe)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(CefNativeFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
-    <!-- Copy locales -->
-    <ItemGroup>
-      <CefLocales Include="$(_CefNativeSource)locales\*.*" />
-    </ItemGroup>
     <Copy SourceFiles="@(CefLocales)" DestinationFolder="$(OutputPath)\locales\" SkipUnchangedFiles="true" />
-    <ItemGroup>
-      <ResolvedFileToPublish Include="@(CefNativeFiles)">
-        <RelativePath>%(CefNativeFiles.Filename)%(CefNativeFiles.Extension)</RelativePath>
-        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
-      </ResolvedFileToPublish>
-    </ItemGroup>
+    <Message Text="CEF native files copied from NuGet + $(_NativeExeSource)" Importance="high" />
   </Target>
 </Project>

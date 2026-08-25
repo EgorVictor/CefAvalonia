@@ -309,11 +309,21 @@ public class WebView : UserControl
 
     /// <summary>
     /// Clean up the native process. Call when the tab is permanently closed (not on tab switch).
+    /// Idempotent: safe to call multiple times.
     /// </summary>
     public void Cleanup()
     {
         if (_disposed) return;
         _disposed = true;
+
+        _resizeCts?.Cancel();
+        _resizeCts?.Dispose();
+        _resizeCts = null;
+
+        // Forget the embedded HWND BEFORE disposing the manager: the native host will
+        // destroy that window, and we must never reparent/touch it afterwards.
+        _browserHost.DetachEmbedded();
+
         _manager?.Dispose();
         _manager = null;
         _cefHwnd = IntPtr.Zero;
