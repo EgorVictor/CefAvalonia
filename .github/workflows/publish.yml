@@ -15,6 +15,11 @@ env:
   DOTNET_VERSION: 8.0.x
   CEF_VER: 109.1.11+g6d4fdb2+chromium-109.0.5414.87
 
+# Trusted Publishing: OIDC token (id-token) lets us push to nuget.org without an API key
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -94,9 +99,8 @@ jobs:
       - name: Build .NET + Pack NuGet
         run: dotnet pack CefSharp.Avalonia\CefSharp.Avalonia.csproj -c Release -o artifacts
 
-      - name: Push to nuget.org (tags & manual only)
+      - name: Push to nuget.org (trusted publishing)
         if: env.PACKAGE_VERSION != ''
         run: |
           dotnet nuget push artifacts\*.nupkg `
-            --api-key "${{ secrets.NUGET_API_KEY }}" `
             --source https://api.nuget.org/v3/index.json
