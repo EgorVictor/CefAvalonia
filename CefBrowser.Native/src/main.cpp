@@ -7,10 +7,14 @@
 //   Isolated per browser: renderer processes + optional RequestContext (own cache dir).
 // IPC protocol v2 (pipe messages, all commands/events carry a browser id):
 //   C#→Native: Create|{id}|{cachePath}|{url}, Navigate|{id}|{url}, Reload|{id},
-//              Stop|{id}, Resize|{id}|{w}|{h}, EmbedDone|{id}, Close|{id}, Quit
+//              Stop|{id}, Resize|{id}|{w}|{h}, EmbedDone|{id}, Close|{id}, Quit,
+//              Back|{id}, Forward|{id}, Zoom|{id}|{delta}, Find|{id}|{text},
+//              StopFind|{id}, DevTools|{id}, ExecJS|{id}|{base64 script}
 //   Native→C#: Ready|{id}|{HWND_HEX}, AddressChanged|{id}|{url},
 //              LoadError|{id}|{code}|{text}|{url}, NavState|{id}|{l}|{b}|{f},
-//              TitleChanged|{id}|{title}, OpenPopup|{id}|{url}
+//              TitleChanged|{id}|{title}, OpenPopup|{id}|{url},
+//              DownloadStart|{id}|{path}, DownloadComplete|{id}|{path},
+//              DownloadCanceled|{id}
 //   The process exits when the last browser closes or Quit is received.
 
 #include "browser_handler.h"
@@ -32,6 +36,7 @@
 #include <cstdint>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <map>
 #include <vector>
@@ -156,6 +161,30 @@ static std::string DisplayUrl(const std::string& url) {
     return url;
 }
 
+// ---- Base64 decoding ----
+// Used to smuggle multi-line JavaScript through the line-oriented stdio pipe.
+static std::string Base64Decode(const std::string& in) {
+    static const char kTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int val = 0;
+    int valBits = -8;
+    for (unsigned char c : in) {
+        if (c == '=')
+            break;
+        const char* p = strchr(kTable, c);
+        if (!p)
+            continue;                       // tolerate stray whitespace/CR
+        val = (val << 6) + static_cast<int>(p - kTable);
+        valBits += 6;
+        if (valBits >= 0) {
+            out.push_back(static_cast<char>((val >> valBits) & 0xFF));
+            valBits -= 8;
+        }
+    }
+    return out;
+}
+
 static std::string GetHost(const std::string& url) {
     size_t start = url.find("://");
     if (start == std::string::npos) start = 0;
@@ -170,7 +199,8 @@ static std::string GetHost(const std::string& url) {
 }
 
 // ---- Command queue (pipe thread -> main pump) ----
-enum class CmdType { Create, Navigate, Reload, Stop, CloseOne, Resize, EmbedDone, Quit, None };
+enum class CmdType { Create, Navigate, Reload, Stop, CloseOne, Resize, EmbedDone, Quit,
+                     Back, Forward, Zoom, Find, StopFind, DevTools, ExecJS, None };
 struct Cmd { CmdType type; int id = 0; std::string arg; };
 static std::queue<Cmd> g_cmdQueue;
 static std::mutex g_cmdMutex;
@@ -199,6 +229,7 @@ struct BrowserInstance {
     // Navigation host filter state (per browser, was global before multi-browser)
     std::string lastNavigateHost;
     ULONGLONG lastNavTick = 0;
+    double zoomLevel = 0.0;   // CEF zoom level: 0 = 100%
 };
 static std::map<int, BrowserInstance> g_browsers;
 static std::mutex g_browsersMutex;
@@ -363,6 +394,91 @@ static void DoCloseBrowser(int id) {
     if (b) b->GetHost()->CloseBrowser(true);
 }
 
+static void DoGoBack(int id) {
+    auto b = FindBrowser(id);
+    if (b && b->CanGoBack()) b->GoBack();
+}
+
+static void DoGoForward(int id) {
+    auto b = FindBrowser(id);
+    if (b && b->CanGoForward()) b->GoForward();
+}
+
+// |delta| > 0 zooms in, < 0 zooms out, == 0 resets to 100%.
+static void DoZoom(int id, int delta) {
+    auto b = FindBrowser(id);
+    if (!b) return;
+
+    double level = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(g_browsersMutex);
+        auto it = g_browsers.find(id);
+        if (it == g_browsers.end()) return;
+        if (delta > 0)      it->second.zoomLevel += 0.5;
+        else if (delta < 0) it->second.zoomLevel -= 0.5;
+        else                it->second.zoomLevel = 0.0;
+        // Clamp to a sane range (roughly 25% .. 500%).
+        if (it->second.zoomLevel >  7.0) it->second.zoomLevel =  7.0;
+        if (it->second.zoomLevel < -7.0) it->second.zoomLevel = -7.0;
+        level = it->second.zoomLevel;
+    }
+    b->GetHost()->SetZoomLevel(level);
+}
+
+static void DoFind(int id, const std::string& payload) {
+    auto b = FindBrowser(id);
+    if (!b) return;
+    // payload = "{text}|{forward}|{findNext}"
+    size_t p1 = payload.find('|');
+    std::string text = p1 == std::string::npos ? payload : payload.substr(0, p1);
+    std::string rest = p1 == std::string::npos ? "" : payload.substr(p1 + 1);
+    size_t p2 = rest.find('|');
+    bool forward = true;
+    bool findNext = false;
+    if (p2 != std::string::npos) {
+        forward = rest.substr(0, p2) != "0";
+        findNext = rest.substr(p2 + 1) == "1";
+    }
+    // CEF 109 signature: Find(searchText, forward, matchCase, findNext)
+    b->GetHost()->Find(text, forward, false, findNext);
+}
+
+static void DoStopFind(int id) {
+    auto b = FindBrowser(id);
+    if (b) b->GetHost()->StopFinding(true);
+}
+
+static void DoShowDevTools(int id) {
+    CefRefPtr<BrowserHandler> handler;
+    CefRefPtr<CefBrowser> b;
+    {
+        std::lock_guard<std::mutex> lock(g_browsersMutex);
+        auto it = g_browsers.find(id);
+        if (it != g_browsers.end()) {
+            handler = it->second.handler;
+            b = handler->GetBrowser();
+        }
+    }
+    if (!b || !handler) return;
+    CefWindowInfo wi;
+    wi.SetAsPopup(nullptr, "DevTools");
+    CefBrowserSettings bs;
+    // Reuse the inspected browser's own CefClient. Passing nullptr would leave
+    // the DevTools window without handlers and can crash on first interaction.
+    b->GetHost()->ShowDevTools(wi, handler, bs, CefPoint());
+}
+
+// Executes JavaScript in the main frame. The script travels base64-encoded so
+// that newlines (which would break the line-oriented stdio protocol) survive.
+static void DoExecJS(int id, const std::string& b64) {
+    auto b = FindBrowser(id);
+    if (!b) return;
+    std::string code = Base64Decode(b64);
+    if (code.empty()) return;
+    auto frame = b->GetMainFrame();
+    if (frame) frame->ExecuteJavaScript(code, frame->GetURL(), 0);
+}
+
 static void RequestCloseAllBrowsers() {
     std::vector<int> ids;
     {
@@ -387,6 +503,10 @@ static void DoCreateBrowser(int id, const std::string& cachePath, const std::str
     if (!parent) { DiagLog("DIAG: [C++] Create id=%d parent window FAILED", id); SendEv("LoadError|" + std::to_string(id) + "|-100|CreateWindow failed|"); return; }
 
     auto handler = new BrowserHandler();
+    handler->SetBrowserId(id);
+    handler->OnDownloadEvent = [id](const std::string& s) {
+        SendEv(s);
+    };
     handler->OnBrowserReady = [id](HWND hwnd) {
         char hwndHex[32];
         sprintf_s(hwndHex, "%I64X", (unsigned long long)(LONG_PTR)hwnd);
@@ -519,6 +639,27 @@ static void ExecuteCmd(const Cmd& c) {
             if (target) ShowWindow(target, SW_SHOW);
             break;
         }
+        case CmdType::Back:
+            CefPostTask(TID_UI, base::BindOnce(&DoGoBack, c.id));
+            break;
+        case CmdType::Forward:
+            CefPostTask(TID_UI, base::BindOnce(&DoGoForward, c.id));
+            break;
+        case CmdType::Zoom:
+            CefPostTask(TID_UI, base::BindOnce(&DoZoom, c.id, atoi(c.arg.c_str())));
+            break;
+        case CmdType::Find:
+            CefPostTask(TID_UI, base::BindOnce(&DoFind, c.id, c.arg));
+            break;
+        case CmdType::StopFind:
+            CefPostTask(TID_UI, base::BindOnce(&DoStopFind, c.id));
+            break;
+        case CmdType::DevTools:
+            CefPostTask(TID_UI, base::BindOnce(&DoShowDevTools, c.id));
+            break;
+        case CmdType::ExecJS:
+            CefPostTask(TID_UI, base::BindOnce(&DoExecJS, c.id, c.arg));
+            break;
         case CmdType::Quit:
             SetEvent(g_shutdownEvent);
             break;
@@ -617,6 +758,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         g_handler->OnAddressChanged = [](const std::string& u) {
             SendEv("AddressChanged|" + DisplayUrl(u));
         };
+        g_handler->OnDownloadEvent = [](const std::string& s) {
+            SendEv(s);
+        };
 
         DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE;
         g_hiddenParent = CreateWindowExW(0, kHiddenClass, L"CEF Browser Test",
@@ -693,13 +837,27 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     DiagLog("DIAG: [C++] Normalized url=%s", navUrl.c_str());
                     if (navUrl.empty()) return;
                     PushCmd(CmdType::Navigate, id, navUrl);
-                } else if (cmd == "Reload" || cmd == "Stop" || cmd == "EmbedDone") {
+                } else if (cmd == "Reload" || cmd == "Stop" || cmd == "EmbedDone" ||
+                           cmd == "Back" || cmd == "Forward" ||
+                           cmd == "StopFind" || cmd == "DevTools") {
                     int id = atoi(arg.c_str());
                     if (id <= 0) return;
-                    CmdType t = cmd == "Reload" ? CmdType::Reload
-                              : cmd == "Stop"   ? CmdType::Stop
-                                                : CmdType::EmbedDone;
+                    CmdType t = cmd == "Reload"   ? CmdType::Reload
+                              : cmd == "Stop"     ? CmdType::Stop
+                              : cmd == "EmbedDone"? CmdType::EmbedDone
+                              : cmd == "Back"     ? CmdType::Back
+                              : cmd == "Forward"  ? CmdType::Forward
+                              : cmd == "StopFind" ? CmdType::StopFind
+                                                  : CmdType::DevTools;
                     PushCmd(t, id);
+                } else if (cmd == "Zoom" || cmd == "Find" || cmd == "ExecJS") {
+                    // arg = "{id}|{payload}"
+                    int id; std::string payload;
+                    if (!splitId(arg, id, payload)) return;
+                    CmdType t = cmd == "Zoom" ? CmdType::Zoom
+                              : cmd == "Find" ? CmdType::Find
+                                              : CmdType::ExecJS;
+                    PushCmd(t, id, payload);
                 } else if (cmd == "Resize") {
                     // arg = "{id}|{w}|{h}"
                     int id; std::string wh;
@@ -782,6 +940,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 inst.handler->OnLoadingStateChanged = nullptr;
                 inst.handler->OnTitleChangedCB = nullptr;
                 inst.handler->OnBeforePopupCB = nullptr;
+                inst.handler->OnDownloadEvent = nullptr;
                 inst.handler->OnBrowserReady = nullptr;
             }
         }

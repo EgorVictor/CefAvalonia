@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Channels;
@@ -232,6 +233,41 @@ public sealed class CefHostProcess : IDisposable
     {
         TrySend("Quit");
         _sendChannel.Writer.TryComplete();
+    }
+
+    /// <summary>
+    /// App-exit hook: asks every host to shut down, gives each a short grace
+    /// period, then force-kills survivors. Without this, CefBrowser.Native.exe
+    /// can outlive the app (e.g. when Avalonia's exit path closes the pipe
+    /// before the native side observes stdin EOF).
+    /// </summary>
+    public static void ShutdownAll(int graceMs = 2000)
+    {
+        CefHostProcess[] hosts;
+        lock (Gate)
+        {
+            hosts = Instances.Values.ToArray();
+            Instances.Clear();
+        }
+
+        foreach (var h in hosts)
+        {
+            try { h.RequestShutdown(); }
+            catch (Exception ex) { Debug.WriteLine($"[CefHost] ShutdownAll request error: {ex.Message}"); }
+        }
+
+        foreach (var h in hosts)
+        {
+            try
+            {
+                if (h._process != null && !h._process.WaitForExit(graceMs))
+                {
+                    Debug.WriteLine("[CefHost] Host did not exit in time, killing");
+                    h._process.Kill(entireProcessTree: true);
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"[CefHost] ShutdownAll kill error: {ex.Message}"); }
+        }
     }
 
     public void Dispose()

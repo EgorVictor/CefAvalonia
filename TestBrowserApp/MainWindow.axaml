@@ -139,41 +139,145 @@
       </Grid>
     </Border>
 
-    <!-- 地址栏 -->
+    <!-- 地址栏 + 查找条 -->
     <Border Grid.Row="1" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
-      <DockPanel VerticalAlignment="Center" Margin="12,0">
+      <Grid RowDefinitions="*,Auto">
 
-        <Button x:Name="RefreshButton"
-                Classes="icon"
-                Content="⟳"
-                DockPanel.Dock="Left"
-                Margin="0,0,8,0"/>
+        <!-- 地址栏行 -->
+        <DockPanel Grid.Row="0" VerticalAlignment="Center" Margin="12,6">
+          <Button x:Name="BackButton"
+                  Classes="icon"
+                  Content="←"
+                  ToolTip.Tip="Back"
+                  DockPanel.Dock="Left"
+                  Margin="0,0,4,0"/>
 
-        <Button x:Name="GoButton"
-                Classes="primary"
-                Content="Go"
-                Width="60"
-                Height="32"
-                DockPanel.Dock="Right"
-                Margin="8,0,0,0"/>
+          <Button x:Name="ForwardButton"
+                  Classes="icon"
+                  Content="→"
+                  ToolTip.Tip="Forward"
+                  DockPanel.Dock="Left"
+                  Margin="0,0,4,0"/>
 
-        <TextBox x:Name="AddressBar"
-                 Watermark="Enter URL"
-                 Height="34"/>
-      </DockPanel>
+          <Button x:Name="RefreshButton"
+                  Classes="icon"
+                  Content="⟳"
+                  ToolTip.Tip="Reload"
+                  DockPanel.Dock="Left"
+                  Margin="0,0,4,0"/>
+
+          <Button x:Name="StopButton"
+                  Classes="icon"
+                  Content="⏹"
+                  ToolTip.Tip="Stop loading"
+                  DockPanel.Dock="Left"
+                  Margin="0,0,8,0"/>
+
+          <Button x:Name="DevToolsButton"
+                  Classes="icon"
+                  Content="⚙"
+                  ToolTip.Tip="DevTools"
+                  DockPanel.Dock="Left"
+                  Margin="0,0,8,0"/>
+
+          <Button x:Name="ZoomOutButton"
+                  Classes="icon"
+                  Content="−"
+                  ToolTip.Tip="Zoom out"
+                  DockPanel.Dock="Right"
+                  Margin="0,0,2,0"/>
+
+          <Button x:Name="ZoomResetButton"
+                  Content="100%"
+                  Height="32"
+                  FontSize="12"
+                  Padding="8,0"
+                  DockPanel.Dock="Right"
+                  Margin="0,0,2,0"/>
+
+          <Button x:Name="ZoomInButton"
+                  Classes="icon"
+                  Content="+"
+                  ToolTip.Tip="Zoom in"
+                  DockPanel.Dock="Right"
+                  Margin="0,0,2,0"/>
+
+          <Button x:Name="FindButton"
+                  Classes="icon"
+                  Content="🔍"
+                  ToolTip.Tip="Find on page"
+                  DockPanel.Dock="Right"
+                  Margin="0,0,8,0"/>
+
+          <Button x:Name="GoButton"
+                  Classes="primary"
+                  Content="Go"
+                  Width="60"
+                  Height="32"
+                  DockPanel.Dock="Right"
+                  Margin="8,0,0,0"/>
+
+          <TextBox x:Name="AddressBar"
+                   Watermark="Enter URL"
+                   Height="34"/>
+        </DockPanel>
+
+        <!-- 查找条（默认隐藏） -->
+        <DockPanel x:Name="FindBar"
+                   Grid.Row="1"
+                   IsVisible="False"
+                   VerticalAlignment="Center"
+                   Margin="12,4,12,8">
+          <Button x:Name="FindCloseButton"
+                  Classes="icon"
+                  Content="✕"
+                  ToolTip.Tip="Close find"
+                  DockPanel.Dock="Right"
+                  Margin="4,0,0,0"/>
+          <Button x:Name="FindPrevButton"
+                  Classes="icon"
+                  Content="↑"
+                  ToolTip.Tip="Previous match"
+                  DockPanel.Dock="Right"
+                  Margin="4,0,0,0"/>
+          <Button x:Name="FindNextButton"
+                  Classes="icon"
+                  Content="↓"
+                  ToolTip.Tip="Next match"
+                  DockPanel.Dock="Right"
+                  Margin="4,0,0,0"/>
+          <TextBlock Text="查找:"
+                     VerticalAlignment="Center"
+                     Margin="0,0,8,0"
+                     FontSize="13"
+                     Foreground="#6B7280"/>
+          <TextBox x:Name="FindTextBox"
+                   Watermark="输入要查找的文字…"
+                   Height="30"/>
+        </DockPanel>
+      </Grid>
     </Border>
 
     <!-- 浏览器 Tab 区域 -->
     <TabControl Grid.Row="2" x:Name="BrowserTabs"/>
 
-    <!-- 状态栏 -->
+    <!-- 状态栏 + 下载进度 -->
     <Border Grid.Row="3" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0">
-      <TextBlock x:Name="StatusBar"
-                 Text="Ready"
-                 VerticalAlignment="Center"
-                 Margin="12,0"
-                 FontSize="12"
-                 Foreground="#6B7280"/>
+      <DockPanel Margin="12,0" VerticalAlignment="Center">
+        <ProgressBar x:Name="DownloadProgressBar"
+                     DockPanel.Dock="Right"
+                     Width="160"
+                     Height="10"
+                     Minimum="0"
+                     Maximum="100"
+                     IsVisible="False"
+                     Margin="12,0,0,0"/>
+        <TextBlock x:Name="StatusBar"
+                   Text="Ready"
+                   VerticalAlignment="Center"
+                   FontSize="12"
+                   Foreground="#6B7280"/>
+      </DockPanel>
     </Border>
 
   </Grid>

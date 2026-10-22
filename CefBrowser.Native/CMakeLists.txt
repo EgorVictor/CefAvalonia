@@ -30,6 +30,13 @@ target_link_libraries(CefBrowser.Native PRIVATE
     glu32.lib
     imm32.lib
     opengl32.lib
+    # COM: IFileDialog (file inputs), SHGetFolderPath (downloads folder)
+    ole32.lib
+    shell32.lib
+    # MessageBox / dialog window classes
+    user32.lib
+    gdi32.lib
+    comdlg32.lib
 )
 
 COPY_FILES(CefBrowser.Native "${CEF_BINARY_FILES}" "${CEF_BINARY_DIR}" "${CEF_TARGET_OUT_DIR}")

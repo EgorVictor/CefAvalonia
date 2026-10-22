@@ -72,6 +72,30 @@ public class WebView : UserControl
         private set => SetAndRaise(IsLoadingProperty, ref _isLoading, value);
     }
 
+    private bool _canGoBack;
+    public static readonly DirectProperty<WebView, bool> CanGoBackProperty =
+        AvaloniaProperty.RegisterDirect<WebView, bool>(nameof(CanGoBack),
+            o => o.CanGoBack);
+
+    /// <summary>True when history has an entry behind the current page. Enables a Back button.</summary>
+    public bool CanGoBack
+    {
+        get => _canGoBack;
+        private set => SetAndRaise(CanGoBackProperty, ref _canGoBack, value);
+    }
+
+    private bool _canGoForward;
+    public static readonly DirectProperty<WebView, bool> CanGoForwardProperty =
+        AvaloniaProperty.RegisterDirect<WebView, bool>(nameof(CanGoForward),
+            o => o.CanGoForward);
+
+    /// <summary>True when history has an entry ahead of the current page. Enables a Forward button.</summary>
+    public bool CanGoForward
+    {
+        get => _canGoForward;
+        private set => SetAndRaise(CanGoForwardProperty, ref _canGoForward, value);
+    }
+
     public static readonly StyledProperty<ICommand?> NavigateCommandProperty =
         AvaloniaProperty.Register<WebView, ICommand?>(nameof(NavigateCommand));
 
@@ -104,6 +128,8 @@ public class WebView : UserControl
     public event Action<string>? LoadError;
     /// <summary>Raised when a web page requests to open a popup/new window. URL should open in a new tab.</summary>
     public event Action<string>? OpenPopup;
+    /// <summary>Raised on download lifecycle events. Arg: "DownloadStart|{path}", "DownloadComplete|{path}", or "DownloadCanceled".</summary>
+    public event Action<string>? DownloadEvent;
 
     public WebView()
     {
@@ -222,9 +248,19 @@ public class WebView : UserControl
             });
         };
 
+        _manager.NavigationStateChanged += () =>
+        {
+            Dispatcher.UIThread.Post(SyncNavigationState);
+        };
+
         _manager.OpenPopup += url =>
         {
             Dispatcher.UIThread.Post(() => OpenPopup?.Invoke(url));
+        };
+
+        _manager.DownloadEvent += info =>
+        {
+            Dispatcher.UIThread.Post(() => DownloadEvent?.Invoke(info));
         };
 
         // On Ready event: save HWND, embed, then signal embed done + push initial size
@@ -301,11 +337,60 @@ public class WebView : UserControl
     /// <summary>Stop the current page load.</summary>
     public Task StopAsync() => _manager?.StopAsync() ?? Task.CompletedTask;
 
+    // ---- History ----
+    /// <summary>Navigate to the previous entry in history, if any.</summary>
+    public void GoBack() => _manager?.GoBack();
+    /// <summary>Navigate to the next entry in history, if any.</summary>
+    public void GoForward() => _manager?.GoForward();
+
+    // ---- Zoom ----
+    /// <summary>Increase the page zoom level.</summary>
+    public void ZoomIn() => _manager?.ZoomIn();
+    /// <summary>Decrease the page zoom level.</summary>
+    public void ZoomOut() => _manager?.ZoomOut();
+    /// <summary>Reset the page zoom level to 100%.</summary>
+    public void ZoomReset() => _manager?.ZoomReset();
+
+    // ---- Find in page ----
+    private string _lastFindText = "";
+
+    /// <summary>Starts a new find for |text| from the top of the page.</summary>
+    public void Find(string text)
+    {
+        _lastFindText = text ?? "";
+        _manager?.Find(_lastFindText, true, false);
+    }
+
+    /// <summary>Jumps to the next match of the current find text.</summary>
+    public void FindNext() => _manager?.Find(_lastFindText, true, true);
+
+    /// <summary>Jumps to the previous match of the current find text.</summary>
+    public void FindPrevious() => _manager?.Find(_lastFindText, false, true);
+
+    /// <summary>Clears find highlighting.</summary>
+    public void StopFinding() => _manager?.StopFinding();
+
+    // ---- Script ----
     /// <summary>
-    /// Opens developer tools. WebView (HWND interop) does not support DevTools in-process.
-    /// Configure remote-debugging-port in CefSettings.CommandLineSwitches and access via browser.
+    /// Executes JavaScript in the main frame. Fire-and-forget: no return value.
+    /// Multi-line scripts are supported (encoded before crossing the pipe).
     /// </summary>
-    public void ShowDeveloperTools() { }
+    public void ExecuteJavaScriptAsync(string code) => _manager?.ExecuteJavaScript(code);
+
+    // ---- DevTools ----
+    /// <summary>
+    /// Opens the Chrome DevTools window for this browser. The window is owned by
+    /// the native host process, so it appears as a separate top-level window.
+    /// </summary>
+    public void ShowDeveloperTools() => _manager?.ShowDevTools();
+
+    /// <summary>Copies CanGoBack/CanGoForward out of the manager into bindable properties.</summary>
+    private void SyncNavigationState()
+    {
+        if (_manager == null) return;
+        CanGoBack = _manager.CanGoBack;
+        CanGoForward = _manager.CanGoForward;
+    }
 
     /// <summary>
     /// Clean up the native process. Call when the tab is permanently closed (not on tab switch).

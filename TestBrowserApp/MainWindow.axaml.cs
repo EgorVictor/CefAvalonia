@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 
 namespace TestBrowserApp;
@@ -29,6 +30,21 @@ public partial class MainWindow : Window
     private Button? _goButton;
     private Button? _refreshButton;
     private Button? _newTabButton;
+    private Button? _backButton;
+    private Button? _forwardButton;
+    private Button? _devToolsButton;
+    private Button? _stopButton;
+    private Button? _zoomOutButton;
+    private Button? _zoomResetButton;
+    private Button? _zoomInButton;
+    private Button? _findButton;
+    private DockPanel? _findBar;
+    private TextBox? _findTextBox;
+    private Button? _findCloseButton;
+    private Button? _findPrevButton;
+    private Button? _findNextButton;
+    private TextBlock? _statusBar;
+    private ProgressBar? _downloadProgressBar;
     private Dictionary<int, WebView> _tabWebViews = new();
     private int _tabCounter = 1;
 
@@ -42,6 +58,21 @@ public partial class MainWindow : Window
         _goButton = this.FindControl<Button>("GoButton");
         _refreshButton = this.FindControl<Button>("RefreshButton");
         _newTabButton = this.FindControl<Button>("NewTabButton");
+        _backButton = this.FindControl<Button>("BackButton");
+        _forwardButton = this.FindControl<Button>("ForwardButton");
+        _devToolsButton = this.FindControl<Button>("DevToolsButton");
+        _stopButton = this.FindControl<Button>("StopButton");
+        _zoomOutButton = this.FindControl<Button>("ZoomOutButton");
+        _zoomResetButton = this.FindControl<Button>("ZoomResetButton");
+        _zoomInButton = this.FindControl<Button>("ZoomInButton");
+        _findButton = this.FindControl<Button>("FindButton");
+        _findBar = this.FindControl<DockPanel>("FindBar");
+        _findTextBox = this.FindControl<TextBox>("FindTextBox");
+        _findCloseButton = this.FindControl<Button>("FindCloseButton");
+        _findPrevButton = this.FindControl<Button>("FindPrevButton");
+        _findNextButton = this.FindControl<Button>("FindNextButton");
+        _statusBar = this.FindControl<TextBlock>("StatusBar");
+        _downloadProgressBar = this.FindControl<ProgressBar>("DownloadProgressBar");
 
         if (_addressBar != null)
         {
@@ -58,6 +89,79 @@ public partial class MainWindow : Window
             _refreshButton.Click += (s, e) => Refresh();
         }
 
+        if (_backButton != null)
+        {
+            _backButton.Click += (s, e) => GetCurrentWebView()?.GoBack();
+        }
+
+        if (_forwardButton != null)
+        {
+            _forwardButton.Click += (s, e) => GetCurrentWebView()?.GoForward();
+        }
+
+        if (_devToolsButton != null)
+        {
+            _devToolsButton.Click += (s, e) => GetCurrentWebView()?.ShowDeveloperTools();
+        }
+
+        if (_stopButton != null)
+        {
+            _stopButton.Click += (s, e) => GetCurrentWebView()?.StopAsync();
+        }
+
+        if (_zoomOutButton != null)
+            _zoomOutButton.Click += (s, e) => GetCurrentWebView()?.ZoomOut();
+
+        if (_zoomResetButton != null)
+            _zoomResetButton.Click += (s, e) => GetCurrentWebView()?.ZoomReset();
+
+        if (_zoomInButton != null)
+            _zoomInButton.Click += (s, e) => GetCurrentWebView()?.ZoomIn();
+
+        if (_findButton != null)
+        {
+            _findButton.Click += (s, e) =>
+            {
+                if (_findBar != null) _findBar.IsVisible = !_findBar.IsVisible;
+                _findTextBox?.Focus();
+            };
+        }
+
+        if (_findCloseButton != null)
+        {
+            _findCloseButton.Click += (s, e) =>
+            {
+                if (_findBar != null) _findBar.IsVisible = false;
+                GetCurrentWebView()?.StopFinding();
+            };
+        }
+
+        if (_findNextButton != null)
+            _findNextButton.Click += (s, e) => GetCurrentWebView()?.FindNext();
+
+        if (_findPrevButton != null)
+            _findPrevButton.Click += (s, e) => GetCurrentWebView()?.FindPrevious();
+
+        if (_findTextBox != null)
+        {
+            _findTextBox.TextChanged += (s, e) =>
+            {
+                var wv = GetCurrentWebView();
+                if (wv == null || _findTextBox == null) return;
+                var t = _findTextBox.Text ?? "";
+                if (string.IsNullOrEmpty(t)) wv.StopFinding();
+                else wv.Find(t);
+            };
+            _findTextBox.KeyDown += (s, e) =>
+            {
+                if (e.Key == Key.Return)
+                {
+                    GetCurrentWebView()?.FindNext();
+                    e.Handled = true;
+                }
+            };
+        }
+
         if (_newTabButton != null)
         {
             _newTabButton.Click += (s, e) => CreateNewTab();
@@ -70,6 +174,15 @@ public partial class MainWindow : Window
 
         Log("MainWindow initialized - Multi-tab WebView ready");
         CreateNewTab();  // Create first tab
+
+        // Release every browser when the window closes. The native host is a
+        // separate process; without this each tab would keep its renderer alive.
+        Closing += (_, _) =>
+        {
+            foreach (var webView in _tabWebViews.Values.ToList())
+                webView.Cleanup();
+            _tabWebViews.Clear();
+        };
 
         // --smoke:<url> 自动冒烟：导航到 url → 等 25s → 关窗（--smoke-kill 则由外部强杀）
         var args = Environment.GetCommandLineArgs();
@@ -270,12 +383,45 @@ public partial class MainWindow : Window
         {
             Log($"Tab {tabId} title changed: {title}");
             UpdateTabTitle(tabItem, title);
+            if (GetCurrentWebView() == webView)
+                Title = string.IsNullOrEmpty(title) ? "Modern Browser" : title;
         };
 
         webView.OpenPopup += url =>
         {
             Log($"Tab {tabId} open popup: {url}");
             CreateNewTab(url);
+        };
+
+        webView.DownloadEvent += info =>
+        {
+            Log($"Tab {tabId} download event: {info}");
+            // info format: DownloadStart|{path}, DownloadProgress|{received}|{total},
+            //             DownloadComplete|{path}, DownloadCanceled
+            var sep = info.IndexOf('|');
+            var kind = sep >= 0 ? info[..sep] : info;
+            var rest = sep >= 0 ? info[(sep + 1)..] : "";
+            UpdateDownloadUI(kind, rest);
+        };
+
+        // Surface navigation failures (e.g. DNS/connection errors, blocked hosts)
+        // in the status bar so a failed load isn't mistaken for "nothing happened".
+        webView.LoadError += info =>
+        {
+            // info = "{code}|{text}|{url}"
+            var p = info.Split('|');
+            var text = p.Length >= 2 ? p[1] : info;
+            var url = p.Length >= 3 ? p[2] : "";
+            Log($"Tab {tabId} load error: {info}");
+            if (_statusBar != null)
+                _statusBar.Text = $"加载失败: {text}  ({url})";
+        };
+
+        // Keep Back/Forward buttons in sync with the browser history state.
+        webView.PropertyChanged += (_, e) =>
+        {
+            if (e.Property == WebView.CanGoBackProperty || e.Property == WebView.CanGoForwardProperty)
+                UpdateNavButtons();
         };
     }
 
@@ -348,6 +494,8 @@ public partial class MainWindow : Window
             Console.Error.WriteLine($"DIAG: TAB SWITCHED to visible WebView");
         }
         UpdateAddressBar();
+        UpdateNavButtons();
+        Title = webView?.Title is { Length: > 0 } t ? t : "Modern Browser";
     }
 
     private void UpdateAddressBar()
@@ -357,6 +505,74 @@ public partial class MainWindow : Window
         {
             _addressBar.Text = webView?.Url ?? "";
         }
+    }
+
+    private void UpdateNavButtons()
+    {
+        var webView = GetCurrentWebView();
+        if (_backButton != null)
+            _backButton.IsEnabled = webView?.CanGoBack == true;
+        if (_forwardButton != null)
+            _forwardButton.IsEnabled = webView?.CanGoForward == true;
+    }
+
+    // ---- Download UI ----
+    private void UpdateDownloadUI(string kind, string rest)
+    {
+        switch (kind)
+        {
+            case "DownloadStart":
+                if (_statusBar != null)
+                    _statusBar.Text = $"下载中: {Path.GetFileName(rest)}";
+                if (_downloadProgressBar != null)
+                {
+                    _downloadProgressBar.IsVisible = true;
+                    _downloadProgressBar.IsIndeterminate = true;
+                    _downloadProgressBar.Value = 0;
+                }
+                break;
+            case "DownloadProgress":
+                var p = rest.Split('|');
+                var received = p.Length >= 1 ? p[0] : "0";
+                var total = p.Length >= 2 ? p[1] : "0";
+                if (long.TryParse(received, out var r) &&
+                    long.TryParse(total, out var t) && t > 0)
+                {
+                    if (_downloadProgressBar != null)
+                    {
+                        _downloadProgressBar.IsIndeterminate = false;
+                        _downloadProgressBar.Value = Math.Min(100.0, (double)r / t * 100);
+                    }
+                    if (_statusBar != null)
+                        _statusBar.Text =
+                            $"下载中: {FormatBytes(r)} / {FormatBytes(t)} ({r * 100 / t:F0}%)";
+                }
+                else if (_downloadProgressBar != null)
+                {
+                    _downloadProgressBar.IsIndeterminate = true;
+                }
+                break;
+            case "DownloadComplete":
+                if (_statusBar != null)
+                    _statusBar.Text = $"下载完成: {rest}";
+                if (_downloadProgressBar != null)
+                    _downloadProgressBar.IsVisible = false;
+                break;
+            case "DownloadCanceled":
+                if (_statusBar != null)
+                    _statusBar.Text = "下载已取消";
+                if (_downloadProgressBar != null)
+                    _downloadProgressBar.IsVisible = false;
+                break;
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
+        if (bytes < 1024L * 1024 * 1024) return $"{bytes / 1024.0 / 1024.0:F1} MB";
+        return $"{bytes / 1024.0 / 1024.0 / 1024.0:F2} GB";
     }
 
     private void OnAddressBarKeyDown(object? sender, KeyEventArgs e)

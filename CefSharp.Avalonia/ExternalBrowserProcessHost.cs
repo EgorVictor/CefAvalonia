@@ -19,6 +19,21 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
     private IntPtr embeddedHwnd = IntPtr.Zero;
     private IntPtr _pendingEmbedHwnd = IntPtr.Zero;
 
+    public ExternalBrowserProcessHost()
+    {
+        // The embedded CEF window is a foreign HWND: Avalonia keeps keyboard
+        // focus on its own window unless we forward it. Without this the page
+        // is not typeable after clicking into it.
+        GotFocus += (_, _) => ForwardFocus();
+    }
+
+    /// <summary>Hands keyboard focus to the embedded browser window.</summary>
+    public void ForwardFocus()
+    {
+        if (embeddedHwnd != IntPtr.Zero)
+            SetFocus(embeddedHwnd);
+    }
+
     /// <summary>True once EmbedWindow has been called successfully.</summary>
     public bool IsEmbedded => embeddedHwnd != IntPtr.Zero;
 
@@ -187,4 +202,7 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetFocus(IntPtr hWnd);
 }

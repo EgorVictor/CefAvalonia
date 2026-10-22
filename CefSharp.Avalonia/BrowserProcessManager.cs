@@ -30,6 +30,25 @@ public sealed class BrowserProcessManager
 
     public string? LastUrl => lastUrl;
 
+    private bool _canGoBack;
+    /// <summary>True when the browser history has an entry behind the current page.</summary>
+    public bool CanGoBack
+    {
+        get => _canGoBack;
+        private set { if (_canGoBack != value) { _canGoBack = value; NavigationStateChanged?.Invoke(); } }
+    }
+
+    private bool _canGoForward;
+    /// <summary>True when the browser history has an entry ahead of the current page.</summary>
+    public bool CanGoForward
+    {
+        get => _canGoForward;
+        private set { if (_canGoForward != value) { _canGoForward = value; NavigationStateChanged?.Invoke(); } }
+    }
+
+    /// <summary>Raised when CanGoBack / CanGoForward change.</summary>
+    public event Action? NavigationStateChanged;
+
     /// <summary>Raised on AddressChanged event from native host.</summary>
     public event Action<string>? AddressChanged;
     /// <summary>Raised on page load error. Arg: "code|text|url".</summary>
@@ -43,6 +62,10 @@ public sealed class BrowserProcessManager
     public event Action<string>? OpenPopup;
     /// <summary>Raised when loading state changes (true=loading, false=done).</summary>
     public event Action<bool>? LoadingStateChanged;
+    /// <summary>Raised on download lifecycle events. Arg:
+    /// "DownloadStart|{path}", "DownloadProgress|{received}|{total}",
+    /// "DownloadComplete|{path}", or "DownloadCanceled".</summary>
+    public event Action<string>? DownloadEvent;
 
     public BrowserProcessManager()
     {
@@ -117,7 +140,13 @@ public sealed class BrowserProcessManager
                 LoadError?.Invoke(arg);
                 break;
             case "NavState":
+                // arg = "{isLoading}|{canGoBack}|{canGoForward}"
                 var parts = arg.Split('|');
+                if (parts.Length >= 3)
+                {
+                    CanGoBack = parts[1] == "1";
+                    CanGoForward = parts[2] == "1";
+                }
                 if (parts.Length >= 1)
                     LoadingStateChanged?.Invoke(parts[0] == "1");
                 break;
@@ -127,6 +156,21 @@ public sealed class BrowserProcessManager
             case "OpenPopup":
                 OpenPopup?.Invoke(arg);
                 break;
+            case "DownloadStart":
+            case "DownloadComplete":
+            case "DownloadCanceled":
+                // NOTE: CefHostProcess.Dispatch() already strips the browser id,
+                // so arg is "{path}" (or "") here - do not strip anything else.
+                DownloadEvent?.Invoke(ev + "|" + arg);
+                break;
+            case "DownloadProgress": {
+                // arg = "{received}|{total}" (browser id already stripped).
+                var p = arg.Split('|');
+                var received = p.Length >= 1 ? p[0] : "0";
+                var total = p.Length >= 2 ? p[1] : "0";
+                DownloadEvent?.Invoke($"DownloadProgress|{received}|{total}");
+                break;
+            }
             default:
                 Debug.WriteLine($"[BPM {_browserId}] Unknown event: {ev}");
                 break;
@@ -152,6 +196,30 @@ public sealed class BrowserProcessManager
     public Task StopAsync() { SendChecked("Stop", ""); return Task.CompletedTask; }
     public Task SendEmbedDoneAsync() { SendChecked("EmbedDone", ""); return Task.CompletedTask; }
     public Task SendResizeAsync(int w, int h) { SendResize(w, h); return Task.CompletedTask; }
+
+    // ---- History / zoom / find / devtools / script ----
+    public void GoBack()      { SendChecked("Back", ""); }
+    public void GoForward()   { SendChecked("Forward", ""); }
+    public void ZoomIn()      { SendChecked("Zoom", "1"); }
+    public void ZoomOut()     { SendChecked("Zoom", "-1"); }
+    public void ZoomReset()   { SendChecked("Zoom", "0"); }
+    public void StopFinding() { SendChecked("StopFind", ""); }
+    public void ShowDevTools() { SendChecked("DevTools", ""); }
+
+    /// <summary>Finds |text| in the page. forward/findNext mirror CEF's Find().</summary>
+    public void Find(string text, bool forward, bool findNext)
+        => SendChecked("Find", $"{(text ?? "")}|{(forward ? 1 : 0)}|{(findNext ? 1 : 0)}");
+
+    /// <summary>
+    /// Runs JavaScript in the main frame (fire-and-forget; no return value).
+    /// The script is base64-encoded so that newlines survive the line-oriented pipe.
+    /// </summary>
+    public void ExecuteJavaScript(string code)
+    {
+        if (string.IsNullOrEmpty(code)) return;
+        var b64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(code));
+        SendChecked("ExecJS", b64);
+    }
 
     public void SendResize(int w, int h)
     {

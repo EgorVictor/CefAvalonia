@@ -3,13 +3,21 @@
 #include "include/cef_life_span_handler.h"
 #include "include/cef_load_handler.h"
 #include "include/cef_display_handler.h"
+#include "include/cef_download_handler.h"
+#include "include/cef_download_item.h"
+#include "include/cef_jsdialog_handler.h"
+#include "include/cef_dialog_handler.h"
 #include <string>
 #include <functional>
+#include <vector>
 
 class BrowserHandler : public CefClient,
                        public CefLifeSpanHandler,
                        public CefLoadHandler,
-                       public CefDisplayHandler {
+                       public CefDisplayHandler,
+                       public CefDownloadHandler,
+                       public CefJSDialogHandler,
+                       public CefDialogHandler {
 public:
     BrowserHandler();
 
@@ -17,6 +25,9 @@ public:
     CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
     CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
     CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+    CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
+    CefRefPtr<CefJSDialogHandler> GetJSDialogHandler() override { return this; }
+    CefRefPtr<CefDialogHandler> GetDialogHandler() override { return this; }
 
     // CefLifeSpanHandler
     void OnAfterCreated(CefRefPtr<CefBrowser> browser) override;
@@ -53,9 +64,52 @@ public:
     void OnTitleChange(CefRefPtr<CefBrowser> browser,
                        const CefString& title) override;
 
+    // CefDownloadHandler
+    // Called before a download begins. We pick a target path in the user's
+    // Downloads folder and continue; without this handler CEF silently cancels
+    // all downloads (GetDownloadHandler() returns nullptr by default).
+    void OnBeforeDownload(CefRefPtr<CefBrowser> browser,
+                          CefRefPtr<CefDownloadItem> download_item,
+                          const CefString& suggested_name,
+                          CefRefPtr<CefBeforeDownloadCallback> callback) override;
+
+    // Called whenever a download's status/progress changes.
+    void OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
+                           CefRefPtr<CefDownloadItem> download_item,
+                           CefRefPtr<CefDownloadItemCallback> callback) override;
+
+    // CefJSDialogHandler
+    // Handles alert()/confirm()/prompt(). Without this handler CEF silently
+    // swallows JS dialogs (confirm() returns false), breaking many pages.
+    bool OnJSDialog(CefRefPtr<CefBrowser> browser,
+                    const CefString& origin_url,
+                    JSDialogType dialog_type,
+                    const CefString& message_text,
+                    const CefString& default_prompt_text,
+                    CefRefPtr<CefJSDialogCallback> callback,
+                    bool& suppress_message) override;
+
+    // Return false: never block navigation/tab close with a leave-confirmation
+    // prompt (it would otherwise be able to hang the close path).
+    bool OnBeforeUnloadDialog(CefRefPtr<CefBrowser> browser,
+                              const CefString& message_text,
+                              bool is_reload,
+                              CefRefPtr<CefJSDialogCallback> callback) override;
+
+    // CefDialogHandler
+    // Handles <input type="file">. Without this handler clicking a file input
+    // does nothing at all.
+    bool OnFileDialog(CefRefPtr<CefBrowser> browser,
+                      FileDialogMode mode,
+                      const CefString& title,
+                      const CefString& default_file_path,
+                      const std::vector<CefString>& accept_filters,
+                      CefRefPtr<CefFileDialogCallback> callback) override;
+
     // Public accessors
     HWND GetBrowserHwnd() const { return browser_hwnd_; }
     CefRefPtr<CefBrowser> GetBrowser() const { return browser_; }
+    void SetBrowserId(int id) { browser_id_ = id; }
 
     // Callbacks
     std::function<void(HWND)> OnBrowserReady;
@@ -65,10 +119,12 @@ public:
     std::function<void(bool, bool, bool)> OnLoadingStateChanged;
     std::function<void(const std::string&)> OnTitleChangedCB;
     std::function<void(const std::string&)> OnBeforePopupCB;
+    std::function<void(const std::string&)> OnDownloadEvent;
 
 private:
     CefRefPtr<CefBrowser> browser_;
     HWND browser_hwnd_ = nullptr;
+    int browser_id_ = 0;
 
     IMPLEMENT_REFCOUNTING(BrowserHandler);
 };
