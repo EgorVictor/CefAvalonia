@@ -99,8 +99,17 @@ jobs:
       - name: Build .NET + Pack NuGet
         run: dotnet pack CefSharp.Avalonia\CefSharp.Avalonia.csproj -c Release -o artifacts
 
+      # Trusted Publishing: exchange the Actions OIDC token for a short-lived
+      # NuGet API key (dotnet nuget push cannot do this exchange by itself).
+      - name: NuGet login (OIDC -> temp API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: yhq   # nuget.org account (package owner)
+
       - name: Push to nuget.org (trusted publishing)
         if: env.PACKAGE_VERSION != ''
         run: |
           dotnet nuget push artifacts\*.nupkg `
+            --api-key ${{ steps.login.outputs.NUGET_API_KEY }} `
             --source https://api.nuget.org/v3/index.json
