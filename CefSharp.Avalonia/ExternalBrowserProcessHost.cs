@@ -29,6 +29,7 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
     private IntPtr _xDisplay = IntPtr.Zero;
     private IntPtr _x11HostWindow = IntPtr.Zero;
     private bool _embedding;
+    private bool _hostWindowCreated;
 
     public ExternalBrowserProcessHost()
     {
@@ -44,6 +45,44 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
 
     /// <summary>Handle of the Avalonia host panel (HWND or XID).</summary>
     public IntPtr HostPanelHandle => _hostPanelHwnd;
+
+    /// <summary>
+    /// Handle of the window the native browser should be created into: the X11
+    /// host window on Linux, the panel HWND on Windows. Zero until Avalonia has
+    /// created the host panel (which happens during the first layout pass).
+    /// </summary>
+    public IntPtr HostWindowHandle => IsLinux
+        ? (_x11HostWindow != IntPtr.Zero ? _x11HostWindow : _hostPanelHwnd)
+        : _hostPanelHwnd;
+
+    /// <summary>Raised once Avalonia has created the host window.</summary>
+    public event Action? HostWindowCreated;
+
+    /// <summary>
+    /// Waits until Avalonia has created the host window and returns its handle,
+    /// or <see cref="IntPtr.Zero"/> when it is still missing after
+    /// <paramref name="timeout"/> (so callers can fall back to the old path
+    /// instead of hanging).
+    /// </summary>
+    public async Task<IntPtr> WaitForHostWindowAsync(TimeSpan timeout)
+    {
+        if (_hostWindowCreated) return HostWindowHandle;
+
+        var tcs = new TaskCompletionSource<IntPtr>(TaskCreationOptions.RunContinuationsAsynchronously);
+        void OnCreated() => tcs.TrySetResult(HostWindowHandle);
+
+        HostWindowCreated += OnCreated;
+        try
+        {
+            Task delay = Task.Delay(timeout);
+            Task done = await Task.WhenAny(tcs.Task, delay).ConfigureAwait(true);
+            return done == tcs.Task ? await tcs.Task.ConfigureAwait(true) : IntPtr.Zero;
+        }
+        finally
+        {
+            HostWindowCreated -= OnCreated;
+        }
+    }
 
     /// <summary>Hands keyboard focus to the embedded browser window.</summary>
     public void ForwardFocus()
@@ -104,6 +143,9 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
             ? (_x11HostWindow != IntPtr.Zero ? _x11HostWindow : _hostPanelHwnd)
             : _hostPanelHwnd;
 
+        _hostWindowCreated = true;
+        HostWindowCreated?.Invoke();
+
         return new PlatformHandle(handle, IsLinux ? "XID" : "HWND");
     }
 
@@ -139,7 +181,14 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
                 if (_xDisplay == IntPtr.Zero || _x11HostWindow == IntPtr.Zero)
                     return;
 
-                XReparentWindow(_xDisplay, childHwnd, _x11HostWindow, 0, 0);
+                // When the browser was created directly inside our host window it
+                // is already a child. Reparenting it onto the same parent again
+                // emits an unmap/map pair that can invalidate the native drawing
+                // surface, so only move it when it really lives somewhere else
+                // (tab-switch re-embed).
+                if (GetXParent(_xDisplay, childHwnd) != _x11HostWindow)
+                    XReparentWindow(_xDisplay, childHwnd, _x11HostWindow, 0, 0);
+
                 if (w > 0 && h > 0)
                     XMoveResizeWindow(_xDisplay, childHwnd, 0, 0, (uint)w, (uint)h);
                 XMapRaised(_xDisplay, childHwnd);
@@ -269,6 +318,7 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
         _pendingEmbedHwnd = IntPtr.Zero;
         _embeddedHwnd = IntPtr.Zero;
         _hostPanelHwnd = IntPtr.Zero;
+        _hostWindowCreated = false;
 
         if (IsLinux && _xDisplay != IntPtr.Zero)
         {
@@ -425,6 +475,25 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
 
     [DllImport(X11Lib)]
     private static extern int XSync(IntPtr display, [MarshalAs(UnmanagedType.Bool)] bool discard);
+
+    [DllImport(X11Lib)]
+    private static extern int XQueryTree(IntPtr display, IntPtr window, out IntPtr rootReturn,
+        out IntPtr parentReturn, out IntPtr childrenReturn, out int nChildrenReturn);
+
+    [DllImport(X11Lib)]
+    private static extern int XFree(IntPtr data);
+
+    /// <summary>Current parent XID of <paramref name="window"/>, or Zero on failure.</summary>
+    private static IntPtr GetXParent(IntPtr display, IntPtr window)
+    {
+        if (display == IntPtr.Zero || window == IntPtr.Zero) return IntPtr.Zero;
+
+        if (XQueryTree(display, window, out _, out IntPtr parent, out IntPtr children, out _) == 0)
+            return IntPtr.Zero;
+
+        if (children != IntPtr.Zero) XFree(children);
+        return parent;
+    }
 
     [DllImport(X11Lib)]
     private static extern int XSetInputFocus(IntPtr display, IntPtr focus, int revertTo, ulong time);

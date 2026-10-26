@@ -347,7 +347,20 @@ public class WebView : UserControl, IDisposable
 
         try
         {
-            bool ok = await _manager.StartAsync(Url, CefSettings);
+            // On X11 the browser window must be created inside the real host
+            // window: building it under a hidden, unmapped parent and moving it
+            // afterwards leaves the window unrealized, so the control stays
+            // transparent. Windows reparents reliably, so it keeps that path.
+            IntPtr hostWindow = IntPtr.Zero;
+            if (OperatingSystem.IsLinux())
+            {
+                hostWindow = await _browserHost.WaitForHostWindowAsync(TimeSpan.FromSeconds(5))
+                    .ConfigureAwait(true);
+            }
+
+            if (_manager == null || _disposed) return false;
+
+            bool ok = await _manager.StartAsync(Url, CefSettings, hostWindow).ConfigureAwait(true);
             if (!ok)
                 CefDiagnostics.Error("[WebView] native host could not be started");
             return ok;

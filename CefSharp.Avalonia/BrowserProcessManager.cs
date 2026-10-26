@@ -12,7 +12,8 @@ namespace CefSharp.Avalonia;
 /// One instance per WebView; owns a browser id inside the shared native host.
 ///
 /// Protocol v3 (all commands carry the browser id; text fields are escaped):
-///   C#→Native: Create|{id}|{cachePath}|{url}, Navigate|{id}|{url}, Reload|{id},
+///   C#→Native: SetHostWindow|{id}|{xid} (optional, before Create),
+///              Create|{id}|{cachePath}|{url}, Navigate|{id}|{url}, Reload|{id},
 ///              Stop|{id}, Resize|{id}|{w}|{h}, EmbedDone|{id}, Close|{id}, Quit,
 ///              Back|{id}, Forward|{id}, Zoom|{id}|{delta}, Find|{id}|{text}|{f}|{n},
 ///              StopFind|{id}, DevTools|{id}, ExecJS|{id}|{base64},
@@ -113,11 +114,19 @@ public sealed class BrowserProcessManager : IDisposable
     public event Action<CefJsDialog>? JsDialogRequested;
 
     /// <summary>
+    /// Window the browser must be created into (X11 host window on Linux).
+    /// Remembered so crash recovery re-creates the browser in the same place.
+    /// </summary>
+    private IntPtr _hostWindow;
+
+    /// <summary>
     /// Start this browser inside the shared host. Process-level settings are
     /// taken from the first caller (the host is shared).
+    /// <paramref name="hostWindow"/> is the native window to create the browser
+    /// in; pass Zero on Windows, where the host reparents afterwards.
     /// </summary>
     public async Task<bool> StartAsync(string url, CefSettings? settings = null,
-        CancellationToken cancellationToken = default)
+        IntPtr hostWindow = default, CancellationToken cancellationToken = default)
     {
         lock (_state)
         {
@@ -128,6 +137,7 @@ public sealed class BrowserProcessManager : IDisposable
         settings ??= new CefSettings();
         _settings = settings;
         lastUrl = url;
+        _hostWindow = hostWindow;
 
         CefHostProcess host;
         int browserId;
@@ -146,6 +156,15 @@ public sealed class BrowserProcessManager : IDisposable
         {
             _host = host;
             _browserId = browserId;
+        }
+
+        // Hand the host window over BEFORE the browser is created. Older native
+        // builds ignore the unknown command and keep creating the browser under a
+        // hidden parent, which the managed side then reparents as before.
+        if (hostWindow != IntPtr.Zero)
+        {
+            await host.SendAsync($"SetHostWindow|{browserId}|{hostWindow.ToInt64()}",
+                cancellationToken).ConfigureAwait(false);
         }
 
         string cachePath = CefProtocol.Escape(IsolatedCachePath);
@@ -182,7 +201,7 @@ public sealed class BrowserProcessManager : IDisposable
             oldHost.Release(oldId);
 
         string url = string.IsNullOrEmpty(lastUrl) ? "about:blank" : lastUrl;
-        return await StartAsync(url, _settings, cancellationToken).ConfigureAwait(false);
+        return await StartAsync(url, _settings, _hostWindow, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Entry point for events routed by <see cref="CefHostProcess"/> (id already stripped).</summary>

@@ -8,7 +8,8 @@
 //
 // IPC protocol v3 (line oriented over stdin/stdout; text fields are escaped with
 // proto::Escape so '|', CR and LF never break framing):
-//   C#→Native: Create|{id}|{cachePath}|{url}, Navigate|{id}|{url}, Reload|{id},
+//   C#→Native: SetHostWindow|{id}|{xid} (optional, before Create),
+//              Create|{id}|{cachePath}|{url}, Navigate|{id}|{url}, Reload|{id},
 //              Stop|{id}, Resize|{id}|{w}|{h}, EmbedDone|{id}, Close|{id}, Quit,
 //              Back|{id}, Forward|{id}, Zoom|{id}|{delta},
 //              Find|{id}|{text}|{forward}|{findNext}, StopFind|{id}, DevTools|{id},
@@ -356,7 +357,7 @@ static std::string Base64Decode(const std::string& in) {
 // ---- Command queue (pipe thread -> main pump) ----
 enum class CmdType { Create, Navigate, Reload, Stop, CloseOne, Resize, EmbedDone, Quit,
                      Back, Forward, Zoom, Find, StopFind, DevTools, ExecJS,
-                     JsDialogResult, Nop };
+                     JsDialogResult, SetHostWindow, Nop };
 struct Cmd { CmdType type; int id = 0; std::string arg; };
 static std::queue<Cmd> g_cmdQueue;
 static std::mutex g_cmdMutex;
@@ -382,9 +383,16 @@ struct BrowserInstance {
     int id = 0;
     CefRefPtr<BrowserHandler> handler;
     CefWindowHandle parentWindow = 0;
+    bool ownsParentWindow = false;  // false when the parent belongs to the host app
     double zoomLevel = 0.0;   // CEF zoom level: 0 = 100%
 };
 static std::map<int, BrowserInstance> g_browsers;
+
+// Host window handed over by the managed side with SetHostWindow, consumed by
+// DoCreateBrowser. Only used where creating the browser under a hidden parent
+// does not work reliably (X11).
+static std::map<int, CefWindowHandle> g_hostWindows;
+static std::mutex g_hostWindowsMutex;
 static std::mutex g_browsersMutex;
 
 static void SendEv(const std::string& line) {
@@ -861,8 +869,27 @@ static void DoCreateBrowser(int id, const std::string& cachePath, const std::str
         if (g_browsers.count(id)) { DiagLog("DIAG: [C++] Create id=%d already exists", id); return; }
     }
 
-    CefWindowHandle parent = CreateHiddenParentWindow(false, nullptr);
-    if (!parent) { DiagLog("DIAG: [C++] Create id=%d parent window FAILED", id); SendEv("LoadError|" + std::to_string(id) + "|-100|CreateWindow failed|"); return; }
+    // Creating the browser under a hidden, unmapped parent and reparenting it
+    // afterwards can leave the X11 window unrealized (the control stays
+    // transparent). When the managed side hands over its own — already mapped —
+    // host window, create the browser directly inside it instead. That window
+    // belongs to the host app, so we must never destroy it.
+    CefWindowHandle hostWindow = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_hostWindowsMutex);
+        auto it = g_hostWindows.find(id);
+        if (it != g_hostWindows.end()) { hostWindow = it->second; g_hostWindows.erase(it); }
+    }
+
+    CefWindowHandle parent = 0;
+    bool ownsParent = false;
+    if (hostWindow) {
+        parent = hostWindow;
+    } else {
+        parent = CreateHiddenParentWindow(false, nullptr);
+        ownsParent = true;
+        if (!parent) { DiagLog("DIAG: [C++] Create id=%d parent window FAILED", id); SendEv("LoadError|" + std::to_string(id) + "|-100|CreateWindow failed|"); return; }
+    }
 
     auto handler = new BrowserHandler();
     handler->SetBrowserId(id);
@@ -874,15 +901,20 @@ static void DoCreateBrowser(int id, const std::string& cachePath, const std::str
     };
     handler->OnBrowserClosed = [id]() {
         CefWindowHandle parentToDestroy = 0;
+        bool ownsParentToDestroy = false;
         {
             std::lock_guard<std::mutex> lock(g_browsersMutex);
             auto it = g_browsers.find(id);
             if (it != g_browsers.end()) {
                 parentToDestroy = it->second.parentWindow;
+                ownsParentToDestroy = it->second.ownsParentWindow;
                 g_browsers.erase(it);
             }
         }
-        if (parentToDestroy) DestroyNativeWindow(parentToDestroy);
+        // Only windows we created ourselves may be destroyed: a parent handed
+        // over by the managed side belongs to the host application (Avalonia),
+        // and destroying it would take the app window down with it.
+        if (parentToDestroy && ownsParentToDestroy) DestroyNativeWindow(parentToDestroy);
         // Host lifetime is owned by the C# side: it stays alive until an explicit
         // Quit or stdin EOF (parent process death). Do NOT exit just because the
         // last browser closed — the app may open a new tab afterwards.
@@ -926,7 +958,7 @@ static void DoCreateBrowser(int id, const std::string& cachePath, const std::str
 
     {
         std::lock_guard<std::mutex> lock(g_browsersMutex);
-        g_browsers[id] = {id, handler, parent};
+        g_browsers[id] = {id, handler, parent, ownsParent};
     }
     CefBrowserHost::CreateBrowserSync(wi, handler, url.empty() ? "about:blank" : url, bs, nullptr, requestCtx);
 }
@@ -940,6 +972,21 @@ static void ExecuteCmd(const Cmd& c) {
             std::string cachePath = fields.size() > 0 ? fields[0] : "";
             std::string url = fields.size() > 1 ? fields[1] : "";
             DoCreateBrowser(c.id, cachePath, NormalizeUrl(url));
+            break;
+        }
+        case CmdType::SetHostWindow: {
+            // "{xid}" — a window owned by the managed side that the browser must
+            // be created into. Accepted everywhere; only meaningful on X11, where
+            // creating the browser under a hidden parent does not work reliably.
+            std::string s = proto::Unescape(c.arg);
+            CefWindowHandle hw = 0;
+            if (!s.empty() && s != "0")
+                hw = (CefWindowHandle)strtoull(s.c_str(), nullptr, 0);
+            {
+                std::lock_guard<std::mutex> lock(g_hostWindowsMutex);
+                g_hostWindows[c.id] = hw;
+            }
+            DiagLog("DIAG: [C++] SetHostWindow id=%d hw=%llu", c.id, (unsigned long long)hw);
             break;
         }
         case CmdType::Navigate:
@@ -1239,7 +1286,8 @@ static int RunMain(int argc, char** argv
     }
 
     // ---- Step 6: Stdio server (skipped in standalone mode) ----
-    // Protocol v2: every command carries a browser id.
+    // Protocol v3: every command carries a browser id.
+    //   SetHostWindow|{id}|{xid}  (optional; must precede Create)
     //   Create|{id}|{cachePath}|{url}   Navigate|{id}|{url}   Reload|{id}
     //   Stop|{id}   Resize|{id}|{w}|{h}   EmbedDone|{id}   Close|{id}   Quit
     StdioServer* ps = nullptr;
@@ -1272,6 +1320,12 @@ static int RunMain(int argc, char** argv
                     // in ExecuteCmd so the escape sequences stay intact here.
                     if (navUrl.empty()) return;
                     PushCmd(CmdType::Navigate, id, navUrl);
+                } else if (cmd == "SetHostWindow") {
+                    // arg = "{id}|{xid}" — must be sent before Create so the
+                    // browser is born inside the managed host window.
+                    int id; std::string payload;
+                    if (!splitId(arg, id, payload)) return;
+                    PushCmd(CmdType::SetHostWindow, id, payload);
                 } else if (cmd == "JsDialogResult") {
                     // arg = "{id}|{dialogId}|{accept}|{text}"
                     int id; std::string payload;

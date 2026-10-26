@@ -166,7 +166,22 @@ jobs:
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT="$CEF" -DCMAKE_MODULE_PATH="$CEF/cmake"
           cmake --build build --config Release
 
-      - name: Build .NET (library + demo)
+      - name: Build .NET library
+        run: dotnet build CefSharp.Avalonia/CefSharp.Avalonia.csproj -c Release
+
+      # Publish a runnable Linux bundle (CEF + native host are copied and +x is
+      # re-applied by the csproj). NOTE: use $HOME, not '~' — a literal '~' inside
+      # a -p: argument is NOT expanded by the shell and silently points
+      # CefLinuxRoot at a non-existent path.
+      - name: Publish demo app (linux-x64)
         run: |
-          dotnet build CefSharp.Avalonia/CefSharp.Avalonia.csproj -c Release
-          dotnet build TestBrowserApp/TestBrowserApp.csproj -c Release -p:CefLinuxRoot=~/cef/cef_binary_${{ env.CEF_VER }}_linux64
+          dotnet publish TestBrowserApp/TestBrowserApp.csproj -c Release -r linux-x64 \
+            -o publish-linux \
+            -p:CefLinuxRoot="$HOME/cef/cef_binary_${{ env.CEF_VER }}_linux64"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CefBrowser-Linux-x64
+          path: publish-linux/
+          if-no-files-found: error
