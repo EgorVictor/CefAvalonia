@@ -2,207 +2,430 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Platform;
 using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 
 namespace CefSharp.Avalonia;
 
 /// <summary>
-/// HWND interop host: embeds a foreign window (CEF browser HWND) into an Avalonia panel via
-/// SetParent with proper style flags (WS_CHILD) to avoid popup flash and coordinate issues.
-/// Uses NativeControlHost to obtain a native HWND from the Avalonia layout engine.
+/// Hosts a foreign native window inside Avalonia.
+///
+/// Windows: reparents the CEF HWND into the panel obtained from
+/// <see cref="NativeControlHost"/> with <c>SetParent</c>.
+/// Linux: creates an X11 child window and reparents the CEF XID into it with
+/// <c>XReparentWindow</c>.
+///
+/// The class is deliberately defensive: the embedded window belongs to another
+/// process and can disappear at any time (native host crash), so every Win32/X11
+/// call is guarded by an <c>IsWindow</c> check.
 /// </summary>
 public sealed class ExternalBrowserProcessHost : NativeControlHost
 {
-    private IntPtr hostPanelHwnd = IntPtr.Zero;
-    private IntPtr embeddedHwnd = IntPtr.Zero;
+    private static bool IsLinux => OperatingSystem.IsLinux();
+
+    private IntPtr _hostPanelHwnd = IntPtr.Zero;
+    private IntPtr _embeddedHwnd = IntPtr.Zero;
     private IntPtr _pendingEmbedHwnd = IntPtr.Zero;
+    private IntPtr _xDisplay = IntPtr.Zero;
+    private IntPtr _x11HostWindow = IntPtr.Zero;
+    private bool _embedding;
 
     public ExternalBrowserProcessHost()
     {
-        // The embedded CEF window is a foreign HWND: Avalonia keeps keyboard
-        // focus on its own window unless we forward it. Without this the page
-        // is not typeable after clicking into it.
+        // The embedded CEF window is a foreign window: Avalonia keeps keyboard
+        // focus on its own window unless we forward it. Without this the page is
+        // not typeable after clicking into it.
         GotFocus += (_, _) => ForwardFocus();
+        SizeChanged += OnSizeChanged;
     }
+
+    /// <summary>True once a native window has been embedded.</summary>
+    public bool IsEmbedded => _embeddedHwnd != IntPtr.Zero;
+
+    /// <summary>Handle of the Avalonia host panel (HWND or XID).</summary>
+    public IntPtr HostPanelHandle => _hostPanelHwnd;
 
     /// <summary>Hands keyboard focus to the embedded browser window.</summary>
     public void ForwardFocus()
     {
-        if (embeddedHwnd != IntPtr.Zero)
-            SetFocus(embeddedHwnd);
+        IntPtr child = _embeddedHwnd;
+        if (child == IntPtr.Zero) return;
+
+        if (IsLinux)
+        {
+            if (_xDisplay != IntPtr.Zero)
+            {
+                XSetInputFocus(_xDisplay, child, RevertToParent, CurrentTime);
+                XFlush(_xDisplay);
+            }
+            return;
+        }
+
+        if (!IsWindow(child)) return;
+        SetFocus(child);
     }
-
-    /// <summary>True once EmbedWindow has been called successfully.</summary>
-    public bool IsEmbedded => embeddedHwnd != IntPtr.Zero;
-
-    /// <summary>Current host panel HWND. Used to detect panel changes during tab switch.</summary>
-    public IntPtr HostPanelHandle => hostPanelHwnd;
 
     protected override IPlatformHandle CreateNativeControlCore(IPlatformHandle parent)
     {
-        hostPanelHwnd = parent.Handle;
-        Console.Error.WriteLine($"DIAG: [EBPH] CreateNativeControlCore panel=0x{hostPanelHwnd.ToInt64():X} pending=0x{_pendingEmbedHwnd.ToInt64():X}");
-        // Process any pending embed from tab switch
+        _hostPanelHwnd = parent.Handle;
+        CefDiagnostics.Debug(
+            $"[BrowserHost] CreateNativeControl panel=0x{_hostPanelHwnd.ToInt64():X}");
+
+        if (IsLinux)
+        {
+            EnsureXDisplay();
+            if (_xDisplay != IntPtr.Zero)
+            {
+                (uint w, uint h) = GetScaledSize();
+                _x11HostWindow = XCreateSimpleWindow(
+                    _xDisplay, _hostPanelHwnd, 0, 0, w, h, 0, IntPtr.Zero, IntPtr.Zero);
+                XMapWindow(_xDisplay, _x11HostWindow);
+                XFlush(_xDisplay);
+            }
+            else
+            {
+                CefDiagnostics.Warn(
+                    "[BrowserHost] XOpenDisplay failed; X11 embedding is unavailable " +
+                    "(a Wayland-only session cannot host a CEF window)");
+                _x11HostWindow = IntPtr.Zero;
+            }
+        }
+
+        // A tab switch may have produced an embed request while the panel was
+        // being recreated; run it now that we have a valid parent.
         if (_pendingEmbedHwnd != IntPtr.Zero)
         {
-            var hwnd = _pendingEmbedHwnd;
+            IntPtr hwnd = _pendingEmbedHwnd;
             _pendingEmbedHwnd = IntPtr.Zero;
-            Console.Error.WriteLine($"DIAG: [EBPH] Processing deferred embed of HWND=0x{hwnd.ToInt64():X}");
-            _ = EmbedWindowAsync(hwnd);
+            EmbedWindow(hwnd);
         }
-        return new PlatformHandle(hostPanelHwnd, "HWND");
+
+        IntPtr handle = IsLinux
+            ? (_x11HostWindow != IntPtr.Zero ? _x11HostWindow : _hostPanelHwnd)
+            : _hostPanelHwnd;
+
+        return new PlatformHandle(handle, IsLinux ? "XID" : "HWND");
     }
 
+    /// <summary>Embeds (or re-embeds) a native browser window.</summary>
     public void EmbedWindow(IntPtr childHwnd)
     {
-        if (hostPanelHwnd == IntPtr.Zero)
+        if (childHwnd == IntPtr.Zero) return;
+
+        if (_hostPanelHwnd == IntPtr.Zero || (IsLinux && _x11HostWindow == IntPtr.Zero))
         {
-            Console.Error.WriteLine($"DIAG: [EBPH] EmbedWindow DEFERRED hwnd=0x{childHwnd.ToInt64():X}");
+            CefDiagnostics.Debug(
+                $"[BrowserHost] embed deferred (panel not ready) child=0x{childHwnd.ToInt64():X}");
             _pendingEmbedHwnd = childHwnd;
             return;
         }
+
         _ = EmbedWindowAsync(childHwnd);
     }
 
-    /// <summary>
-    /// Async version of EmbedWindow with enhanced refresh sequence to eliminate black screen.
-    /// Implements double-redraw with delays to ensure complete HWND embedding and visibility.
-    /// </summary>
     private async Task EmbedWindowAsync(IntPtr childHwnd)
     {
+        if (_embedding) return;
+        _embedding = true;
+
         try
         {
-            if (hostPanelHwnd == IntPtr.Zero) return;
+            if (_hostPanelHwnd == IntPtr.Zero) return;
 
-            embeddedHwnd = childHwnd;
-            Debug.WriteLine($"[EBPH] EmbedWindowAsync START: child=0x{childHwnd.ToInt64():X8}, panel=0x{hostPanelHwnd.ToInt64():X8}");
+            (int w, int h) = GetPixelSize();
 
-            // Step 1: Change style to WS_CHILD BEFORE reparenting (prevents popup flash)
-            var style = GetWindowLong(childHwnd, GWL_STYLE);
-            style &= ~WS_POPUP;
-            style |= WS_CHILD | WS_VISIBLE;
-            SetWindowLong(childHwnd, GWL_STYLE, style);
-            Debug.WriteLine($"[EBPH] Step 1: SetWindowLong(WS_CHILD|WS_VISIBLE) done");
-
-            // Step 2: Reparent into the panel
-            var oldParent = SetParent(childHwnd, hostPanelHwnd);
-            Debug.WriteLine($"[EBPH] Step 2: SetParent done, oldParent=0x{oldParent.ToInt64():X8}");
-
-            // Step 3: Wait for OS to process SetParent (25ms buffer ensures kernel completes reparent)
-            await Task.Delay(25);
-            Debug.WriteLine($"[EBPH] Step 3: Delay 25ms after SetParent");
-
-            // Step 4: Force position/size with DPI scaling
-            var scaling = TopLevel.GetTopLevel(this)?.RenderScaling ?? 1.0;
-            var w = (int)(Bounds.Width * scaling);
-            var h = (int)(Bounds.Height * scaling);
-            if (w > 0 && h > 0)
+            if (IsLinux)
             {
-                MoveWindow(childHwnd, 0, 0, w, h, false);
-                Debug.WriteLine($"[EBPH] Step 4: MoveWindow({w}x{h}) with scaling={scaling}");
+                if (_xDisplay == IntPtr.Zero || _x11HostWindow == IntPtr.Zero)
+                    return;
+
+                XReparentWindow(_xDisplay, childHwnd, _x11HostWindow, 0, 0);
+                if (w > 0 && h > 0)
+                    XMoveResizeWindow(_xDisplay, childHwnd, 0, 0, (uint)w, (uint)h);
+                XMapRaised(_xDisplay, childHwnd);
+                XSync(_xDisplay, false);
+
+                _embeddedHwnd = childHwnd;
+                ForwardFocus();
+                CefDiagnostics.Debug($"[BrowserHost] X11 embed complete {w}x{h}");
+                return;
             }
 
-            // Step 5: Set Z-order and make visible
+            if (!IsWindow(childHwnd) || !IsWindow(_hostPanelHwnd))
+            {
+                CefDiagnostics.Warn("[BrowserHost] embed skipped: window handle is no longer valid");
+                return;
+            }
+
+            // 1. Child style BEFORE reparenting (prevents a top-level flash).
+            long style = GetWindowLongPtr(childHwnd, GWL_STYLE).ToInt64();
+            style &= ~(long)(WS_POPUP | WS_CAPTION | WS_THICKFRAME);
+            style |= WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN;
+            SetWindowLongPtr(childHwnd, GWL_STYLE, new IntPtr(style));
+
+            // 2. Reparent into the Avalonia panel.
+            SetParent(childHwnd, _hostPanelHwnd);
+
+            // 3. Let the OS settle, then apply geometry and the new frame.
+            await Task.Delay(25);
+
+            if (!IsWindow(childHwnd) || !IsWindow(_hostPanelHwnd))
+                return;
+
+            if (w > 0 && h > 0)
+                MoveWindow(childHwnd, 0, 0, w, h, false);
+
             SetWindowPos(childHwnd, HWND_TOP, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            Debug.WriteLine($"[EBPH] Step 5: SetWindowPos(HWND_TOP) done");
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            ShowWindow(childHwnd, SW_SHOW);
 
-            // Step 6: First RedrawWindow on parent container
-            RedrawWindow(hostPanelHwnd, IntPtr.Zero, IntPtr.Zero,
+            RedrawWindow(_hostPanelHwnd, IntPtr.Zero, IntPtr.Zero,
                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-            Debug.WriteLine($"[EBPH] Step 6: RedrawWindow(parent) - first pass");
-
-            // Step 7: Brief delay to ensure first redraw processes
-            await Task.Delay(10);
-
-            // Step 8: Second RedrawWindow directly on the child HWND (critical for eliminating black frame)
             RedrawWindow(childHwnd, IntPtr.Zero, IntPtr.Zero,
                 RDW_INVALIDATE | RDW_UPDATENOW);
-            Debug.WriteLine($"[EBPH] Step 8: RedrawWindow(child) - second pass");
 
-            Debug.WriteLine($"[EBPH] EmbedWindowAsync COMPLETE");
+            _embeddedHwnd = childHwnd;
+            ForwardFocus();
+            CefDiagnostics.Debug($"[BrowserHost] Windows embed complete {w}x{h}");
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[EBPH] EmbedWindowAsync ERROR: {ex}");
+            CefDiagnostics.Error("[BrowserHost] embed failed", ex);
         }
+        finally
+        {
+            _embedding = false;
+        }
+    }
+
+    private (int Width, int Height) GetPixelSize()
+    {
+        (uint w, uint h) = GetScaledSize();
+        return ((int)w, (int)h);
+    }
+
+    private (uint Width, uint Height) GetScaledSize()
+    {
+        double scaling = TopLevel.GetTopLevel(this)?.RenderScaling ?? 1.0;
+        double width = Bounds.Width > 0 ? Bounds.Width : 1;
+        double height = Bounds.Height > 0 ? Bounds.Height : 1;
+        return ((uint)Math.Max(1, Math.Round(width * scaling)),
+                (uint)Math.Max(1, Math.Round(height * scaling)));
+    }
+
+    private void OnSizeChanged(object? sender, SizeChangedEventArgs e)
+    {
+        if (IsLinux)
+        {
+            if (_xDisplay == IntPtr.Zero || _x11HostWindow == IntPtr.Zero) return;
+
+            (uint w, uint h) = GetScaledSize();
+            XMoveResizeWindow(_xDisplay, _x11HostWindow, 0, 0, w, h);
+            if (_embeddedHwnd != IntPtr.Zero)
+                XMoveResizeWindow(_xDisplay, _embeddedHwnd, 0, 0, w, h);
+            XFlush(_xDisplay);
+            return;
+        }
+
+        if (_embeddedHwnd == IntPtr.Zero || !IsWindow(_embeddedHwnd)) return;
+
+        (int width, int height) = GetPixelSize();
+        MoveWindow(_embeddedHwnd, 0, 0, width, height, true);
     }
 
     protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
     {
-        // Reparent CEF child to desktop BEFORE base destroys DumbWindow (which would cascade-destroy child windows)
-        if (embeddedHwnd != IntPtr.Zero)
-        {
-            Console.Error.WriteLine($"DIAG: [EBPH] OnDetachedFromVisualTree reparenting CEF child 0x{embeddedHwnd.ToInt64():X} to desktop");
-            SetParent(embeddedHwnd, IntPtr.Zero);
-            ShowWindow(embeddedHwnd, SW_HIDE);
-        }
+        // Detach the CEF child BEFORE Avalonia destroys the host window, which
+        // would otherwise cascade-destroy the child.
+        DetachFromCurrentParent();
         base.OnDetachedFromVisualTree(e);
+    }
+
+    private void DetachFromCurrentParent()
+    {
+        IntPtr child = _embeddedHwnd;
+        if (child == IntPtr.Zero) return;
+
+        if (IsLinux)
+        {
+            if (_xDisplay != IntPtr.Zero)
+            {
+                XReparentWindow(_xDisplay, child, XDefaultRootWindow(_xDisplay), 0, 0);
+                XUnmapWindow(_xDisplay, child);
+                XFlush(_xDisplay);
+            }
+        }
+        else if (IsWindow(child))
+        {
+            SetParent(child, IntPtr.Zero);
+            ShowWindow(child, SW_HIDE);
+        }
+
+        _embeddedHwnd = IntPtr.Zero;
     }
 
     protected override void DestroyNativeControlCore(IPlatformHandle control)
     {
         _pendingEmbedHwnd = IntPtr.Zero;
-        embeddedHwnd = IntPtr.Zero;
-        hostPanelHwnd = IntPtr.Zero;  // Force defer on next attach until CreateNativeControlCore provides new panel
+        _embeddedHwnd = IntPtr.Zero;
+        _hostPanelHwnd = IntPtr.Zero;
+
+        if (IsLinux && _xDisplay != IntPtr.Zero)
+        {
+            if (_x11HostWindow != IntPtr.Zero)
+            {
+                XDestroyWindow(_xDisplay, _x11HostWindow);
+                XFlush(_xDisplay);
+            }
+
+            XCloseDisplay(_xDisplay);
+            _xDisplay = IntPtr.Zero;
+        }
+
+        _x11HostWindow = IntPtr.Zero;
         base.DestroyNativeControlCore(control);
     }
 
     /// <summary>
-    /// Forget the embedded HWND. Call during permanent teardown (WebView.Cleanup) so that
-    /// a subsequent detach/destroy never calls SetParent/ShowWindow on a destroyed window.
+    /// Forgets the embedded window without touching it. Used during permanent
+    /// teardown (WebView.Cleanup) when the native host is about to destroy the
+    /// window; a later detach must never call SetParent/XReparent on it.
     /// </summary>
     public void DetachEmbedded()
     {
         _pendingEmbedHwnd = IntPtr.Zero;
-        embeddedHwnd = IntPtr.Zero;
-        hostPanelHwnd = IntPtr.Zero;
+        _embeddedHwnd = IntPtr.Zero;
+        _hostPanelHwnd = IntPtr.Zero;
+        _x11HostWindow = IntPtr.Zero;
     }
 
+    private void EnsureXDisplay()
+    {
+        if (!IsLinux || _xDisplay != IntPtr.Zero) return;
+        _xDisplay = XOpenDisplay(IntPtr.Zero);
+    }
+
+    // ---- Windows constants ----
     private const int GWL_STYLE = -16;
     private const uint WS_CHILD = 0x40000000;
     private const uint WS_POPUP = 0x80000000;
     private const uint WS_VISIBLE = 0x10000000;
+    private const uint WS_CAPTION = 0x00C00000;
+    private const uint WS_THICKFRAME = 0x00040000;
+    private const uint WS_CLIPCHILDREN = 0x02000000;
 
-    private const uint SWP_NOMOVE = 0x0002;
     private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
     private const uint SWP_NOACTIVATE = 0x0010;
+    private const uint SWP_FRAMECHANGED = 0x0020;
     private const uint SWP_SHOWWINDOW = 0x0040;
 
     private const uint RDW_INVALIDATE = 0x0001;
     private const uint RDW_UPDATENOW = 0x0100;
     private const uint RDW_ALLCHILDREN = 0x0080;
 
+    private const int SW_HIDE = 0;
+    private const int SW_SHOW = 5;
+
+    private static readonly IntPtr HWND_TOP = IntPtr.Zero;
+
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
 
     [DllImport("user32.dll", SetLastError = true)]
-    private static extern uint GetWindowLong(IntPtr hWnd, int nIndex);
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindow(IntPtr hWnd);
 
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern uint SetWindowLong(IntPtr hWnd, int nIndex, uint dwNewLong);
+    // GetWindowLongPtrW only exists on 64-bit Windows; on 32-bit the *W variant
+    // is the correct entry point, so pick the right one at runtime.
+    private static IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex) =>
+        IntPtr.Size == 8
+            ? GetWindowLongPtr64(hWnd, nIndex)
+            : new IntPtr(GetWindowLong32(hWnd, nIndex));
+
+    private static IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr value) =>
+        IntPtr.Size == 8
+            ? SetWindowLongPtr64(hWnd, nIndex, value)
+            : new IntPtr(SetWindowLong32(hWnd, nIndex, value.ToInt32()));
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+    private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
+    private static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr value);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+    private static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
+    private static extern int SetWindowLong32(IntPtr hWnd, int nIndex, int value);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, [MarshalAs(UnmanagedType.Bool)] bool bRepaint);
+    private static extern bool MoveWindow(IntPtr hWnd, int x, int y, int width, int height,
+        [MarshalAs(UnmanagedType.Bool)] bool repaint);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
+        int x, int y, int cx, int cy, uint flags);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
-
-    private static readonly IntPtr HWND_TOP = new IntPtr(0);
-    private const int SW_HIDE = 0;
+    private static extern bool RedrawWindow(IntPtr hWnd, IntPtr updateRect,
+        IntPtr updateRegion, uint flags);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    private static extern bool ShowWindow(IntPtr hWnd, int cmdShow);
 
     [DllImport("user32.dll")]
     private static extern IntPtr SetFocus(IntPtr hWnd);
+
+    // ---- X11 P/Invoke ----
+    private const string X11Lib = "libX11.so.6";
+    private const int RevertToParent = 2;
+    private const ulong CurrentTime = 0;
+
+    [DllImport(X11Lib)]
+    private static extern IntPtr XOpenDisplay(IntPtr display);
+
+    [DllImport(X11Lib)]
+    private static extern int XCloseDisplay(IntPtr display);
+
+    [DllImport(X11Lib)]
+    private static extern IntPtr XDefaultRootWindow(IntPtr display);
+
+    [DllImport(X11Lib)]
+    private static extern IntPtr XCreateSimpleWindow(
+        IntPtr display, IntPtr parent, int x, int y, uint width, uint height,
+        uint borderWidth, IntPtr border, IntPtr background);
+
+    [DllImport(X11Lib)]
+    private static extern int XDestroyWindow(IntPtr display, IntPtr window);
+
+    [DllImport(X11Lib)]
+    private static extern int XReparentWindow(IntPtr display, IntPtr window, IntPtr parent, int x, int y);
+
+    [DllImport(X11Lib)]
+    private static extern int XMoveResizeWindow(IntPtr display, IntPtr window, int x, int y,
+        uint width, uint height);
+
+    [DllImport(X11Lib)]
+    private static extern int XMapWindow(IntPtr display, IntPtr window);
+
+    [DllImport(X11Lib)]
+    private static extern int XMapRaised(IntPtr display, IntPtr window);
+
+    [DllImport(X11Lib)]
+    private static extern int XUnmapWindow(IntPtr display, IntPtr window);
+
+    [DllImport(X11Lib)]
+    private static extern int XFlush(IntPtr display);
+
+    [DllImport(X11Lib)]
+    private static extern int XSync(IntPtr display, [MarshalAs(UnmanagedType.Bool)] bool discard);
+
+    [DllImport(X11Lib)]
+    private static extern int XSetInputFocus(IntPtr display, IntPtr focus, int revertTo, ulong time);
 }

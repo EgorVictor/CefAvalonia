@@ -1,17 +1,17 @@
 # CefBrowser
 
-基于 **CEF (Chromium Embedded Framework)** 的 .NET Avalonia 浏览器控件，通过 C++ 原生子进程 + Named Pipe IPC 实现嵌入式浏览器 HWND 托管。
+基于 **CEF (Chromium Embedded Framework)** 的 .NET Avalonia 浏览器控件，通过 C++ 原生子进程 + **stdio（标准输入/输出）IPC** 实现嵌入式浏览器 HWND 托管。
 
-支持 **Windows 7** 兼容，使用 MSVC v143 工具链编译。
+支持 **Windows**（x64）与 **Linux**（x64，需 `chrome-sandbox` 或显式关闭沙箱）。目标框架为 **.NET 8**（.NET 8 本身不支持 Windows 7，请勿在 Win7 上部署）。
 
 ## 简介
 
-CefBrowser 将 CEF 浏览器引擎封装为一个 Avalonia `UserControl`（`BrowserView`），提供完整的浏览功能（导航、加载状态、标题同步等），并暴露 C# 事件与异步 API。
+CefBrowser 将 CEF 浏览器引擎封装为一个 Avalonia `WebView` 控件，提供完整的浏览功能（导航、加载状态、标题同步、下载、JS 对话框等），并暴露 C# 事件与异步 API。
 
 **设计目标：**
-- CEF 运行在独立原生进程，与 .NET 进程解耦
-- 通过 HWND 嵌入（`SetParent`）实现浏览器与 Avalonia 控件无缝融合
-- Named Pipe 进程间通信，命令与事件高效传递
+- CEF 运行在独立的原生进程，与 .NET 进程解耦（一个原生宿主进程可服务多个 `WebView`）。
+- 通过 HWND 嵌入（`SetParent`）实现浏览器与 Avalonia 控件无缝融合。
+- 进程间通信走 stdin/stdout，按行分帧（文本字段经转义），带 `Hello|{version}` 握手。
 
 ---
 
@@ -21,55 +21,61 @@ CefBrowser 将 CEF 浏览器引擎封装为一个 Avalonia `UserControl`（`Brow
 ┌──────────────────────────────────────────────────┐
 │              Avalonia App (.NET 8)               │
 │  ┌─────────────────────────────────────────────┐  │
-│  │              BrowserView                     │  │
+│  │              WebView                        │  │
 │  │  ┌─────────────────────────────────────────┐ │  │
 │  │  │   ExternalBrowserProcessHost            │ │  │
-│  │  │   (NativeControlHost, HWND embedding)    │ │  │
+│  │  │   (NativeControlHost, HWND 嵌入)        │ │  │
 │  │  └─────────────────────────────────────────┘ │  │
 │  │  ┌─────────────────────────────────────────┐ │  │
 │  │  │   BrowserProcessManager                 │ │  │
-│  │  │   (子进程生命周期 + Named Pipe IPC)      │ │  │
+│  │  │   (浏览器生命周期 + stdio IPC 客户端)    │ │  │
 │  │  └─────────────────────────────────────────┘ │  │
 │  └─────────────────────────────────────────────┘  │
 │                         │                          │
-│                   Named Pipe                       │
-│                   (Windows)                        │
+│                      stdio (stdin/stdout)           │
 └────────────────────┬─────────────────────────────┘
                      │
 ┌────────────────────┴─────────────────────────────┐
 │          CefBrowser.Native (C++, CEF)             │
 │  ┌─────────────────────────────────────────────┐  │
-│  │              PipeServer                      │  │
-│  │  (Named Pipe 服务端, 双线程: 读取+写入)      │  │
+│  │              StdioServer                    │  │
+│  │  (stdio 服务端, 读/写双线程, 事件队列)       │  │
 │  └─────────────────────────────────────────────┘  │
 │  ┌─────────────────────────────────────────────┐  │
-│  │              BrowserHandler                  │  │
-│  │  (CEF Client / LifeSpan / Load / Display)     │  │
+│  │              BrowserHandler                 │  │
+│  │  (CEF Client / LifeSpan / Load / Display)   │  │
 │  └─────────────────────────────────────────────┘  │
 │  ┌─────────────────────────────────────────────┐  │
-│  │           CEF Browser Instance               │  │
-│  │  (Chromium 109, 独立进程)                    │  │
+│  │           CEF Browser Instance              │  │
+│  │  (Chromium 109, 独立渲染进程)               │  │
 │  └─────────────────────────────────────────────┘  │
 │                        │                           │
 │                  SetParent(browser_hwnd)           │
 └──────────────────────────────────────────────────┘
 ```
 
-### 通信协议
+### 通信协议（v3，行协议）
+
+文本字段（URL、标题、路径、对话框文本）一律用 `CefProtocol.Escape` 转义，避免 `|`、CR、LF 破坏分帧。所有命令/事件携带浏览器 `id`。
 
 | 方向 | 命令/事件 | 格式 |
 |------|-----------|------|
-| C# → C++ | `Navigate` | `Navigate\|url` |
-| C# → C++ | `Reload` | `Reload` |
-| C# → C++ | `Stop` | `Stop` |
-| C# → C++ | `Close` | `Close` |
-| C# → C++ | `EmbedDone` | `EmbedDone` |
-| C# → C++ | `Resize` | `Resize\|width\|height` |
-| C++ → C# | `Ready` | `Ready\|HWND_HEX` |
-| C++ → C# | `AddressChanged` | `AddressChanged\|url` |
-| C++ → C# | `LoadError` | `LoadError\|code\|text\|url` |
-| C++ → C# | `NavState` | `NavState\|isLoading\|canGoBack\|canGoForward` |
-| C++ → C# | `TitleChanged` | `TitleChanged\|title` |
+| C# → C++ | `Create` | `Create\|{id}\|{cachePath}\|{url}` |
+| C# → C++ | `Navigate` | `Navigate\|{id}\|{url}` |
+| C# → C++ | `Reload` / `Stop` / `Close` / `EmbedDone` | `...\|{id}` |
+| C# → C++ | `Resize` | `Resize\|{id}\|{w}\|{h}` |
+| C# → C++ | `Zoom` / `Find` / `ExecJS` | `...\|{id}\|{payload}` |
+| C# → C++ | `JsDialogResult` | `JsDialogResult\|{id}\|{dialogId}\|{accept}\|{text}` |
+| C# → C++ | `Quit` | `Quit` |
+| C++ → C# | `Hello` | `Hello\|{version}` |
+| C++ → C# | `Ready` | `Ready\|{id}\|{HWND_HEX}` |
+| C++ → C# | `AddressChanged` | `AddressChanged\|{id}\|{url}` |
+| C++ → C# | `LoadError` | `LoadError\|{id}\|{code}\|{text}\|{url}` |
+| C++ → C# | `NavState` | `NavState\|{id}\|{isLoading}\|{canGoBack}\|{canGoForward}` |
+| C++ → C# | `TitleChanged` | `TitleChanged\|{id}\|{title}` |
+| C++ → C# | `OpenPopup` | `OpenPopup\|{id}\|{url}` |
+| C++ → C# | `JsDialog` | `JsDialog\|{id}\|{dialogId}\|{type}\|{message}\|{default}` |
+| C++ → C# | `Download*` | `DownloadStart\|{id}\|{path}` 等 |
 
 ---
 
@@ -77,19 +83,24 @@ CefBrowser 将 CEF 浏览器引擎封装为一个 Avalonia `UserControl`（`Brow
 
 ```
 CefBrowser/
-├── CefBrowser.Native/              # C++ CEF 原生子进程 (CMake 项目)
+├── CefBrowser.Native/              # C++ CEF 原生宿主 (CMake 项目)
 │   ├── CMakeLists.txt              # CMake 构建配置
+│   ├── prebuilt/                   # 不再使用；请从源码构建（见 .gitignore）
 │   └── src/
-│       ├── main.cpp                # WinMain、CEF 初始化、消息泵、命令调度
+│       ├── main.cpp                # 入口、CEF 初始化、消息泵、命令调度
 │       ├── browser_handler.h/.cpp  # CEF Client 回调处理
-│       └── pipe_server.h/.cpp      # Named Pipe 服务端 (双线程读写)
+│       ├── stdio_server.h/.cpp     # stdio 服务端（双线程读写）
+│       └── protocol.h              # 行协议转义/切分辅助
 │
 ├── CefSharp.Avalonia/              # C# Avalonia 浏览器控件库 (.NET 8)
 │   ├── CefSharp.Avalonia.csproj
-│   ├── BrowserView.cs              # 可复用的 Avalonia UserControl
-│   ├── BrowserProcessManager.cs    # 子进程管理 + Named Pipe 客户端 + 消息调度
+│   ├── WebView.cs                  # 可复用的 Avalonia UserControl
+│   ├── BrowserProcessManager.cs    # 单浏览器外观 + stdio IPC 客户端
+│   ├── CefHostProcess.cs           # 共享原生宿主进程（崩溃恢复、引用计数）
 │   ├── ExternalBrowserProcessHost.cs # HWND 嵌入 (NativeControlHost)
 │   ├── CefSettings.cs              # CefSettings 镜像类
+│   ├── CefProtocol.cs              # 行协议转义/切分
+│   ├── CefDiagnostics.cs           # 可配置诊断日志
 │   ├── build/                      # NuGet 打包 MSBuild targets
 │   └── buildTransitive/
 │
@@ -97,121 +108,65 @@ CefBrowser/
 │   ├── TestBrowserApp.csproj
 │   ├── Program.cs                  # 应用入口
 │   ├── App.axaml / App.axaml.cs    # Avalonia Application
-│   ├── MainWindow.axaml / .cs      # 主窗口 (地址栏 + 浏览器)
+│   ├── MainWindow.axaml / .cs      # 主窗口 (标签 + 地址栏 + 浏览器)
 │   └── app.manifest                # Windows 兼容性清单
 │
-├── .github/workflows/publish.yml   # GitHub Actions 自动发布
-├── package.ps1                     # 一键编译打包脚本
-├── pack.ps1                        # 打包 NuGet 脚本
-├── run.ps1                         # 启动 TestBrowserApp
-├── run-standalone.ps1              # 启动 C++ 独立模式
-├── run-dev.ps1                     # 启动 UI 测试模式
+├── .github/workflows/publish.yml   # GitHub Actions（构建 + 打包 + 发布 NuGet）
+├── pack.ps1                        # 一键构建并打包 NuGet（原生 + 托管）
+├── publish.ps1                     # 打包 TestBrowserApp 可再分发 zip
 └── README.md                       # 本文件
 ```
 
 ---
 
-## 启动方式
+## 构建
 
-项目支持 3 种启动模式：
-
-### 1. 完整应用模式（推荐）
-
-运行 `TestBrowserApp`（.NET + CEF）：
-
-```powershell
-.\run.ps1
-```
-
-### 2. C++ 独立模式（调试 CEF）
-
-直接运行 CEF 原生进程，不依赖 .NET：
-
-```powershell
-# 默认 about:blank
-.\run-standalone.ps1
-
-# 指定 URL
-.\run-standalone.ps1 -Url "https://www.google.com"
-
-# 加载本地文件
-.\run-standalone.ps1 -Url "file:///F:/Test/test.html"
-```
-
-此模式用于快速验证 CEF 本身的运行状态。窗口标题为 "CEF Browser Test"。
-
-### 3. 开发模式（无 CEF）
-
-仅测试 UI 布局，跳过浏览器进程：
-
-```powershell
-.\run-dev.ps1
-```
-
-等价于 `TestBrowserApp.exe --no-cef`。
-
----
-
-## 本地文件加载
-
-CefBrowser 支持加载本地 HTML 文件。输入本地路径即可：
-
-```
-# 在地址栏输入（自动补全为 file:///）
-F:\Test\test.html
-
-# 或直接使用 file:// 协议
-file:///F:/Test/test.html
-```
-
-底层通过 `--allow-file-access-from-files` 和 `--disable-web-security` 两个 CEF 开关实现。此方式用于**本地开发测试**，生产环境建议使用 HTTP 服务器。
-
-> 注：`--disable-web-security` 会关闭同源策略，请勿用于加载不受信任的内容。
-
----
-
-## 编译
+所有工具（CMake / MSVC）都通过 `vswhere` 或 PATH 解析，不依赖特定 VS 版本或安装路径。
 
 ### 环境要求
 
 | 组件 | 版本 |
 |------|------|
-| Visual Studio | 2022 / 2026（含 C++ 桌面开发） |
+| Visual Studio | 2022（含 C++ 桌面开发 / v143） |
 | CMake | 3.20+ |
 | .NET SDK | 8.0+ |
 | CEF Binary | 109.1.11（Chromium 109.0.5414.87） |
 
-### 一键编译
+CEF 根目录可通过环境变量 `CEF_ROOT` 覆盖，默认 `C:/cef/cef_binary_109.1.11+g6d4fdb2+chromium-109.0.5414.87_windows64`。
+
+### 一键构建 + 打包 NuGet
 
 ```powershell
-.\package.ps1            # Release
-.\package.ps1 -Debug     # Debug
+.\pack.ps1            # Release
+.\pack.ps1 -Debug     # Debug
 ```
 
 此命令依次：
-1. 编译 `CefBrowser.Native`（CMake + Ninja，v143 工具链）
-2. 编译 .NET 项目
-3. 打包为 `CefBrowser-Win7-x64.zip`
+1. 用 CMake + Ninja 编译 `CefBrowser.Native`（v143 工具链）；
+2. 构建 `CefSharp.Avalonia` 库；
+3. `dotnet pack` 生成 `artifacts\CefSharp.Avalonia.<ver>.nupkg`。
+
+### 打包演示应用
+
+```powershell
+.\publish.ps1         # 生成 CefBrowser-Win-x64.zip（含原生宿主 + CEF 运行时 + 演示程序）
+```
 
 ### 分步编译
 
-#### 1. 下载 CEF
+#### 1. 下载并解压 CEF 到无空格路径
 
 ```
 https://cef-builds.spotifycdn.com/cef_binary_109.1.11+g6d4fdb2+chromium-109.0.5414.87_windows64.tar.bz2
 ```
 
-解压到无空格路径，如 `C:\cef\cef_binary_109.1.11+...`
-
-#### 2. 编译原生子进程
+#### 2. 编译原生宿主
 
 ```cmd
 cd CefBrowser.Native
-
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   -DCEF_ROOT=C:/cef/cef_binary_109.1.11+g6d4fdb2+chromium-109.0.5414.87_windows64 ^
   -DCMAKE_MODULE_PATH=C:/cef/cef_binary_109.1.11+g6d4fdb2+chromium-109.0.5414.87_windows64/cmake
-
 cmake --build build --config Release
 ```
 
@@ -219,23 +174,32 @@ cmake --build build --config Release
 
 ```cmd
 dotnet build TestBrowserApp -c Release
-.\TestBrowserApp\bin\Release\net8.0-windows\TestBrowserApp.exe
+dotnet run --project TestBrowserApp -c Release
 ```
+
+> **本地文件加载 / 开发模式**：以 `--no-cef` 启动演示程序（`dotnet run --project TestBrowserApp -c Release -- --no-cef`）可跳过浏览器进程，仅验证 UI 布局。
 
 ---
 
 ## 配置 (CefSettings)
 
-通过 `BrowserView.CefSettings` 属性配置 CEF 初始化参数：
+通过 `WebView.CefSettings` 配置 CEF 初始化参数。**必须在控件挂接到可视树之前赋值。**
 
 ```csharp
-var browser = new BrowserView();
-browser.CefSettings.NoSandbox = true;
+var browser = new WebView();
+// 沙箱默认开启；仅在确实需要时显式关闭。
+browser.CefSettings.NoSandbox = true;                 // 逃生开关，默认 false（沙箱开启）
 browser.CefSettings.CommandLineSwitches.Add("--allow-file-access-from-files");
 browser.CefSettings.Locale = "zh-CN";
 ```
 
-所有 CEF 设置项通过 `--cef-*` 命令行参数序列化到原生进程。
+所有 CEF 设置项通过 `--cef-*` 命令行参数序列化到原生进程（值含空格也安全，因为使用 `ProcessStartInfo.ArgumentList`）。
+
+### 重要的共享宿主约束
+
+- **进程级设置只在第一个 `WebView` 生效**：因为所有 `WebView` 共享同一个原生宿主进程，CEF 的进程级设置（UA、语言、代理、缓存根等）由首个创建宿主的实例决定。后续实例若设置不同的进程级参数，库会输出 `CefDiagnostics` 告警并忽略其差异。
+- **每浏览器隔离**：用 `WebView.IsolatedCachePath` 给单个浏览器独立的 request context（独立 cookie/localStorage/cache），这是多标签并存的关键。
+- **默认缓存目录**：`%LOCALAPPDATA%\CefAvalonia\cef_cache`（Linux：`~/.cache/cefavalonia/cef_cache`），不会写到程序目录（Program Files 不可写）。
 
 ---
 
@@ -246,59 +210,66 @@ browser.CefSettings.Locale = "zh-CN";
 ### 安装
 
 ```xml
-<PackageReference Include="CefSharp.Avalonia" Version="1.0.0" />
+<PackageReference Include="CefSharp.Avalonia" Version="1.1.0" />
 ```
 
-### 目标框架要求
+### 目标框架要求（消费方）
 
 ```xml
-<TargetFramework>net8.0-windows</TargetFramework>
+<TargetFramework>net8.0</TargetFramework>
 <PlatformTarget>x64</PlatformTarget>
 <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-<UseWindowsForms>true</UseWindowsForms>
 ```
 
-### 本地打包
-
-```powershell
-.\pack.ps1
-```
-
-输出：`artifacts\CefSharp.Avalonia.1.0.0.nupkg`
-
-### 自动发布
-
-推 tag 到 GitHub 自动触发 GitHub Actions：
-
-```cmd
-git tag v1.0.1
-git push --tags
-```
+> 库本身只依赖 `Avalonia` 核心包（不再强制 `Avalonia.Desktop`），由消费方自行引用所需的平台后端。
 
 ---
 
 ## API 参考
 
-### BrowserView
+### WebView
 
 ```csharp
-var browser = new BrowserView();
+var browser = new WebView();
 
 // 事件
 browser.AddressChanged += url => Console.WriteLine(url);
-browser.TitleChanged += title => this.Title = title;
+browser.TitleChanged  += title => this.Title = title;
 browser.LoadingStateChanged += isLoading => button.IsEnabled = !isLoading;
 browser.BrowserCrashed += () => Console.WriteLine("Browser crashed");
 browser.LoadError += info => Console.WriteLine($"LoadError: {info}");
+browser.OpenPopup += url => OpenNewTab(url);          // 含 about:blank 弹窗
 
 // 导航
 await browser.NavigateAsync("https://github.com");
 await browser.ReloadAsync();
 await browser.StopAsync();
+browser.GoBack();
+browser.GoForward();
 
 // 属性
-browser.CefSettings.NoSandbox = false;
-string currentUrl = browser.Url;
-string title = browser.Title;
-bool isLoading = browser.IsLoading;
+string currentUrl = browser.Url;       // 双向绑定可用
+string title      = browser.Title;
+bool isLoading    = browser.IsLoading;
+
+// 生命周期
+browser.AutoRecover = true;            // 宿主崩溃后自动恢复（默认开启，最多 3 次）
+// 标签永久关闭时：
+browser.Cleanup();                    // 等同 Dispose()
 ```
+
+`WebView` 实现了 `IDisposable`：`Dispose()`/`Cleanup()` 只释放该浏览器槽位，共享宿主进程在应用退出时由 `CefHostProcess.ShutdownAll()`（库已在 `AppDomain.ProcessExit` 注册兜底）统一关闭。
+
+---
+
+## 已知限制与注意事项
+
+- **键盘焦点**：点击页面后，焦点进入 CEF 的 HWND，Avalonia 层面的快捷键（`Ctrl+T`、`F12`、Tab 切换等）不会触发。需要使用加速键时，请在应用层通过 `WebView` 暴露的命令（`GoBack`/`ShowDeveloperTools`/缩放等）桥接，或在 Avalonia 顶层自行处理。
+- **JS 对话框**：有托管宿主时，弹窗通过 `JsDialogRequested` 事件异步回调，不会阻塞共享消息泵；未订阅时自动以安全默认应答（alert 接受、其余取消），页面不会卡死。
+- **诊断日志**：默认仅输出 `Error` 级。设置环境变量 `CEF_DIAG=1` 可开启全部诊断；或在代码中设置 `CefDiagnostics.Level` / `CefDiagnostics.Sink` 接入自有日志，避免污染宿主 stderr。
+
+---
+
+## 许可证
+
+本项目以 [MIT 许可证](./LICENSE) 发布。

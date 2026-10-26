@@ -1,12 +1,25 @@
 #include "browser_handler.h"
+#include "protocol.h"
 #include "include/cef_browser.h"
 #include "include/cef_frame.h"
 #include "include/cef_download_item.h"
+#include <algorithm>
+#include <atomic>
+#include <string>
+#include <utility>
+#include <vector>
+
+#if defined(_WIN32)
 #include <shlobj.h>    // SHGetFolderPathW / CSIDL_DOWNLOADS
 #include <shobjidl.h>  // IFileDialog (Vista+ common file dialogs)
 #include <objbase.h>   // CoInitializeEx / CoCreateInstance
 #include <commdlg.h>   // GetSaveFileNameW (Save As dialog)
-#include <algorithm>
+#elif defined(__linux__)
+#include <gtk/gtk.h>
+#include <glib.h>
+#include <cstring>
+extern bool g_gtkInitialized;
+#endif
 
 BrowserHandler::BrowserHandler()
 {
@@ -15,16 +28,17 @@ BrowserHandler::BrowserHandler()
 void BrowserHandler::OnAfterCreated(CefRefPtr<CefBrowser> browser)
 {
     browser_ = browser;
-    browser_hwnd_ = browser->GetHost()->GetWindowHandle();
+    browser_window_ = browser->GetHost()->GetWindowHandle();
 
     if (OnBrowserReady)
-        OnBrowserReady(browser_hwnd_);
+        OnBrowserReady(browser_window_);
 }
 
 void BrowserHandler::OnBeforeClose(CefRefPtr<CefBrowser> browser)
 {
     browser_ = nullptr;
-    browser_hwnd_ = nullptr;
+    browser_window_ = 0;
+    DismissAllDialogs();
     if (OnBrowserClosed)
         OnBrowserClosed();
 }
@@ -33,6 +47,11 @@ void BrowserHandler::OnAddressChange(CefRefPtr<CefBrowser> browser,
                                      CefRefPtr<CefFrame> frame,
                                      const CefString& url)
 {
+    // Only top-level navigation belongs in the address bar. Sub-frame loads
+    // (ads, iframes) are ignored instead of trying to guess by host name.
+    if (!frame || !frame->IsMain())
+        return;
+
     if (OnAddressChanged)
         OnAddressChanged(url.ToString());
 }
@@ -66,8 +85,10 @@ bool BrowserHandler::OnBeforePopup(CefRefPtr<CefBrowser> browser,
                                     CefRefPtr<CefDictionaryValue>& extra_info,
                                     bool* no_javascript_access)
 {
-    if (OnBeforePopupCB && !target_url.empty())
-        OnBeforePopupCB(target_url.ToString());
+    // Report every popup, including window.open() with an empty URL (e.g.
+    // about:blank + document.write), so the managed host can open a blank tab.
+    if (OnBeforePopupCB)
+        OnBeforePopupCB(target_url.empty() ? "about:blank" : target_url.ToString());
     return true; // cancel popup, we handle it in C#
 }
 
@@ -77,13 +98,14 @@ void BrowserHandler::OnLoadError(CefRefPtr<CefBrowser> browser,
                                  const CefString& errorText,
                                  const CefString& failedUrl)
 {
-    if (!frame->IsMain()) return;
+    if (!frame || !frame->IsMain()) return;
     if (OnLoadErrorEvent)
         OnLoadErrorEvent(std::to_string((int)errorCode) + "|" +
-                         errorText.ToString() + "|" +
-                         failedUrl.ToString());
+                         proto::Escape(errorText.ToString()) + "|" +
+                         proto::Escape(failedUrl.ToString()));
 }
 
+#if defined(_WIN32)
 // Shows the OS "Save As" dialog so the user can choose where to store the file.
 // Returns the chosen path, or an empty string if the user cancels.
 static std::wstring ShowSaveDialog(HWND owner, const std::wstring& suggestedName)
@@ -111,12 +133,37 @@ static std::wstring ShowSaveDialog(HWND owner, const std::wstring& suggestedName
         return std::wstring(buf);
     return std::wstring();
 }
+#elif defined(__linux__)
+static std::string ShowSaveDialog(const std::string& suggestedName)
+{
+    GtkWidget* dialog = gtk_file_chooser_dialog_new(
+        "Save As", nullptr, GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Save", GTK_RESPONSE_ACCEPT,
+        nullptr);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dialog), TRUE);
+    if (!suggestedName.empty())
+        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), suggestedName.c_str());
+
+    std::string chosen;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char* filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        if (filename) {
+            chosen = filename;
+            g_free(filename);
+        }
+    }
+    gtk_widget_destroy(dialog);
+    return chosen;
+}
+#endif
 
 void BrowserHandler::OnBeforeDownload(CefRefPtr<CefBrowser> browser,
                                       CefRefPtr<CefDownloadItem> download_item,
                                       const CefString& suggested_name,
                                       CefRefPtr<CefBeforeDownloadCallback> callback)
 {
+#if defined(_WIN32)
     std::wstring suggested = suggested_name.ToWString();
     if (suggested.empty())
         suggested = L"download.bin";
@@ -124,7 +171,7 @@ void BrowserHandler::OnBeforeDownload(CefRefPtr<CefBrowser> browser,
     // Let the user pick the destination via the native Save As dialog. This is
     // the expected UX for an embedded browser, which has no built-in download
     // bar / path picker of its own.
-    HWND owner = browser_hwnd_ ? GetAncestor(browser_hwnd_, GA_ROOT) : nullptr;
+    HWND owner = browser_window_ ? GetAncestor(browser_window_, GA_ROOT) : nullptr;
     std::wstring chosen = ShowSaveDialog(owner, suggested);
     if (chosen.empty()) {
         // User cancelled: not calling callback->Continue() cancels the download.
@@ -135,12 +182,31 @@ void BrowserHandler::OnBeforeDownload(CefRefPtr<CefBrowser> browser,
 
     if (OnDownloadEvent) {
         OnDownloadEvent("DownloadStart|" + std::to_string(browser_id_) + "|" +
-                        CefString(chosen).ToString());
+                        proto::Escape(CefString(chosen).ToString()));
     }
 
     // show_dialog=false: we already asked the user via our own dialog, so CEF
     // should just save to the chosen path without its own confirmation.
     callback->Continue(chosen, false);
+#elif defined(__linux__)
+    std::string suggested = suggested_name.ToString();
+    if (suggested.empty())
+        suggested = "download.bin";
+
+    std::string chosen = ShowSaveDialog(suggested);
+    if (chosen.empty()) {
+        if (OnDownloadEvent)
+            OnDownloadEvent("DownloadCanceled|" + std::to_string(browser_id_));
+        return;
+    }
+
+    if (OnDownloadEvent) {
+        OnDownloadEvent("DownloadStart|" + std::to_string(browser_id_) + "|" +
+                        proto::Escape(CefString(chosen).ToString()));
+    }
+
+    callback->Continue(CefString(chosen), false);
+#endif
 }
 
 void BrowserHandler::OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
@@ -153,7 +219,7 @@ void BrowserHandler::OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
     if (download_item->IsComplete()) {
         if (OnDownloadEvent)
             OnDownloadEvent("DownloadComplete|" + std::to_string(browser_id_) + "|" +
-                            download_item->GetFullPath().ToString());
+                            proto::Escape(download_item->GetFullPath().ToString()));
     } else if (download_item->IsCanceled()) {
         if (OnDownloadEvent)
             OnDownloadEvent("DownloadCanceled|" + std::to_string(browser_id_));
@@ -173,6 +239,7 @@ void BrowserHandler::OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
 //  JavaScript dialogs (alert / confirm / prompt)
 // ========================================================================
 
+#if defined(_WIN32)
 // State for the dynamically-created prompt dialog.
 struct PromptDialogState {
     std::wstring message;
@@ -295,6 +362,38 @@ static HWND GetDialogOwner(CefRefPtr<CefBrowser> browser)
         return browser->GetHost()->GetWindowHandle();
     return nullptr;
 }
+#elif defined(__linux__)
+static bool ShowPromptDialog(const std::string& message,
+                             const std::string& defaultValue,
+                             std::string& outValue)
+{
+    GtkWidget* dialog = gtk_dialog_new_with_buttons(
+        "JavaScript Prompt", nullptr, GTK_DIALOG_MODAL,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_OK", GTK_RESPONSE_OK,
+        nullptr);
+    GtkWidget* area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget* label = gtk_label_new(message.c_str());
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(label), 60);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(area), label, FALSE, FALSE, 8);
+    GtkWidget* entry = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(entry), defaultValue.c_str());
+    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+    gtk_box_pack_start(GTK_BOX(area), entry, FALSE, FALSE, 8);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+    gtk_widget_show_all(dialog);
+
+    bool ok = gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK;
+    if (ok) {
+        const char* text = gtk_entry_get_text(GTK_ENTRY(entry));
+        outValue = text ? text : "";
+    }
+    gtk_widget_destroy(dialog);
+    return ok;
+}
+#endif
 
 bool BrowserHandler::OnJSDialog(CefRefPtr<CefBrowser> browser,
                                 const CefString& origin_url,
@@ -304,6 +403,29 @@ bool BrowserHandler::OnJSDialog(CefRefPtr<CefBrowser> browser,
                                 CefRefPtr<CefJSDialogCallback> callback,
                                 bool& suppress_message)
 {
+    if (OnJsDialog) {
+        const char* typeName = "confirm";
+        switch (dialog_type) {
+        case JSDIALOGTYPE_ALERT:  typeName = "alert";  break;
+        case JSDIALOGTYPE_CONFIRM: typeName = "confirm"; break;
+        case JSDIALOGTYPE_PROMPT: typeName = "prompt"; break;
+        default: break;
+        }
+
+        int dialogId = NextDialogId();
+        {
+            std::lock_guard<std::mutex> lock(dialog_mutex_);
+            pending_dialogs_[dialogId] = PendingDialog{callback};
+        }
+
+        suppress_message = false;
+        OnJsDialog(dialogId, typeName, message_text.ToString(),
+                   default_prompt_text.ToString());
+        return true;   // answered asynchronously by the managed host
+    }
+
+    // No managed host attached (standalone mode): use the native dialogs below.
+#if defined(_WIN32)
     HWND owner = GetDialogOwner(browser);
     std::wstring msg = message_text.ToWString();
 
@@ -329,6 +451,40 @@ bool BrowserHandler::OnJSDialog(CefRefPtr<CefBrowser> browser,
     default:
         break;
     }
+#elif defined(__linux__)
+    if (!g_gtkInitialized)
+        return false;
+
+    std::string msg = message_text.ToString();
+    switch (dialog_type) {
+    case JSDIALOGTYPE_ALERT: {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            nullptr, GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", msg.c_str());
+        gtk_window_set_title(GTK_WINDOW(dialog), "Alert");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        callback->Continue(true, CefString());
+        return true;
+    }
+    case JSDIALOGTYPE_CONFIRM: {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            nullptr, GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO, "%s", msg.c_str());
+        gtk_window_set_title(GTK_WINDOW(dialog), "Confirm");
+        int r = gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        callback->Continue(r == GTK_RESPONSE_YES, CefString());
+        return true;
+    }
+    case JSDIALOGTYPE_PROMPT: {
+        std::string value;
+        bool ok = ShowPromptDialog(msg, default_prompt_text.ToString(), value);
+        callback->Continue(ok, CefString(value));
+        return true;
+    }
+    default:
+        break;
+    }
+#endif
 
     return false;   // use CEF's default implementation
 }
@@ -338,16 +494,69 @@ bool BrowserHandler::OnBeforeUnloadDialog(CefRefPtr<CefBrowser> browser,
                                           bool is_reload,
                                           CefRefPtr<CefJSDialogCallback> callback)
 {
+    (void)browser;
+    (void)is_reload;
+
+    if (OnJsDialog) {
+        int dialogId = NextDialogId();
+        {
+            std::lock_guard<std::mutex> lock(dialog_mutex_);
+            pending_dialogs_[dialogId] = PendingDialog{callback};
+        }
+
+        OnJsDialog(dialogId, "beforeunload", message_text.ToString(), "");
+        return true;
+    }
+
     // Returning false uses CEF's default handling (allow the unload). We never
     // block navigation with a modal here: a stuck beforeunload dialog would
     // prevent tabs from closing.
     return false;
 }
 
+int BrowserHandler::NextDialogId()
+{
+    static std::atomic<int> next{0};
+    return ++next;
+}
+
+bool BrowserHandler::ResolveJsDialog(int dialog_id, bool accept, const std::string& text)
+{
+    PendingDialog pending;
+    {
+        std::lock_guard<std::mutex> lock(dialog_mutex_);
+        auto it = pending_dialogs_.find(dialog_id);
+        if (it == pending_dialogs_.end())
+            return false;
+
+        pending = it->second;
+        pending_dialogs_.erase(it);
+    }
+
+    if (pending.callback)
+        pending.callback->Continue(accept, CefString(text));
+    return true;
+}
+
+void BrowserHandler::DismissAllDialogs()
+{
+    std::map<int, PendingDialog> pending;
+    {
+        std::lock_guard<std::mutex> lock(dialog_mutex_);
+        pending.swap(pending_dialogs_);
+    }
+
+    for (auto& entry : pending) {
+        if (entry.second.callback)
+            entry.second.callback->Continue(false, CefString());
+    }
+}
+
 // ========================================================================
 //  File dialogs (<input type="file">)
 // ========================================================================
 
+#if defined(_WIN32)
 // Shows the Vista+ common item dialog. |filterSpecs| entries are
 // {description, pattern}. Returns the selected paths (empty if cancelled).
 static std::vector<std::wstring> ShowCommonFileDialog(
@@ -458,6 +667,98 @@ static std::vector<std::wstring> ShowCommonFileDialog(
 
     return result;
 }
+#elif defined(__linux__)
+static std::vector<std::string> ShowCommonFileDialog(
+    bool isSave,
+    bool multiSelect,
+    bool folderPick,
+    const std::string& title,
+    const std::string& defaultPath,
+    const std::vector<std::pair<std::string, std::string>>& filterSpecs)
+{
+    std::vector<std::string> result;
+    GtkFileChooserAction action = isSave
+        ? GTK_FILE_CHOOSER_ACTION_SAVE
+        : (folderPick ? GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER : GTK_FILE_CHOOSER_ACTION_OPEN);
+
+    const char* fallbackTitle = isSave ? "Save As" : (folderPick ? "Select Folder" : "Open");
+    GtkWidget* dialog = gtk_file_chooser_dialog_new(
+        title.empty() ? fallbackTitle : title.c_str(), nullptr, action,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        isSave ? "_Save" : "_Open", GTK_RESPONSE_ACCEPT,
+        nullptr);
+
+    GtkFileChooser* chooser = GTK_FILE_CHOOSER(dialog);
+    if (multiSelect && !folderPick && !isSave)
+        gtk_file_chooser_set_select_multiple(chooser, TRUE);
+    if (isSave)
+        gtk_file_chooser_set_do_overwrite_confirmation(chooser, TRUE);
+
+    for (const auto& spec : filterSpecs) {
+        GtkFileFilter* filter = gtk_file_filter_new();
+        gtk_file_filter_set_name(filter, spec.first.c_str());
+        size_t start = 0;
+        while (start <= spec.second.size()) {
+            size_t semi = spec.second.find(';', start);
+            std::string pat = spec.second.substr(start,
+                semi == std::string::npos ? std::string::npos : semi - start);
+            if (pat == "*" || pat == "*.*") {
+                pat = "*";
+            } else if (!pat.empty() && pat[0] == '.') {
+                pat = "*" + pat;
+            } else if (!pat.empty() && pat.find('*') == std::string::npos) {
+                pat = "*." + pat;
+            }
+            if (!pat.empty())
+                gtk_file_filter_add_pattern(filter, pat.c_str());
+            if (semi == std::string::npos)
+                break;
+            start = semi + 1;
+        }
+        gtk_file_chooser_add_filter(chooser, filter);
+    }
+    GtkFileFilter* allFilter = gtk_file_filter_new();
+    gtk_file_filter_set_name(allFilter, "All Files");
+    gtk_file_filter_add_pattern(allFilter, "*");
+    gtk_file_chooser_add_filter(chooser, allFilter);
+
+    if (!defaultPath.empty()) {
+        if (g_file_test(defaultPath.c_str(), G_FILE_TEST_IS_DIR)) {
+            gtk_file_chooser_set_current_folder(chooser, defaultPath.c_str());
+        } else {
+            if (isSave) {
+                gchar* base = g_path_get_basename(defaultPath.c_str());
+                gchar* dir = g_path_get_dirname(defaultPath.c_str());
+                if (base)
+                    gtk_file_chooser_set_current_name(chooser, base);
+                if (dir && std::strcmp(dir, ".") != 0)
+                    gtk_file_chooser_set_current_folder(chooser, dir);
+                g_free(base);
+                g_free(dir);
+            } else {
+                gtk_file_chooser_set_filename(chooser, defaultPath.c_str());
+            }
+        }
+    }
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        if (multiSelect && !folderPick && !isSave) {
+            GSList* files = gtk_file_chooser_get_filenames(chooser);
+            for (GSList* it = files; it; it = it->next)
+                result.emplace_back(static_cast<char*>(it->data));
+            g_slist_free_full(files, g_free);
+        } else {
+            char* filename = gtk_file_chooser_get_filename(chooser);
+            if (filename) {
+                result.emplace_back(filename);
+                g_free(filename);
+            }
+        }
+    }
+    gtk_widget_destroy(dialog);
+    return result;
+}
+#endif
 
 bool BrowserHandler::OnFileDialog(CefRefPtr<CefBrowser> browser,
                                   FileDialogMode mode,
@@ -466,6 +767,7 @@ bool BrowserHandler::OnFileDialog(CefRefPtr<CefBrowser> browser,
                                   const std::vector<CefString>& accept_filters,
                                   CefRefPtr<CefFileDialogCallback> callback)
 {
+#if defined(_WIN32)
     // In CEF 109 cef_file_dialog_mode_t is a plain 4-value enum (no flag bits),
     // so the mode can be compared directly.
     bool isSave      = (mode == FILE_DIALOG_SAVE);
@@ -510,6 +812,48 @@ bool BrowserHandler::OnFileDialog(CefRefPtr<CefBrowser> browser,
             cefPaths.push_back(CefString(p));
         callback->Continue(cefPaths);
     }
+#elif defined(__linux__)
+    if (!g_gtkInitialized)
+        return false;
+
+    bool isSave      = (mode == FILE_DIALOG_SAVE);
+    bool folderPick  = (mode == FILE_DIALOG_OPEN_FOLDER);
+    bool multiSelect = (mode == FILE_DIALOG_OPEN_MULTIPLE);
+
+    std::vector<std::pair<std::string, std::string>> specs;
+    for (const auto& f : accept_filters) {
+        std::string s = f.ToString();
+        if (s.empty())
+            continue;
+        size_t bar = s.find('|');
+        if (bar != std::string::npos) {
+            std::string desc = s.substr(0, bar);
+            std::string pat  = s.substr(bar + 1);
+            if (!desc.empty() && !pat.empty())
+                specs.push_back({ desc, pat });
+        } else if (s[0] == '.') {
+            specs.push_back({ s + " Files", s });
+        }
+    }
+    specs.push_back({ "All Files", "*" });
+
+    std::string titleS = title.ToString();
+    if (titleS.empty())
+        titleS = isSave ? "Save As" : (folderPick ? "Select Folder" : "Open");
+
+    std::vector<std::string> paths = ShowCommonFileDialog(
+        isSave, multiSelect, folderPick, titleS, default_file_path.ToString(), specs);
+
+    if (paths.empty()) {
+        callback->Cancel();
+    } else {
+        std::vector<CefString> cefPaths;
+        cefPaths.reserve(paths.size());
+        for (const auto& p : paths)
+            cefPaths.push_back(CefString(p));
+        callback->Continue(cefPaths);
+    }
+#endif
 
     return true;   // custom dialog used
 }

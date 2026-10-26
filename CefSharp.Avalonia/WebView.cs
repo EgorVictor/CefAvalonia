@@ -3,7 +3,6 @@ using Avalonia.Controls;
 using Avalonia.Data;
 using Avalonia.Threading;
 using System;
-using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Input;
@@ -11,49 +10,61 @@ using System.Windows.Input;
 namespace CefSharp.Avalonia;
 
 /// <summary>
-/// Avalonia UserControl that embeds a CEF browser instance via HWND interop.
-/// Uses ExternalBrowserProcessHost (NativeControlHost) + BrowserProcessManager (IPC).
-/// Lifecycle: OnAttachedToVisualTree → StartAsync → CefBrowser.Native.exe → Embed → events
+/// Avalonia control that embeds a real CEF (Chromium) browser.
+///
+/// The actual browser runs in a separate <c>CefBrowser.Native</c> process,
+/// shared by every <see cref="WebView"/> in the application, and its native
+/// child window is embedded into this control through <see cref="NativeControlHost"/>.
+///
+/// Typical usage:
+/// <code>
+/// var web = new WebView { Url = "https://example.com" };
+/// web.JsDialogRequested += dialog => ShowDialog(dialog);
+/// parent.Children.Add(web);
+/// </code>
+///
+/// Lifecycle: attach → start native host → embed window. Detaching keeps the
+/// browser alive so tab switches stay instant; call <see cref="Dispose"/> (or
+/// <see cref="Cleanup"/>) when the tab is permanently closed.
 /// </summary>
-public class WebView : UserControl
+public class WebView : UserControl, IDisposable
 {
+    private static readonly bool s_noCef =
+        Array.IndexOf(Environment.GetCommandLineArgs(), "--no-cef") >= 0;
+
     private readonly ExternalBrowserProcessHost _browserHost = new();
+    private readonly DispatcherTimer _resizeTimer;
+
     private BrowserProcessManager? _manager;
-    private CancellationTokenSource? _resizeCts;
-    private string? _lastNavigatedUrl;
     private IntPtr _cefHwnd = IntPtr.Zero;
     private bool _disposed;
+    private bool _eventsWired;
+    private bool _syncingUrl;
+    private int _recoveryAttempts;
+    private TopLevel? _topLevel;
+    private string _lastFindText = "";
 
+    /// <summary>
+    /// Single, bindable browser location. Setting it navigates; the value is
+    /// updated from the browser whenever the page changes address (redirects,
+    /// link clicks, history navigation), so a TwoWay binding stays in sync.
+    /// </summary>
     public static readonly StyledProperty<string> UrlProperty =
-        AvaloniaProperty.Register<WebView, string>(nameof(Url), defaultValue: "");
+        AvaloniaProperty.Register<WebView, string>(
+            nameof(Url), defaultValue: "", defaultBindingMode: BindingMode.TwoWay);
 
-    /// <summary>Current URL. Set in C++ and passed through as-is.</summary>
+    /// <summary>Current page URL. Setting this property navigates the browser.</summary>
     public string Url
     {
         get => GetValue(UrlProperty);
         set => SetValue(UrlProperty, value ?? "");
     }
 
-    /// <summary>
-    /// Bindable address. Setting this property triggers navigation via NavigateAsync.
-    /// Unlike Url (which is display-only from C++), Address is meant for ViewModel binding.
-    /// </summary>
-    public static readonly StyledProperty<string?> AddressProperty =
-        AvaloniaProperty.Register<WebView, string?>(nameof(Address),
-            defaultBindingMode: BindingMode.TwoWay);
-
-    public string? Address
-    {
-        get => GetValue(AddressProperty);
-        set => SetValue(AddressProperty, value);
-    }
-
     private string _title = "";
     public static readonly DirectProperty<WebView, string> TitleProperty =
-        AvaloniaProperty.RegisterDirect<WebView, string>(nameof(Title),
-            o => o.Title);
+        AvaloniaProperty.RegisterDirect<WebView, string>(nameof(Title), o => o.Title);
 
-    /// <summary>Browser tab title synced from CEF's OnTitleChange.</summary>
+    /// <summary>Page title reported by the browser.</summary>
     public string Title
     {
         get => _title;
@@ -62,10 +73,9 @@ public class WebView : UserControl
 
     private bool _isLoading;
     public static readonly DirectProperty<WebView, bool> IsLoadingProperty =
-        AvaloniaProperty.RegisterDirect<WebView, bool>(nameof(IsLoading),
-            o => o.IsLoading);
+        AvaloniaProperty.RegisterDirect<WebView, bool>(nameof(IsLoading), o => o.IsLoading);
 
-    /// <summary>Whether the browser is currently loading a page.</summary>
+    /// <summary>True while the browser is loading a page.</summary>
     public bool IsLoading
     {
         get => _isLoading;
@@ -74,10 +84,9 @@ public class WebView : UserControl
 
     private bool _canGoBack;
     public static readonly DirectProperty<WebView, bool> CanGoBackProperty =
-        AvaloniaProperty.RegisterDirect<WebView, bool>(nameof(CanGoBack),
-            o => o.CanGoBack);
+        AvaloniaProperty.RegisterDirect<WebView, bool>(nameof(CanGoBack), o => o.CanGoBack);
 
-    /// <summary>True when history has an entry behind the current page. Enables a Back button.</summary>
+    /// <summary>True when there is a history entry behind the current page.</summary>
     public bool CanGoBack
     {
         get => _canGoBack;
@@ -86,10 +95,9 @@ public class WebView : UserControl
 
     private bool _canGoForward;
     public static readonly DirectProperty<WebView, bool> CanGoForwardProperty =
-        AvaloniaProperty.RegisterDirect<WebView, bool>(nameof(CanGoForward),
-            o => o.CanGoForward);
+        AvaloniaProperty.RegisterDirect<WebView, bool>(nameof(CanGoForward), o => o.CanGoForward);
 
-    /// <summary>True when history has an entry ahead of the current page. Enables a Forward button.</summary>
+    /// <summary>True when there is a history entry ahead of the current page.</summary>
     public bool CanGoForward
     {
         get => _canGoForward;
@@ -100,9 +108,8 @@ public class WebView : UserControl
         AvaloniaProperty.Register<WebView, ICommand?>(nameof(NavigateCommand));
 
     /// <summary>
-    /// Bindable command. Bind your ViewModel's RelayCommand here.
-    /// When the user presses Enter / clicks Go, bind a Button to this command.
-    /// Your ViewModel is responsible for calling NavigateAsync.
+    /// Optional command invoked when the control itself requests navigation
+    /// (kept for MVVM scenarios; the control never invokes it automatically).
     /// </summary>
     public ICommand? NavigateCommand
     {
@@ -111,359 +118,438 @@ public class WebView : UserControl
     }
 
     /// <summary>
-    /// CEF initialization settings mapped from CefSettings in CEF's cef_types.h.
-    /// Set before WebView is attached to the visual tree.
+    /// Process-level CEF settings. Because all browsers share one native host,
+    /// only the first <see cref="WebView"/> that starts decides them.
+    /// Must be assigned before the control is attached to the visual tree.
+    /// The sandbox is enabled by default.
     /// </summary>
-    public CefSettings CefSettings { get; set; } = new() { NoSandbox = true };
+    public CefSettings CefSettings { get; set; } = new();
+
+    /// <summary>
+    /// Optional per-browser cache/profile directory. When set, this browser gets
+    /// its own CEF request context (isolated cookies, localStorage, cache), which
+    /// is what allows several tabs to run side by side. Leave null to share the
+    /// host's default profile.
+    /// </summary>
+    public string? IsolatedCachePath { get; set; }
+
+    /// <summary>
+    /// Restart the browser automatically after the native host dies.
+    /// Defaults to <see langword="true"/>; at most three consecutive attempts are
+    /// made, and the counter resets after a successful start.
+    /// </summary>
+    public bool AutoRecover { get; set; } = true;
 
     /// <summary>Raised when the browser navigates to a new URL.</summary>
     public event Action<string>? AddressChanged;
     /// <summary>Raised when the page title changes.</summary>
     public event Action<string>? TitleChanged;
-    /// <summary>Raised when loading state changes (true = loading, false = done).</summary>
+    /// <summary>Raised when the loading state changes (true = loading).</summary>
     public event Action<bool>? LoadingStateChanged;
-    /// <summary>Raised when the native browser process exits unexpectedly.</summary>
+    /// <summary>Raised after the native host died and could not be recovered here.</summary>
     public event Action? BrowserCrashed;
-    /// <summary>Raised when a page load error occurs. Parameter: "code|text|url".</summary>
+    /// <summary>Raised on page load error. Format: "code|text|url".</summary>
     public event Action<string>? LoadError;
-    /// <summary>Raised when a web page requests to open a popup/new window. URL should open in a new tab.</summary>
+    /// <summary>Raised when a page requests a popup/new window. Open it in a new tab.</summary>
     public event Action<string>? OpenPopup;
-    /// <summary>Raised on download lifecycle events. Arg: "DownloadStart|{path}", "DownloadComplete|{path}", or "DownloadCanceled".</summary>
+    /// <summary>Raised for download lifecycle events, e.g. "DownloadStart|path".</summary>
     public event Action<string>? DownloadEvent;
+
+    /// <summary>
+    /// Raised when the page shows a JavaScript dialog. The handler must call
+    /// <see cref="CefJsDialog.Accept"/> or <see cref="CefJsDialog.Dismiss"/>.
+    /// Without a handler a safe default answer is sent so the page never hangs.
+    /// </summary>
+    public event Action<CefJsDialog>? JsDialogRequested;
 
     public WebView()
     {
         Content = _browserHost;
-        LayoutUpdated += OnLayoutUpdated;
+        ClipToBounds = true;
+
+        _resizeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        _resizeTimer.Tick += (_, _) =>
+        {
+            _resizeTimer.Stop();
+            SendResize();
+        };
     }
 
-    private bool _layoutDone;
+    /// <summary>True once the native browser process accepted this browser.</summary>
+    public bool IsBrowserAvailable => _manager != null && _cefHwnd != IntPtr.Zero;
 
-    private void OnLayoutUpdated(object? sender, EventArgs e)
-    {
-        if (_layoutDone) return;
-        _layoutDone = true;
-        _ = SendResizeAsync();
-    }
-
-    /// <summary>
-    /// Lifecycle start: launches CefBrowser.Native.exe or re-embeds existing HWND.
-    /// Skip with --no-cef command-line flag for UI-only testing.
-    /// </summary>
     protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
     {
-        Debug.WriteLine($"[WebView] OnAttachedToVisualTree - URL={Url}, HasManager={_manager != null}, HasHwnd={_cefHwnd != IntPtr.Zero}");
         base.OnAttachedToVisualTree(e);
-        var cmdArgs = Environment.GetCommandLineArgs();
-        if (Array.IndexOf(cmdArgs, "--no-cef") >= 0)
-            return;
+        if (s_noCef || _disposed) return;
 
-        if (_manager != null && _cefHwnd != IntPtr.Zero)
+        _topLevel = TopLevel.GetTopLevel(this);
+        if (_topLevel != null)
+            _topLevel.ScalingChanged += OnScalingChanged;
+
+        _manager ??= CreateManager();
+        if (_manager == null) return;
+
+        if (_cefHwnd != IntPtr.Zero)
         {
-            // Tab switch back: re-embed existing CEF HWND into new panel
-            Debug.WriteLine($"[WebView] RE-EMBEDDING existing HWND=0x{_cefHwnd.ToInt64():X}");
-            _layoutDone = false;
+            // Tab switch back: the HWND survived, only the Avalonia panel was
+            // recreated. Re-embed it synchronously (or defer inside the host).
+            CefDiagnostics.Debug($"[WebView] re-embed HWND=0x{_cefHwnd.ToInt64():X}");
             _browserHost.EmbedWindow(_cefHwnd);
-            _ = SendResizeAsync();
+            QueueResize();
             _ = _manager.SendEmbedDoneAsync();
-        }
-        else if (_manager != null)
-        {
-            // Manager exists but HWND not ready yet — reset layout, embed on WindowHandleReceived
-            Debug.WriteLine($"[WebView] Manager exists, waiting for HWND");
-            _layoutDone = false;
         }
         else
         {
-            Debug.WriteLine($"[WebView] Starting new browser");
-            StartBrowser();
+            CefDiagnostics.Debug($"[WebView] starting browser for {Url}");
+            _ = StartBrowserAsync();
         }
     }
 
-    /// <summary>
-    /// Lifecycle end: keep the native process alive for tab switch.
-    /// Actual cleanup happens via Dispose() or process exit.
-    /// </summary>
     protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
     {
-        Debug.WriteLine($"[WebView] OnDetachedFromVisualTree");
         base.OnDetachedFromVisualTree(e);
-        // Don't dispose manager — keep CEF process for tab switch re-embed
-    }
 
-    private void StartBrowser()
-    {
-        if (_manager != null) return;
-
-        _manager = new BrowserProcessManager();
-        WireManagerEvents();
-        _ = StartAsync();
-    }
-
-    /// <summary>
-    /// Wires BrowserProcessManager events to UI thread and WebView properties.
-    /// AddressChanged filters out stale intermediate-redirect hosts within 3s of a pending navigation.
-    /// </summary>
-    private void WireManagerEvents()
-    {
-        if (_manager == null) return;
-
-        _manager.AddressChanged += url =>
+        if (_topLevel != null)
         {
-            Dispatcher.UIThread.Post(() =>
-            {
-                var last = _lastNavigatedUrl;
-                if (last != null)
-                {
-                    var u = url.Replace('\\', '/');
-                    var l = last.Replace('\\', '/');
-                    if (!u.Contains(l, StringComparison.OrdinalIgnoreCase) &&
-                        !l.Contains(u, StringComparison.OrdinalIgnoreCase))
-                    {
-                        _lastNavigatedUrl = null;
-                        return;
-                    }
-                    _lastNavigatedUrl = null;
-                }
-                Url = url;
-                AddressChanged?.Invoke(url);
-            });
-        };
-
-        _manager.TitleChanged += title =>
-        {
-            Dispatcher.UIThread.Post(() =>
-            {
-                Title = title;
-                TitleChanged?.Invoke(title);
-            });
-        };
-
-        _manager.LoadingStateChanged += loading =>
-        {
-            Dispatcher.UIThread.Post(() =>
-            {
-                IsLoading = loading;
-                LoadingStateChanged?.Invoke(loading);
-            });
-        };
-
-        _manager.NavigationStateChanged += () =>
-        {
-            Dispatcher.UIThread.Post(SyncNavigationState);
-        };
-
-        _manager.OpenPopup += url =>
-        {
-            Dispatcher.UIThread.Post(() => OpenPopup?.Invoke(url));
-        };
-
-        _manager.DownloadEvent += info =>
-        {
-            Dispatcher.UIThread.Post(() => DownloadEvent?.Invoke(info));
-        };
-
-        // On Ready event: save HWND, embed, then signal embed done + push initial size
-        _manager.WindowHandleReceived += hwnd =>
-        {
-            _cefHwnd = hwnd;
-            Dispatcher.UIThread.Post(async () =>
-            {
-                _browserHost.EmbedWindow(hwnd);
-                await SendResizeAsync();
-                await _manager.SendEmbedDoneAsync();
-            });
-        };
-
-        _manager.BrowserCrashed += () =>
-        {
-            Dispatcher.UIThread.Post(() => BrowserCrashed?.Invoke());
-        };
-
-        _manager.LoadError += info =>
-        {
-            Dispatcher.UIThread.Post(() => LoadError?.Invoke(info));
-        };
-    }
-
-    private async Task StartAsync()
-    {
-        if (_manager == null) return;
-        try
-        {
-            Debug.WriteLine("[WebView] StartAsync: Starting browser process");
-            await _manager.StartAsync(Url, CefSettings);
-            Debug.WriteLine("[WebView] StartAsync: Browser process started successfully");
+            _topLevel.ScalingChanged -= OnScalingChanged;
+            _topLevel = null;
         }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"[WebView] StartAsync error: {ex}");
-        }
+
+        _resizeTimer.Stop();
+        // The browser intentionally stays alive: a tab switch must not tear down
+        // the renderer. ExternalBrowserProcessHost moves the child out of the
+        // dying panel. Permanent teardown happens in Dispose/Cleanup.
     }
 
-    /// <summary>
-    /// Navigate to a URL. C++ handles all normalization.
-    /// If the native process hasn't started yet, starts it first.
-    /// Immediately sets Url + fires AddressChanged for optimistic UI, then delegates to IPC.
-    /// </summary>
-    public async Task NavigateAsync(string url)
+    private BrowserProcessManager CreateManager()
     {
-        if (string.IsNullOrWhiteSpace(url)) return;
+        var manager = new BrowserProcessManager { IsolatedCachePath = IsolatedCachePath };
+        _manager = manager;
+        WireManagerEvents(manager);
+        return manager;
+    }
 
-        Console.Error.WriteLine($"DIAG: WEBVIEW NavigateAsync url={url} manager={_manager != null}");
-        try
+    private void WireManagerEvents(BrowserProcessManager manager)
+    {
+        if (_eventsWired) return;
+        _eventsWired = true;
+
+        manager.AddressChanged += url => Dispatcher.UIThread.Post(() =>
         {
-            if (_manager == null)
+            // Native reports only the main frame, so no heuristic filtering is
+            // needed here: every event is the real address.
+            ApplyNativeUrl(url);
+        });
+
+        manager.TitleChanged += title => Dispatcher.UIThread.Post(() =>
+        {
+            Title = title;
+            TitleChanged?.Invoke(title);
+        });
+
+        manager.LoadingStateChanged += loading => Dispatcher.UIThread.Post(() =>
+        {
+            IsLoading = loading;
+            LoadingStateChanged?.Invoke(loading);
+        });
+
+        manager.NavigationStateChanged += () => Dispatcher.UIThread.Post(() =>
+        {
+            if (_manager == null) return;
+            CanGoBack = _manager.CanGoBack;
+            CanGoForward = _manager.CanGoForward;
+        });
+
+        manager.OpenPopup += url => Dispatcher.UIThread.Post(() => OpenPopup?.Invoke(url));
+
+        manager.DownloadEvent += info => Dispatcher.UIThread.Post(() => DownloadEvent?.Invoke(info));
+
+        manager.LoadError += info => Dispatcher.UIThread.Post(() => LoadError?.Invoke(info));
+
+        manager.JsDialogRequested += dialog => Dispatcher.UIThread.Post(() =>
+        {
+            Action<CefJsDialog>? handler = JsDialogRequested;
+            if (handler == null)
             {
-                Debug.WriteLine($"[WebView] NavigateAsync: Manager is null, starting browser");
-                Url = url;
-                StartBrowser();
+                // No UI wired up: answer instead of leaving the renderer blocked.
+                if (dialog.IsAlert) dialog.Accept();
+                else dialog.Dismiss();
                 return;
             }
-            _lastNavigatedUrl = url;
-            Url = url;
-            AddressChanged?.Invoke(url);
-            Debug.WriteLine($"[WebView] NavigateAsync: Navigating to {url}");
-            await _manager.NavigateAsync(url);
+
+            try
+            {
+                handler(dialog);
+            }
+            catch (Exception ex)
+            {
+                CefDiagnostics.Error("[WebView] JsDialogRequested handler failed", ex);
+                dialog.Dismiss();
+            }
+        });
+
+        manager.WindowHandleReceived += hwnd => Dispatcher.UIThread.Post(async () =>
+        {
+            if (_disposed) return;
+
+            _cefHwnd = hwnd;
+            _recoveryAttempts = 0;
+            CefDiagnostics.Debug($"[WebView] browser ready HWND=0x{hwnd.ToInt64():X}");
+
+            _browserHost.EmbedWindow(hwnd);
+            SendResize();
+            if (_manager != null)
+                await _manager.SendEmbedDoneAsync();
+        });
+
+        manager.BrowserCrashed += () => Dispatcher.UIThread.Post(OnBrowserCrashed);
+    }
+
+    private async void OnBrowserCrashed()
+    {
+        if (_disposed) return;
+
+        // The native child window died with the host: forget it before any
+        // detach/reattach logic can touch a stale handle.
+        _cefHwnd = IntPtr.Zero;
+        _browserHost.DetachEmbedded();
+        BrowserCrashed?.Invoke();
+
+        if (!AutoRecover || _manager == null)
+            return;
+
+        if (_recoveryAttempts >= 3)
+        {
+            CefDiagnostics.Error("[WebView] auto-recovery abandoned after 3 attempts");
+            return;
+        }
+
+        _recoveryAttempts++;
+        CefDiagnostics.Warn($"[WebView] recovering browser (attempt {_recoveryAttempts}/3)");
+
+        await Task.Delay(500);
+        if (_disposed) return;
+
+        try
+        {
+            await _manager.RecoverAsync();
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[WebView] NavigateAsync error: {ex}");
+            CefDiagnostics.Error("[WebView] recovery failed", ex);
         }
     }
 
-    /// <summary>Reload the current page.</summary>
-    public Task ReloadAsync() => _manager?.ReloadAsync() ?? Task.CompletedTask;
-    /// <summary>Stop the current page load.</summary>
-    public Task StopAsync() => _manager?.StopAsync() ?? Task.CompletedTask;
+    private async Task<bool> StartBrowserAsync()
+    {
+        if (_manager == null || _disposed) return false;
 
-    // ---- History ----
-    /// <summary>Navigate to the previous entry in history, if any.</summary>
+        try
+        {
+            bool ok = await _manager.StartAsync(Url, CefSettings);
+            if (!ok)
+                CefDiagnostics.Error("[WebView] native host could not be started");
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            CefDiagnostics.Error("[WebView] failed to start browser", ex);
+            return false;
+        }
+    }
+
+    private void ApplyNativeUrl(string url)
+    {
+        _syncingUrl = true;
+        try
+        {
+            // SetCurrentValue keeps a TwoWay binding alive instead of replacing it.
+            SetCurrentValue(UrlProperty, url ?? "");
+        }
+        finally
+        {
+            _syncingUrl = false;
+        }
+
+        AddressChanged?.Invoke(url ?? "");
+    }
+
+    // ---- Navigation -------------------------------------------------------
+
+    /// <summary>
+    /// Navigates to <paramref name="url"/>. Returns false only when the command
+    /// could not be delivered to the native host; when the control is not
+    /// attached yet the URL is remembered and loaded on attach.
+    /// </summary>
+    public async Task<bool> NavigateAsync(string url, CancellationToken cancellationToken = default)
+    {
+        if (_disposed || string.IsNullOrWhiteSpace(url)) return false;
+
+        _syncingUrl = true;
+        try
+        {
+            SetCurrentValue(UrlProperty, url);
+        }
+        finally
+        {
+            _syncingUrl = false;
+        }
+
+        BrowserProcessManager? manager = _manager;
+        if (manager == null) return true; // loaded on attach
+
+        return await manager.NavigateAsync(url, cancellationToken).ConfigureAwait(true);
+    }
+
+    /// <summary>Reloads the current page.</summary>
+    public async Task<bool> ReloadAsync(CancellationToken cancellationToken = default)
+    {
+        BrowserProcessManager? manager = _manager;
+        return manager != null && await manager.ReloadAsync(cancellationToken).ConfigureAwait(true);
+    }
+
+    /// <summary>Stops the current load.</summary>
+    public async Task<bool> StopAsync(CancellationToken cancellationToken = default)
+    {
+        BrowserProcessManager? manager = _manager;
+        return manager != null && await manager.StopAsync(cancellationToken).ConfigureAwait(true);
+    }
+
+    /// <summary>Navigates to the previous history entry.</summary>
     public void GoBack() => _manager?.GoBack();
-    /// <summary>Navigate to the next entry in history, if any.</summary>
+
+    /// <summary>Navigates to the next history entry.</summary>
     public void GoForward() => _manager?.GoForward();
 
-    // ---- Zoom ----
-    /// <summary>Increase the page zoom level.</summary>
+    // ---- Zoom -------------------------------------------------------------
+
+    /// <summary>Increases page zoom.</summary>
     public void ZoomIn() => _manager?.ZoomIn();
-    /// <summary>Decrease the page zoom level.</summary>
+    /// <summary>Decreases page zoom.</summary>
     public void ZoomOut() => _manager?.ZoomOut();
-    /// <summary>Reset the page zoom level to 100%.</summary>
+    /// <summary>Resets page zoom to 100%.</summary>
     public void ZoomReset() => _manager?.ZoomReset();
 
-    // ---- Find in page ----
-    private string _lastFindText = "";
+    // ---- Find in page -----------------------------------------------------
 
-    /// <summary>Starts a new find for |text| from the top of the page.</summary>
+    /// <summary>Starts a new find from the top of the page.</summary>
     public void Find(string text)
     {
         _lastFindText = text ?? "";
-        _manager?.Find(_lastFindText, true, false);
+        if (_lastFindText.Length == 0) _manager?.StopFinding();
+        else _manager?.Find(_lastFindText, forward: true, findNext: false);
     }
 
-    /// <summary>Jumps to the next match of the current find text.</summary>
-    public void FindNext() => _manager?.Find(_lastFindText, true, true);
+    /// <summary>Jumps to the next match.</summary>
+    public void FindNext() => _manager?.Find(_lastFindText, forward: true, findNext: true);
 
-    /// <summary>Jumps to the previous match of the current find text.</summary>
-    public void FindPrevious() => _manager?.Find(_lastFindText, false, true);
+    /// <summary>Jumps to the previous match.</summary>
+    public void FindPrevious() => _manager?.Find(_lastFindText, forward: false, findNext: true);
 
     /// <summary>Clears find highlighting.</summary>
     public void StopFinding() => _manager?.StopFinding();
 
-    // ---- Script ----
-    /// <summary>
-    /// Executes JavaScript in the main frame. Fire-and-forget: no return value.
-    /// Multi-line scripts are supported (encoded before crossing the pipe).
-    /// </summary>
+    // ---- Script / DevTools ------------------------------------------------
+
+    /// <summary>Executes JavaScript in the main frame (fire-and-forget).</summary>
     public void ExecuteJavaScriptAsync(string code) => _manager?.ExecuteJavaScript(code);
 
-    // ---- DevTools ----
-    /// <summary>
-    /// Opens the Chrome DevTools window for this browser. The window is owned by
-    /// the native host process, so it appears as a separate top-level window.
-    /// </summary>
+    /// <summary>Opens the Chrome DevTools window for this browser.</summary>
     public void ShowDeveloperTools() => _manager?.ShowDevTools();
 
-    /// <summary>Copies CanGoBack/CanGoForward out of the manager into bindable properties.</summary>
-    private void SyncNavigationState()
-    {
-        if (_manager == null) return;
-        CanGoBack = _manager.CanGoBack;
-        CanGoForward = _manager.CanGoForward;
-    }
+    // ---- Recovery ---------------------------------------------------------
 
     /// <summary>
-    /// Clean up the native process. Call when the tab is permanently closed (not on tab switch).
-    /// Idempotent: safe to call multiple times.
+    /// Manually restarts the browser on a fresh native host, restoring the last
+    /// URL. Useful after a crash when <see cref="AutoRecover"/> is disabled.
+    /// </summary>
+    public async Task<bool> RecoverAsync(CancellationToken cancellationToken = default)
+    {
+        if (_disposed || _manager == null) return false;
+
+        _cefHwnd = IntPtr.Zero;
+        _browserHost.DetachEmbedded();
+        _recoveryAttempts = 0;
+        return await _manager.RecoverAsync(cancellationToken).ConfigureAwait(true);
+    }
+
+    // ---- Resize -----------------------------------------------------------
+
+    private void OnScalingChanged(object? sender, EventArgs e) => QueueResize();
+
+    private void QueueResize()
+    {
+        if (_disposed) return;
+        _resizeTimer.Stop();
+        _resizeTimer.Start();
+    }
+
+    private void SendResize()
+    {
+        if (_manager == null) return;
+
+        double scaling = _topLevel?.RenderScaling ?? 1.0;
+        double width = _browserHost.Bounds.Width;
+        double height = _browserHost.Bounds.Height;
+
+        if (width <= 0 || height <= 0)
+        {
+            width = Bounds.Width;
+            height = Bounds.Height;
+        }
+
+        int w = (int)Math.Round(width * scaling);
+        int h = (int)Math.Round(height * scaling);
+        if (w > 0 && h > 0)
+            _manager.SendResize(w, h);
+    }
+
+    protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
+    {
+        base.OnPropertyChanged(change);
+
+        if (change.Property == UrlProperty)
+        {
+            if (_syncingUrl) return;
+
+            string? newUrl = change.GetNewValue<string?>();
+            if (!string.IsNullOrWhiteSpace(newUrl))
+                _ = NavigateAsync(newUrl);
+        }
+        else if (change.Property == BoundsProperty)
+        {
+            QueueResize();
+        }
+    }
+
+    // ---- Teardown ---------------------------------------------------------
+
+    /// <summary>
+    /// Permanently releases this browser (tab closed). Idempotent. The shared
+    /// native host stays alive for other tabs until the application exits.
     /// </summary>
     public void Cleanup()
     {
         if (_disposed) return;
         _disposed = true;
 
-        _resizeCts?.Cancel();
-        _resizeCts?.Dispose();
-        _resizeCts = null;
+        _resizeTimer.Stop();
+        _eventsWired = false;
 
-        // Forget the embedded HWND BEFORE disposing the manager: the native host will
-        // destroy that window, and we must never reparent/touch it afterwards.
+        // Forget the embedded HWND before the native browser is destroyed: the
+        // host will destroy that window and we must never touch it afterwards.
+        _cefHwnd = IntPtr.Zero;
         _browserHost.DetachEmbedded();
 
         _manager?.Dispose();
         _manager = null;
-        _cefHwnd = IntPtr.Zero;
     }
 
-    /// <summary>
-    /// Debounced resize: when Bounds changes, wait 15ms then send Resize via IPC.
-    /// Cancels previous pending resize to avoid flooding the pipe during window dragging.
-    /// </summary>
-    protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
+    /// <summary>Same as <see cref="Cleanup"/>.</summary>
+    public void Dispose()
     {
-        base.OnPropertyChanged(change);
-        if (change.Property == AddressProperty)
-        {
-            var newUrl = change.GetNewValue<string?>();
-            if (!string.IsNullOrEmpty(newUrl))
-                _ = NavigateAsync(newUrl);
-        }
-        else if (change.Property == BoundsProperty && _manager != null && IsVisible)
-        {
-            // Only send resize if this WebView is visible to avoid IPC flooding
-            _resizeCts?.Cancel();
-            _resizeCts = new CancellationTokenSource();
-            var token = _resizeCts.Token;
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await Task.Delay(15, token);
-                    if (!token.IsCancellationRequested)
-                        await Dispatcher.UIThread.InvokeAsync(() => SendResizeAsync(token));
-                }
-                catch (OperationCanceledException) { }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"[WebView] Resize task error: {ex}");
-                }
-            }, token);
-        }
-    }
-
-    private void SendResize()
-    {
-        if (_manager == null) return;
-        var scaling = TopLevel.GetTopLevel(this)?.RenderScaling ?? 1.0;
-        var w = (int)(_browserHost.Bounds.Width * scaling);
-        var h = (int)(_browserHost.Bounds.Height * scaling);
-        if (w > 0 && h > 0)
-            _manager.SendResize(w, h);
-    }
-
-    private async Task SendResizeAsync(CancellationToken ct = default)
-    {
-        if (ct.IsCancellationRequested) return;
-        SendResize();
-        await Task.CompletedTask;
+        Cleanup();
+        GC.SuppressFinalize(this);
     }
 }

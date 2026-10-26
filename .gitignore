@@ -42,6 +42,15 @@ GPUCache/
 publish-test/
 check_symbols.cs
 
+## Prebuilt native binary — always build from source instead
+CefBrowser.Native/prebuilt/
+
+## Build / publish output artifacts (not source; keep local for testing)
+publish-win/
+publish-linux/
+artifacts/
+CefBrowser-*.zip
+
 ## NuGet
 packages/
 *.nupkg

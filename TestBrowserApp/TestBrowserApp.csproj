@@ -1,11 +1,20 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>WinExe</OutputType>
+    <OutputType Condition="$([MSBuild]::IsOSPlatform('Windows'))">WinExe</OutputType>
+    <OutputType Condition="$([MSBuild]::IsOSPlatform('Linux'))">Exe</OutputType>
     <!-- Must match CefSharp.Avalonia target framework -->
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
-    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationManifest Condition="$([MSBuild]::IsOSPlatform('Windows'))">app.manifest</ApplicationManifest>
   </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- Path to the extracted CEF 109.1.11 Linux64 distribution. Can also be
+         overridden with: dotnet build -p:CefLinuxRoot=/path/to/cef_binary_... -->
+    <CefLinuxRoot Condition="'$(CefLinuxRoot)' == '' AND '$(CefRoot)' != ''">$(CefRoot)</CefLinuxRoot>
+    <CefLinuxRoot Condition="'$(CefLinuxRoot)' == ''">$(HOME)/cef/cef_binary_109.1.11+g6d4fdb2+chromium-109.0.5414.87_linux64</CefLinuxRoot>
+  </PropertyGroup>
+
   <ItemGroup>
     <AvaloniaXaml Remove="publish\**" />
     <Compile Remove="publish\**" />
@@ -28,18 +37,27 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CefSharp.Avalonia\CefSharp.Avalonia.csproj" />
-    <!-- CEF 运行时二进制与语言资源来自 NuGet，新机器 restore 后即可编译 -->
-    <PackageReference Include="ChromiumEmbeddedFramework.runtime" Version="109.1.11" />
-    <PackageReference Include="ChromiumEmbeddedFramework.runtime.win-x64" Version="109.1.11" GeneratePathProperty="true" />
+    <!-- CEF runtime binaries/resources come from NuGet on Windows and from the
+         official CEF Linux64 tarball on Linux (there is no 109.1.11 linux-x64
+         runtime NuGet package). -->
+    <PackageReference Include="ChromiumEmbeddedFramework.runtime" Version="109.1.11"
+                      Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
+    <PackageReference Include="ChromiumEmbeddedFramework.runtime.win-x64" Version="109.1.11"
+                      GeneratePathProperty="true"
+                      Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
   </ItemGroup>
 
-  <!-- Copy CEF native files: 原生子进程 exe 用 git 内的 prebuilt（或本机重新构建的新产物），其余 CEF 二进制来自 NuGet -->
-  <Target Name="CopyCefNativeFiles" AfterTargets="Build">
+  <!-- Windows: copy CEF binaries from NuGet + native exe from prebuilt/build. -->
+  <Target Name="CopyCefNativeFilesWindows" AfterTargets="Build"
+          Condition="$([MSBuild]::IsOSPlatform('Windows'))">
     <PropertyGroup>
       <_NativeExeSource Condition="Exists('..\CefBrowser.Native\build\Release\CefBrowser.Native.exe')">..\CefBrowser.Native\build\Release\CefBrowser.Native.exe</_NativeExeSource>
-      <_NativeExeSource Condition="'$(_NativeExeSource)' == ''">..\CefBrowser.Native\prebuilt\CefBrowser.Native.exe</_NativeExeSource>
       <_CefNativeDir>$(Pkgchromiumembeddedframework_runtime_win-x64)\runtimes\win-x64\native\</_CefNativeDir>
     </PropertyGroup>
+    <!-- Build artifacts must come from a real native build, not a checked-in
+         prebuilt binary (which drifts out of sync silently). Fail loudly. -->
+    <Error Condition="'$(_NativeExeSource)' == ''"
+           Text="CefBrowser.Native.exe not found in ..\CefBrowser.Native\build\Release. Build the native project first (run pack.ps1) instead of relying on a prebuilt binary." />
     <ItemGroup>
       <CefNativeFiles Include="$(_CefNativeDir)*" />
       <_NativeExe Include="$(_NativeExeSource)" />
@@ -48,6 +66,59 @@
     <Copy SourceFiles="@(_NativeExe)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(CefNativeFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(CefLocales)" DestinationFolder="$(OutputPath)\locales\" SkipUnchangedFiles="true" />
-    <Message Text="CEF native files copied from NuGet + $(_NativeExeSource)" Importance="high" />
+    <!-- dotnet publish does not always re-copy files that were dropped into
+         OutputPath by this target, so copy to the publish dir explicitly. -->
+    <Copy SourceFiles="@(_NativeExe)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" Condition="'$(PublishDir)' != ''" />
+    <Copy SourceFiles="@(CefNativeFiles)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" Condition="'$(PublishDir)' != ''" />
+    <Copy SourceFiles="@(CefLocales)" DestinationFolder="$(PublishDir)\locales\" SkipUnchangedFiles="true" Condition="'$(PublishDir)' != ''" />
+    <Message Text="CEF Windows native files copied from NuGet + $(_NativeExeSource)" Importance="high" />
+  </Target>
+
+  <!-- Linux: copy CEF binaries/resources from the official Linux64 tarball, plus
+       the native host executable built by CMake. -->
+  <Target Name="CopyCefNativeFilesLinux" AfterTargets="Build"
+          Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+    <PropertyGroup>
+      <_NativeExeSource Condition="Exists('..\CefBrowser.Native\build\Release\CefBrowser.Native')">..\CefBrowser.Native\build\Release\CefBrowser.Native</_NativeExeSource>
+      <_NativeExeSource Condition="'$(_NativeExeSource)' == '' AND Exists('..\CefBrowser.Native\build\CefBrowser.Native')">..\CefBrowser.Native\build\CefBrowser.Native</_NativeExeSource>
+    </PropertyGroup>
+    <!-- Same policy as Windows: require a real build, do not fall back to a
+         checked-in prebuilt binary. -->
+    <Error Condition="'$(_NativeExeSource)' == ''"
+           Text="CefBrowser.Native not found in ..\CefBrowser.Native\build. Build the native project first (run pack.ps1)." />
+    <ItemGroup>
+      <_CefLinuxFiles Include="$(CefLinuxRoot)/Release/**/*" />
+      <_NativeExe Include="$(_NativeExeSource)" Condition="Exists('$(_NativeExeSource)')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_CefLinuxFiles)"
+          DestinationFiles="@(_CefLinuxFiles->'$(OutputPath)/%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(CefLinuxRoot)/Release')" />
+    <Copy SourceFiles="@(_NativeExe)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true"
+          Condition="Exists('$(_NativeExeSource)')" />
+    <Copy SourceFiles="@(_CefLinuxFiles)"
+          DestinationFiles="@(_CefLinuxFiles->'$(PublishDir)/%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Condition="'$(PublishDir)' != '' AND Exists('$(CefLinuxRoot)/Release')" />
+    <Copy SourceFiles="@(_NativeExe)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true"
+          Condition="'$(PublishDir)' != '' AND Exists('$(_NativeExeSource)')" />
+    <Exec Command="chmod +x &quot;$(OutputPath)CefBrowser.Native&quot; &quot;$(OutputPath)chrome-sandbox&quot;"
+          Condition="Exists('$(OutputPath)CefBrowser.Native')" />
+    <Exec Command="chmod +x &quot;$(PublishDir)CefBrowser.Native&quot;"
+          Condition="'$(PublishDir)' != '' AND Exists('$(PublishDir)CefBrowser.Native')" />
+    <Exec Command="chmod +x &quot;$(PublishDir)chrome-sandbox&quot;"
+          Condition="'$(PublishDir)' != '' AND Exists('$(PublishDir)chrome-sandbox')" />
+    <Message Text="CEF Linux native files copied from $(CefLinuxRoot) + $(_NativeExeSource)" Importance="high"
+             Condition="Exists('$(CefLinuxRoot)/Release')" />
+  </Target>
+
+  <!-- dotnet publish may copy files again after the Build target, resetting
+       Unix mode bits. Re-apply +x on the final publish output. -->
+  <Target Name="ChmodCefNativeLinuxPublish" AfterTargets="Publish"
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) AND '$(PublishDir)' != ''">
+    <Exec Command="chmod +x &quot;$(PublishDir)CefBrowser.Native&quot;"
+          Condition="Exists('$(PublishDir)CefBrowser.Native')" />
+    <Exec Command="chmod +x &quot;$(PublishDir)chrome-sandbox&quot;"
+          Condition="Exists('$(PublishDir)chrome-sandbox')" />
   </Target>
 </Project>

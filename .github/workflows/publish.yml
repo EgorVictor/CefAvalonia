@@ -21,7 +21,7 @@ permissions:
   id-token: write
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
 
     steps:
@@ -96,8 +96,20 @@ jobs:
 
       # Note: CefBrowser.Native.exe must be built BEFORE the dotnet build,
       # because the csproj's <Content> items reference ..\CefBrowser.Native\build\Release\*
-      - name: Build .NET + Pack NuGet
+      - name: Build .NET library + pack NuGet
         run: dotnet pack CefSharp.Avalonia\CefSharp.Avalonia.csproj -c Release -o artifacts
+
+      # Build the demo app too, so compile errors surface in CI (it also copies
+      # the native host + CEF binaries next to the assembly).
+      - name: Build demo app (smoke)
+        run: dotnet build TestBrowserApp\TestBrowserApp.csproj -c Release
+
+      - name: Upload NuGet artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-package
+          path: artifacts\*.nupkg
+          if-no-files-found: error
 
       # Trusted Publishing: exchange the Actions OIDC token for a short-lived
       # NuGet API key (dotnet nuget push cannot do this exchange by itself).
@@ -113,3 +125,48 @@ jobs:
           dotnet nuget push artifacts\*.nupkg `
             --api-key ${{ steps.login.outputs.NUGET_API_KEY }} `
             --source https://api.nuget.org/v3/index.json
+
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install CEF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libgtk-3-dev
+
+      - name: Cache CEF binaries
+        id: cache-cef-linux
+        uses: actions/cache@v4
+        with:
+          path: ~/cef
+          key: cef-linux-${{ env.CEF_VER }}
+
+      - name: Download & extract CEF (Linux64)
+        if: steps.cache-cef-linux.outputs.cache-hit != 'true'
+        run: |
+          VER="${{ env.CEF_VER }}"
+          URL="https://cef-builds.spotifycdn.com/cef_binary_${VER}_linux64.tar.bz2"
+          mkdir -p ~/cef
+          curl -sL -o ~/cef/cef.tar.bz2 "$URL"
+          tar -xf ~/cef/cef.tar.bz2 -C ~/cef
+          rm ~/cef/cef.tar.bz2
+
+      - name: Build native (Linux)
+        working-directory: CefBrowser.Native
+        run: |
+          CEF=~/cef/cef_binary_${{ env.CEF_VER }}_linux64
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT="$CEF" -DCMAKE_MODULE_PATH="$CEF/cmake"
+          cmake --build build --config Release
+
+      - name: Build .NET (library + demo)
+        run: |
+          dotnet build CefSharp.Avalonia/CefSharp.Avalonia.csproj -c Release
+          dotnet build TestBrowserApp/TestBrowserApp.csproj -c Release -p:CefLinuxRoot=~/cef/cef_binary_${{ env.CEF_VER }}_linux64

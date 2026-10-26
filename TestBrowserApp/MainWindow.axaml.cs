@@ -311,7 +311,9 @@ public partial class MainWindow : Window
             CefSettings = new CefSettings
             {
                 NoSandbox = true,
-                // 每个 tab 独立缓存目录，避免多实例争抢同一 Chromium profile 锁
+                // 每个 tab 独立缓存目录，避免多实例争抢同一 Chromium profile 锁。
+                // CEF 要求 cache_path 必须是 root_cache_path 的子目录。
+                RootCachePath = AppContext.BaseDirectory,
                 CachePath = Path.Combine(AppContext.BaseDirectory, "cef_cache", $"tab{tabId}")
             }
         };

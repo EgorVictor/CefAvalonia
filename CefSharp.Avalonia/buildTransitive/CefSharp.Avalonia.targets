@@ -2,21 +2,25 @@
   <!--
     CefSharp.Avalonia.targets (transitive)
 
-    Same as build\CefSharp.Avalonia.targets but placed in buildTransitive\ so
+    Same as build/CefSharp.Avalonia.targets but placed in buildTransitive/ so
     that projects consuming a transitive dependency on CefSharp.Avalonia also
     get the native binaries copied to their output directory.
   -->
 
   <PropertyGroup>
-    <_CefNativePackageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\nativeBinaries'))</_CefNativePackageDir>
+    <_CefNativePackageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)../nativeBinaries'))</_CefNativePackageDir>
   </PropertyGroup>
 
   <ItemGroup>
-    <_CefNativeFile Include="$(_CefNativePackageDir)**\*" />
+    <_CefNativeFile Include="$(_CefNativePackageDir)**/*" />
   </ItemGroup>
 
   <Target Name="CopyCefNativeBinaries" AfterTargets="Build" Inputs="@(_CefNativeFile)" Outputs="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')">
     <Copy SourceFiles="@(_CefNativeFile)" DestinationFiles="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <Exec Command="chmod +x &quot;$(OutDir)CefBrowser.Native&quot;"
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) AND Exists('$(OutDir)CefBrowser.Native')" />
+    <Exec Command="chmod +x &quot;$(OutDir)chrome-sandbox&quot;"
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) AND Exists('$(OutDir)chrome-sandbox')" />
     <ItemGroup>
       <ResolvedFileToPublish Include="@(_CefNativeFile)">
         <RelativePath>%(_CefNativeFile.RecursiveDir)%(_CefNativeFile.Filename)%(_CefNativeFile.Extension)</RelativePath>
@@ -24,6 +28,15 @@
       </ResolvedFileToPublish>
     </ItemGroup>
     <Message Text="Copied CEF native binaries to $(OutDir)" Importance="high" />
+  </Target>
+
+  <!-- dotnet publish may reset Unix mode bits after copying. -->
+  <Target Name="ChmodCefNativeBinariesPublish" AfterTargets="Publish"
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) AND '$(PublishDir)' != ''">
+    <Exec Command="chmod +x &quot;$(PublishDir)CefBrowser.Native&quot;"
+          Condition="Exists('$(PublishDir)CefBrowser.Native')" />
+    <Exec Command="chmod +x &quot;$(PublishDir)chrome-sandbox&quot;"
+          Condition="Exists('$(PublishDir)chrome-sandbox')" />
   </Target>
 
   <Target Name="CleanCefNativeBinaries" AfterTargets="Clean">

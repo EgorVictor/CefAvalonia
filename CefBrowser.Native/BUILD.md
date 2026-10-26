@@ -45,14 +45,14 @@ cmake -B build -G "Visual Studio 17 2022" -A x64 ^
 cmake --build build --config Release
 ```
 
-Output: `CefBrowser.Native\build\Release\CefBrowser.Native.exe`
+Output: `CefBrowser.Native\build\Release\CefBrowser.Native` (`.exe` on Windows)
 
 ## Step 4: Deploy
 
 Copy `build\Release\*` to Avalonia output directory alongside `CefSharp.Avalonia.exe`.
 
 Required files:
-- `CefBrowser.Native.exe`
+- `CefBrowser.Native` (`.exe` on Windows)
 - `libcef.dll`, `chrome_elf.dll`
 - `icudtl.dat`, `snapshot_blob.bin`, `v8_context_snapshot.bin`
 - `*.pak` files, `locales\`, `d3dcompiler_47.dll`, `libEGL.dll`, `libGLESv2.dll`

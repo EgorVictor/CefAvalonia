@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using System.Text;
 
 namespace CefSharp.Avalonia;
 
@@ -21,84 +23,96 @@ public enum CefLogSeverity
 /// Mirrors CEF's cef_settings_t struct (CEF 109.1.11).
 /// Each property maps 1:1 to the corresponding CefSettings field.
 /// Null values are skipped during serialization (CEF default applies).
+///
+/// These are <b>process-level</b> settings: because all <see cref="WebView"/>
+/// instances share one native host process, only the first browser that starts
+/// the host decides them. Per-browser settings (cache isolation, URL) are
+/// handled separately by <see cref="BrowserProcessManager"/>.
 /// </summary>
 public class CefSettings
 {
     // ---- Boolean flags ----
-    /// <summary>Disable the sandbox for sub-processes. Corresponds to --no-sandbox.</summary>
+    /// <summary>
+    /// Disable the CEF sandbox. Defaults to <c>false</c> (sandbox enabled).
+    /// Only disable it when you must run on an environment where the sandbox is
+    /// unavailable (for example inside some containers or debuggers).
+    /// </summary>
     public bool? NoSandbox { get; set; }
     /// <summary>Enable Chrome runtime (experimental). CEF issue #2969.</summary>
     public bool? ChromeRuntime { get; set; }
     /// <summary>Run browser message loop on a separate thread (Windows/Linux only).</summary>
     public bool? MultiThreadedMessageLoop { get; set; }
-    /// <summary>Control message pump via OnScheduleMessagePumpWork callback.</summary>
+    /// <summary>Use an external message pump instead of an internal one.</summary>
     public bool? ExternalMessagePump { get; set; }
-    /// <summary>Enable off-screen rendering support.</summary>
+    /// <summary>Enable windowless (off-screen) rendering.</summary>
     public bool? WindowlessRenderingEnabled { get; set; }
-    /// <summary>Disable processing of standard Chromium command-line arguments.</summary>
+    /// <summary>Disable configuration of the command line via CefApp.</summary>
     public bool? CommandLineArgsDisabled { get; set; }
-    /// <summary>Persist session cookies when cache path is set.</summary>
+    /// <summary>Persist session cookies between restarts.</summary>
     public bool? PersistSessionCookies { get; set; }
-    /// <summary>Persist user preferences as JSON in cache directory.</summary>
+    /// <summary>Persist user preferences between restarts.</summary>
     public bool? PersistUserPreferences { get; set; }
-    /// <summary>Disable loading of .pak resource/locale pack files.</summary>
+    /// <summary>Disable pack file loading.</summary>
     public bool? PackLoadingDisabled { get; set; }
-    /// <summary>Exclude default schemes (http, https, ws, wss) from cookieable schemes.</summary>
+    /// <summary>Exclude the default cookieable schemes from the list.</summary>
     public bool? CookieableSchemesExcludeDefaults { get; set; }
 
-    // ---- String paths ----
-    /// <summary>Path to sub-process executable (defaults to main executable).</summary>
+    // ---- Paths ----
+    /// <summary>Path to the CEF sub-process executable. Empty uses this executable.</summary>
     public string? BrowserSubprocessPath { get; set; }
-    /// <summary>Path to CEF framework directory (macOS).</summary>
+    /// <summary>Path to the framework directory (macOS).</summary>
     public string? FrameworkDirPath { get; set; }
-    /// <summary>Path to main bundle (macOS).</summary>
+    /// <summary>Path to the main bundle (macOS).</summary>
     public string? MainBundlePath { get; set; }
-    /// <summary>Global browser cache directory. Empty = incognito mode.</summary>
+    /// <summary>Directory used for the browser cache (profile).</summary>
     public string? CachePath { get; set; }
-    /// <summary>Root directory for all cache_path values. Prevents multi-instance conflicts.</summary>
+    /// <summary>Root directory used for the cache when <see cref="CachePath"/> is empty.</summary>
     public string? RootCachePath { get; set; }
-    /// <summary>User data directory (Widevine CDM, spell check, etc.).</summary>
+    /// <summary>Directory used for user data (cookies, local storage, ...).</summary>
     public string? UserDataPath { get; set; }
-    /// <summary>Fully qualified path for resources directory (.pak files).</summary>
-    public string? ResourcesDirPath { get; set; }
-    /// <summary>Fully qualified path for locales directory.</summary>
-    public string? LocalesDirPath { get; set; }
-    /// <summary>Debug log file path. Default: debug.log next to executable.</summary>
+    /// <summary>Path of the CEF log file.</summary>
     public string? LogFile { get; set; }
+    /// <summary>Directory containing CEF resources (icudtl.dat, *.pak).</summary>
+    public string? ResourcesDirPath { get; set; }
+    /// <summary>Directory containing the locales.</summary>
+    public string? LocalesDirPath { get; set; }
 
-    // ---- String other ----
-    /// <summary>Custom User-Agent HTTP header value.</summary>
+    // ---- Strings ----
+    /// <summary>User agent string. Values containing spaces are supported.</summary>
     public string? UserAgent { get; set; }
-    /// <summary>Product portion of default User-Agent. Ignored if UserAgent is set.</summary>
+    /// <summary>User agent product string.</summary>
     public string? UserAgentProduct { get; set; }
-    /// <summary>Locale passed to WebKit. Default: en-US.</summary>
+    /// <summary>Locale, e.g. "zh-CN".</summary>
     public string? Locale { get; set; }
-    /// <summary>Custom V8 JavaScript engine flags.</summary>
+    /// <summary>Additional V8 flags.</summary>
     public string? JavascriptFlags { get; set; }
-    /// <summary>Comma-delimited Accept-Language header languages (no whitespace).</summary>
+    /// <summary>Comma separated list of accepted languages.</summary>
     public string? AcceptLanguageList { get; set; }
-    /// <summary>Comma-delimited list of cookie-supported schemes.</summary>
+    /// <summary>Comma separated list of schemes that can set cookies.</summary>
     public string? CookieableSchemesList { get; set; }
 
-    // ---- Numeric ----
-    /// <summary>Log severity level. Maps to CEF's log_severity_t enum.</summary>
+    // ---- Numbers / enums ----
+    /// <summary>CEF log verbosity.</summary>
     public CefLogSeverity? LogSeverity { get; set; }
-    /// <summary>Remote debugging port (1024-65535). Access via chrome://inspect.</summary>
+    /// <summary>Remote debugging port; 0 disables it.</summary>
     public int? RemoteDebuggingPort { get; set; }
-    /// <summary>Stack frames for uncaught exceptions (0 = disabled).</summary>
+    /// <summary>Stack size for uncaught exceptions.</summary>
     public int? UncaughtExceptionStackSize { get; set; }
-    /// <summary>ARGB background color (0xAARRGGBB). Opaque or fully transparent.</summary>
+    /// <summary>Background color as 0xAARRGGBB.</summary>
     public uint? BackgroundColor { get; set; }
 
-    /// <summary>Additional CEF command-line switches (e.g., "--allow-file-access-from-files").</summary>
+    /// <summary>
+    /// Additional switches passed to the native host verbatim
+    /// (for example <c>--disable-gpu</c> or <c>--proxy-server=...</c>).
+    /// </summary>
     public List<string> CommandLineSwitches { get; set; } = new();
 
     /// <summary>
-    /// Serializes all set properties to --cef-{name}={value} arguments.
-    /// These are passed to CefBrowser.Native.exe and parsed in ApplyCefSettingsFromArgs().
-    /// Null properties are omitted so CEF's defaults apply.
+    /// Serializes all set properties to individual <c>--cef-{name}={value}</c>
+    /// arguments. Use this together with <see cref="System.Diagnostics.ProcessStartInfo.ArgumentList"/>
+    /// so values containing spaces or quotes are passed intact.
     /// </summary>
-    public string ToCommandLineArgs()
+    public IReadOnlyList<string> ToArgumentList()
     {
         var parts = new List<string>();
 
@@ -132,14 +146,64 @@ public class CefSettings
         AddStr(parts, "cookieable-schemes-list", CookieableSchemesList);
         AddBool(parts, "cookieable-schemes-exclude-defaults", CookieableSchemesExcludeDefaults);
 
-        // Additional CEF command-line switches (passed directly to native process)
-        foreach (var sw in CommandLineSwitches)
+        foreach (string sw in CommandLineSwitches)
         {
             if (!string.IsNullOrWhiteSpace(sw))
                 parts.Add(sw);
         }
 
-        return parts.Count > 0 ? " " + string.Join(" ", parts) : "";
+        return parts;
+    }
+
+    /// <summary>
+    /// Legacy helper that joins <see cref="ToArgumentList"/> into a single
+    /// command line string with Windows quoting rules. Prefer
+    /// <see cref="ToArgumentList"/> + <c>ProcessStartInfo.ArgumentList</c>.
+    /// </summary>
+    public string ToCommandLineArgs()
+    {
+        IReadOnlyList<string> parts = ToArgumentList();
+        if (parts.Count == 0) return "";
+
+        var sb = new StringBuilder();
+        foreach (string part in parts)
+        {
+            if (sb.Length > 0) sb.Append(' ');
+            sb.Append(QuoteArgument(part));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Quotes a single argument using CommandLineToArgvW rules.</summary>
+    internal static string QuoteArgument(string argument)
+    {
+        if (argument.Length == 0) return "\"\"";
+        if (argument.IndexOfAny([' ', '\t', '"']) < 0) return argument;
+
+        var sb = new StringBuilder(argument.Length + 4);
+        sb.Append('"');
+        int backslashes = 0;
+        foreach (char c in argument)
+        {
+            if (c == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+
+            if (c == '"')
+            {
+                sb.Append('\\', backslashes * 2 + 1).Append('"');
+                backslashes = 0;
+                continue;
+            }
+
+            sb.Append('\\', backslashes).Append(c);
+            backslashes = 0;
+        }
+
+        sb.Append('\\', backslashes * 2).Append('"');
+        return sb.ToString();
     }
 
     private static void AddBool(List<string> parts, string name, bool? value)
@@ -168,21 +232,21 @@ public class CefSettings
 
     private static void AddEnum(List<string> parts, string name, CefLogSeverity? value)
     {
-        if (value.HasValue)
+        if (!value.HasValue) return;
+
+        string? str = value.Value switch
         {
-            var str = value.Value switch
-            {
-                CefLogSeverity.Default => "default",
-                CefLogSeverity.Verbose => "verbose",
-                CefLogSeverity.Info => "info",
-                CefLogSeverity.Warning => "warning",
-                CefLogSeverity.Error => "error",
-                CefLogSeverity.Fatal => "fatal",
-                CefLogSeverity.Disable => "disable",
-                _ => null
-            };
-            if (str != null)
-                parts.Add($"--cef-{name}={str}");
-        }
+            CefLogSeverity.Default => "default",
+            CefLogSeverity.Verbose => "verbose",
+            CefLogSeverity.Info => "info",
+            CefLogSeverity.Warning => "warning",
+            CefLogSeverity.Error => "error",
+            CefLogSeverity.Fatal => "fatal",
+            CefLogSeverity.Disable => "disable",
+            _ => null,
+        };
+
+        if (str != null)
+            parts.Add($"--cef-{name}={str}");
     }
 }

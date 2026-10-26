@@ -7,7 +7,7 @@
     <PackageId>CefSharp.Avalonia</PackageId>
     <Version>1.1.0</Version>
     <Authors>CefBrowser</Authors>
-    <Description>Avalonia CefBrowser wrapper control. Embeds a CEF (Chromium Embedded Framework) browser as an Avalonia control via named-pipe IPC.</Description>
+    <Description>Avalonia CefBrowser wrapper control. Embeds a CEF (Chromium Embedded Framework) browser as an Avalonia control using a native child process and stdio IPC on Windows and Linux.</Description>
     <PackageTags>avalonia;cef;chromium;browser;webview</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/EgorVictor/CefAvalonia</PackageProjectUrl>
@@ -17,9 +17,12 @@
     <NoWarn>NU5100</NoWarn>
   </PropertyGroup>
 
+  <!-- The library only needs the core Avalonia package: NativeControlHost and
+       the control primitives live in 'Avalonia', not 'Avalonia.Desktop'. Forcing
+       Avalonia.Desktop here would impose a platform backend on every consumer,
+       so the demo app references Avalonia.Desktop itself. -->
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="11.3.7" />
-    <PackageReference Include="Avalonia.Desktop" Version="11.3.7" />
   </ItemGroup>
 
   <!-- Include build targets in the NuGet package -->
@@ -28,8 +31,10 @@
     <Content Include="buildTransitive\*" Pack="true" PackagePath="buildTransitive\" />
   </ItemGroup>
 
-  <!-- Native binary files to include in the NuGet package -->
-  <ItemGroup>
+  <!-- Native binary files to include in the NuGet package.
+       A package is built for the current OS: Windows includes the .exe, Linux
+       includes the extension-less executable and libcef.so. -->
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
     <Content Include="..\CefBrowser.Native\build\Release\*.*" Exclude="..\CefBrowser.Native\build\Release\*.ilk;..\CefBrowser.Native\build\Release\*.obj;..\CefBrowser.Native\build\Release\*.pdb;..\CefBrowser.Native\build\Release\*.exp;..\CefBrowser.Native\build\Release\*.lib" Pack="true" PackagePath="nativeBinaries\%(Filename)%(Extension)">
       <Visible>false</Visible>
     </Content>
@@ -38,7 +43,18 @@
     </Content>
   </ItemGroup>
 
-  <Target Name="CopyCefBrowserNative" AfterTargets="Build">
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+    <Content Include="..\CefBrowser.Native\build\Release\**\*" Exclude="..\CefBrowser.Native\build\Release\*.obj;..\CefBrowser.Native\build\Release\*.pdb;..\CefBrowser.Native\build\Release\*.a;..\CefBrowser.Native\build\Release\*.dll;..\CefBrowser.Native\build\Release\*.exe" Pack="true" PackagePath="nativeBinaries\%(RecursiveDir)%(Filename)%(Extension)">
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="..\CefBrowser.Native\build\CefBrowser.Native" Pack="true" PackagePath="nativeBinaries\CefBrowser.Native" Condition="Exists('..\CefBrowser.Native\build\CefBrowser.Native')">
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+
+  <!-- Windows: copy native binaries next to the managed assembly for local runs. -->
+  <Target Name="CopyCefBrowserNativeWindows" AfterTargets="Build"
+          Condition="$([MSBuild]::IsOSPlatform('Windows'))">
     <PropertyGroup>
       <CefNativeDir>..\CefBrowser.Native\build\Release</CefNativeDir>
     </PropertyGroup>
@@ -46,11 +62,42 @@
       <CefBinFiles Include="$(CefNativeDir)\*.*" Exclude="$(CefNativeDir)\*.obj;$(CefNativeDir)\*.pdb;$(CefNativeDir)\*.ilk;$(CefNativeDir)\*.exp;$(CefNativeDir)\*.lib" />
     </ItemGroup>
     <Copy SourceFiles="@(CefBinFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
-    <!-- Copy locales directory recursively -->
     <ItemGroup>
       <CefLocales Include="$(CefNativeDir)\locales\*.*" />
     </ItemGroup>
     <Copy SourceFiles="@(CefLocales)" DestinationFolder="$(OutputPath)\locales\" SkipUnchangedFiles="true" />
     <Message Text="Copied CefBrowser.Native from Release to $(OutputPath)" Importance="high" />
+  </Target>
+
+  <!-- Linux: same, but the executable has no extension and needs +x. -->
+  <Target Name="CopyCefBrowserNativeLinux" AfterTargets="Build"
+          Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+    <PropertyGroup>
+      <CefNativeDir Condition="Exists('..\CefBrowser.Native\build\Release\libcef.so')">..\CefBrowser.Native\build\Release</CefNativeDir>
+      <CefNativeDir Condition="'$(CefNativeDir)' == '' AND Exists('..\CefBrowser.Native\build\libcef.so')">..\CefBrowser.Native\build</CefNativeDir>
+    </PropertyGroup>
+    <ItemGroup Condition="'$(CefNativeDir)' != ''">
+      <CefBinFiles Include="$(CefNativeDir)\**\*" Exclude="$(CefNativeDir)\*.a;$(CefNativeDir)\*.pdb" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CefBinFiles)"
+          DestinationFiles="@(CefBinFiles->'$(OutputPath)/%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Condition="'$(CefNativeDir)' != ''" />
+    <Exec Command="chmod +x &quot;$(OutputPath)CefBrowser.Native&quot;"
+          Condition="Exists('$(OutputPath)CefBrowser.Native')" />
+    <Exec Command="chmod +x &quot;$(OutputPath)chrome-sandbox&quot;"
+          Condition="Exists('$(OutputPath)chrome-sandbox')" />
+    <Message Text="Copied CefBrowser.Native from $(CefNativeDir) to $(OutputPath)" Importance="high"
+             Condition="'$(CefNativeDir)' != ''" />
+  </Target>
+
+  <!-- dotnet publish may copy files again after the Build target, resetting
+       Unix mode bits. Re-apply +x on the final publish output. -->
+  <Target Name="ChmodCefNativeLinuxPublish" AfterTargets="Publish"
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) AND '$(PublishDir)' != ''">
+    <Exec Command="chmod +x &quot;$(PublishDir)CefBrowser.Native&quot;"
+          Condition="Exists('$(PublishDir)CefBrowser.Native')" />
+    <Exec Command="chmod +x &quot;$(PublishDir)chrome-sandbox&quot;"
+          Condition="Exists('$(PublishDir)chrome-sandbox')" />
   </Target>
 </Project>

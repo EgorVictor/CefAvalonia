@@ -2,27 +2,34 @@
   <!--
     CefSharp.Avalonia.targets
 
-    Copies native CEF binaries and CefBrowser.Native.exe to the consuming
-    project's output directory at build time.  These files live inside the
-    NuGet package under nativeBinaries/ and are deployed alongside the managed
-    assembly so that CefBrowser.Native can be spawned as a subprocess.
+    Copies native CEF binaries and the CefBrowser.Native host executable to the
+    consuming project's output directory at build time. These files live inside
+    the NuGet package under nativeBinaries/ and are deployed alongside the
+    managed assembly so that CefBrowser.Native can be spawned as a subprocess.
+
+    Windows package: nativeBinaries/CefBrowser.Native.exe + CEF DLLs
+    Linux package:   nativeBinaries/CefBrowser.Native + libcef.so etc.
   -->
 
   <PropertyGroup>
-    <!-- 
+    <!--
       Path to the native binaries within the installed package.
-      MSBuildThisFileDirectory resolves to {packageRoot}\build\,
-      so ..\nativeBinaries\ points to {packageRoot}\nativeBinaries\.
+      MSBuildThisFileDirectory resolves to {packageRoot}/build/,
+      so ../nativeBinaries/ points to {packageRoot}/nativeBinaries/.
     -->
-    <_CefNativePackageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\nativeBinaries'))</_CefNativePackageDir>
+    <_CefNativePackageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)../nativeBinaries'))</_CefNativePackageDir>
   </PropertyGroup>
 
   <ItemGroup>
-    <_CefNativeFile Include="$(_CefNativePackageDir)**\*" />
+    <_CefNativeFile Include="$(_CefNativePackageDir)**/*" />
   </ItemGroup>
 
   <Target Name="CopyCefNativeBinaries" AfterTargets="Build" Inputs="@(_CefNativeFile)" Outputs="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')">
     <Copy SourceFiles="@(_CefNativeFile)" DestinationFiles="@(_CefNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <Exec Command="chmod +x &quot;$(OutDir)CefBrowser.Native&quot;"
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) AND Exists('$(OutDir)CefBrowser.Native')" />
+    <Exec Command="chmod +x &quot;$(OutDir)chrome-sandbox&quot;"
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) AND Exists('$(OutDir)chrome-sandbox')" />
     <ItemGroup>
       <ResolvedFileToPublish Include="@(_CefNativeFile)">
         <RelativePath>%(_CefNativeFile.RecursiveDir)%(_CefNativeFile.Filename)%(_CefNativeFile.Extension)</RelativePath>
@@ -30,6 +37,15 @@
       </ResolvedFileToPublish>
     </ItemGroup>
     <Message Text="Copied CEF native binaries to $(OutDir)" Importance="high" />
+  </Target>
+
+  <!-- dotnet publish may reset Unix mode bits after copying. -->
+  <Target Name="ChmodCefNativeBinariesPublish" AfterTargets="Publish"
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) AND '$(PublishDir)' != ''">
+    <Exec Command="chmod +x &quot;$(PublishDir)CefBrowser.Native&quot;"
+          Condition="Exists('$(PublishDir)CefBrowser.Native')" />
+    <Exec Command="chmod +x &quot;$(PublishDir)chrome-sandbox&quot;"
+          Condition="Exists('$(PublishDir)chrome-sandbox')" />
   </Target>
 
   <!-- Clean up copied files -->

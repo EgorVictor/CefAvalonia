@@ -19,7 +19,7 @@ public partial class App : Application
             desktop.MainWindow = new MainWindow();
 
             // Ensure the native browser host is torn down on exit. Without this
-            // CefBrowser.Native.exe can outlive the app.
+            // CefBrowser.Native can outlive the app.
             desktop.Exit += (_, _) => CefHostProcess.ShutdownAll();
         }
 

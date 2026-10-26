@@ -5,19 +5,25 @@
 //   pumps messages, dispatches commands/events between C# (stdio) and CEF.
 //   Shared across browsers: GPU process, network service, storage service.
 //   Isolated per browser: renderer processes + optional RequestContext (own cache dir).
-// IPC protocol v2 (pipe messages, all commands/events carry a browser id):
+//
+// IPC protocol v3 (line oriented over stdin/stdout; text fields are escaped with
+// proto::Escape so '|', CR and LF never break framing):
 //   C#→Native: Create|{id}|{cachePath}|{url}, Navigate|{id}|{url}, Reload|{id},
 //              Stop|{id}, Resize|{id}|{w}|{h}, EmbedDone|{id}, Close|{id}, Quit,
-//              Back|{id}, Forward|{id}, Zoom|{id}|{delta}, Find|{id}|{text},
-//              StopFind|{id}, DevTools|{id}, ExecJS|{id}|{base64 script}
-//   Native→C#: Ready|{id}|{HWND_HEX}, AddressChanged|{id}|{url},
+//              Back|{id}, Forward|{id}, Zoom|{id}|{delta},
+//              Find|{id}|{text}|{forward}|{findNext}, StopFind|{id}, DevTools|{id},
+//              ExecJS|{id}|{base64 script},
+//              JsDialogResult|{id}|{dialogId}|{accept}|{text}
+//   Native→C#: Hello|3, Ready|{id}|{HWND_HEX}, AddressChanged|{id}|{url},
 //              LoadError|{id}|{code}|{text}|{url}, NavState|{id}|{l}|{b}|{f},
 //              TitleChanged|{id}|{title}, OpenPopup|{id}|{url},
-//              DownloadStart|{id}|{path}, DownloadComplete|{id}|{path},
-//              DownloadCanceled|{id}
-//   The process exits when the last browser closes or Quit is received.
+//              JsDialog|{id}|{dialogId}|{type}|{message}|{default},
+//              DownloadStart|{id}|{path}, DownloadProgress|{id}|{received}|{total},
+//              DownloadComplete|{id}|{path}, DownloadCanceled|{id}
+//   The process exits on Quit or when the managed side closes stdin.
 
 #include "browser_handler.h"
+#include "protocol.h"
 #include "stdio_server.h"
 #include "include/cef_app.h"
 #include "include/cef_browser.h"
@@ -30,8 +36,25 @@
 #include "include/wrapper/cef_closure_task.h"
 #include "include/base/cef_bind.h"
 #include "include/base/cef_callback_helpers.h"
+
+#if defined(_WIN32)
 #include <Windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include "include/cef_sandbox_win.h"
+#elif defined(__linux__)
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#include <gtk/gtk.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdarg>
@@ -45,21 +68,39 @@
 
 
 // ---- Forward declarations ----
-static bool HasArg(LPCWSTR arg);
+static bool HasArg(const char* arg);
 static std::string GetArgValue(const std::string& key);
 static std::string GetEnv(const char* name);
 static void StripTypeFromCommandLine();
+static void RequestShutdown();
+static void ResetBrowserReady();
+static void MarkBrowserReady();
+static void WakePump();
 
 // ---- Globals ----
 static CefRefPtr<BrowserHandler> g_handler;
 static StdioServer* g_stdioServer = nullptr;
+#if defined(_WIN32)
 static HANDLE g_browserReadyEvent = nullptr;
 static HANDLE g_shutdownEvent = nullptr;
-static HANDLE g_browserClosedEvent = nullptr;
-static HWND g_browserHwnd = nullptr;
-static HWND g_hiddenParent = nullptr;
+static HANDLE g_pumpWakeEvent = nullptr;   // auto-reset, wakes pump for early deadlines / IPC
+#else
+static std::atomic<bool> g_browserReady{false};
+static std::atomic<bool> g_shutdownRequested{false};
+static bool g_pumpWake = false;
+static std::mutex g_waitMutex;
+static std::condition_variable g_waitCv;
+#endif
+static CefWindowHandle g_browserWindow = 0;
+static CefWindowHandle g_hiddenParent = 0;
 
+#if defined(_WIN32)
 static const wchar_t kHiddenClass[] = L"CefHidden_{B3A0B1C2}";
+#elif defined(__linux__)
+static Display* g_xdisplay = nullptr;
+static Atom g_wmDeleteAtom = None;
+bool g_gtkInitialized = false;
+#endif
 
 // ---- DIAG logging (silent unless CEF_DIAG=1) ----
 static bool g_diagEnabled = false;
@@ -73,13 +114,21 @@ static void DiagLog(const char* fmt, ...) {
     fflush(stderr);
 }
 
-// ---- External message pump state ----
+// ---- Time / external message pump state ----
 // With external_message_pump=true CEF asks us (OnScheduleMessagePumpWork) to run
 // CefDoMessageLoopWork within delay_ms. We park the main thread on kernel waits
-// instead of the old Sleep(1) poll loop: idle CPU drops to ~0%.
-static HANDLE g_pumpWakeEvent = nullptr;   // auto-reset, wakes pump for early deadlines / IPC
+// (Windows) or a condition variable (Linux) instead of a Sleep(1) poll loop.
+static uint64_t NowMs() {
+#if defined(_WIN32)
+    return (uint64_t)GetTickCount64();
+#else
+    using namespace std::chrono;
+    return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+#endif
+}
+
 static std::mutex g_pumpMutex;
-static ULONGLONG g_pumpDueTick = 0;        // absolute GetTickCount64 deadline; 0 = nothing pending
+static uint64_t g_pumpDueTick = 0;         // absolute deadline; 0 = nothing pending
 static uint32_t g_pumpGen = 0;             // bumped on every schedule request
 
 class PumpApp : public CefApp, public CefBrowserProcessHandler {
@@ -90,14 +139,14 @@ public:
 
     void OnScheduleMessagePumpWork(int64 delay_ms) override {
         if (delay_ms < 0) delay_ms = 0;
-        ULONGLONG due = GetTickCount64() + (ULONGLONG)delay_ms;
+        uint64_t due = NowMs() + (uint64_t)delay_ms;
         bool wake = false;
         {
             std::lock_guard<std::mutex> lock(g_pumpMutex);
             if (g_pumpDueTick == 0 || due < g_pumpDueTick) { g_pumpDueTick = due; wake = true; }
             g_pumpGen++;
         }
-        if (wake && g_pumpWakeEvent) SetEvent(g_pumpWakeEvent);
+        if (wake) WakePump();
     }
 private:
     IMPLEMENT_REFCOUNTING(PumpApp);
@@ -105,7 +154,15 @@ private:
 static CefRefPtr<PumpApp> g_pumpApp;
 
 static void WakePump() {
+#if defined(_WIN32)
     if (g_pumpWakeEvent) SetEvent(g_pumpWakeEvent);
+#else
+    {
+        std::lock_guard<std::mutex> lock(g_waitMutex);
+        g_pumpWake = true;
+    }
+    g_waitCv.notify_all();
+#endif
 }
 
 static uint32_t PumpGenSnapshot() {
@@ -113,11 +170,103 @@ static uint32_t PumpGenSnapshot() {
     return g_pumpGen;
 }
 
-static DWORD PumpWaitTimeoutMs() {
+static uint32_t PumpWaitTimeoutMs() {
     std::lock_guard<std::mutex> lock(g_pumpMutex);
-    if (g_pumpDueTick == 0) return INFINITE;
-    ULONGLONG now = GetTickCount64();
-    return now >= g_pumpDueTick ? 0 : (DWORD)(g_pumpDueTick - now);
+    if (g_pumpDueTick == 0) return UINT32_MAX;
+    uint64_t now = NowMs();
+    return now >= g_pumpDueTick ? 0 : (uint32_t)(g_pumpDueTick - now);
+}
+
+static bool g_standaloneMode = false;
+
+static void RequestShutdown() {
+#if defined(_WIN32)
+    if (g_shutdownEvent) SetEvent(g_shutdownEvent);
+#else
+    g_shutdownRequested = true;
+    g_waitCv.notify_all();
+#endif
+}
+
+static void MarkBrowserReady() {
+#if defined(_WIN32)
+    if (g_browserReadyEvent) SetEvent(g_browserReadyEvent);
+#else
+    g_browserReady = true;
+    g_waitCv.notify_all();
+#endif
+}
+
+static void ResetBrowserReady() {
+#if defined(_WIN32)
+    if (g_browserReadyEvent) ResetEvent(g_browserReadyEvent);
+#else
+    g_browserReady = false;
+#endif
+}
+
+static bool IsBrowserReady() {
+#if defined(_WIN32)
+    return g_browserReadyEvent && WaitForSingleObject(g_browserReadyEvent, 0) == WAIT_OBJECT_0;
+#else
+    return g_browserReady.load();
+#endif
+}
+
+enum class PumpWaitResult { Timeout, Wake, Message, Shutdown, BrowserReady };
+
+// Waits up to |timeoutMs| for CEF work / IPC / native input. On Windows this
+// also drains the Win32 message queue. On Linux it drains our own X11
+// connection (helper windows only; CEF owns its own X connection) and GTK.
+static PumpWaitResult WaitForPump(uint32_t timeoutMs) {
+#if defined(_WIN32)
+    HANDLE waits[2] = { g_shutdownEvent, g_pumpWakeEvent };
+    DWORD wr = MsgWaitForMultipleObjectsEx(2, waits, timeoutMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    if (wr == WAIT_OBJECT_0) return PumpWaitResult::Shutdown;
+
+    MSG msg;
+    bool haveMsgs = false;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        haveMsgs = true;
+        if (msg.message == WM_QUIT) return PumpWaitResult::Shutdown;
+        if (g_standaloneMode && msg.message == WM_CLOSE) return PumpWaitResult::Shutdown;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (haveMsgs) return PumpWaitResult::Message;
+    if (wr == WAIT_OBJECT_0 + 1) return PumpWaitResult::Wake;
+    return PumpWaitResult::Timeout;
+#else
+    {
+        std::unique_lock<std::mutex> lock(g_waitMutex);
+        g_waitCv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [] {
+            return g_pumpWake || g_shutdownRequested.load() || g_browserReady.load();
+        });
+    }
+    if (g_shutdownRequested.load()) return PumpWaitResult::Shutdown;
+    if (g_browserReady.exchange(false)) return PumpWaitResult::BrowserReady;
+
+    bool wake;
+    {
+        std::lock_guard<std::mutex> lock(g_waitMutex);
+        wake = g_pumpWake;
+        g_pumpWake = false;
+    }
+
+    if (g_xdisplay) {
+        while (XPending(g_xdisplay)) {
+            XEvent ev;
+            XNextEvent(g_xdisplay, &ev);
+            if (ev.type == ClientMessage && (Atom)ev.xclient.data.l[0] == g_wmDeleteAtom)
+                return PumpWaitResult::Shutdown;
+        }
+    }
+    if (g_gtkInitialized) {
+        while (gtk_events_pending())
+            gtk_main_iteration_do(FALSE);
+    }
+    return wake ? PumpWaitResult::Wake : PumpWaitResult::Timeout;
+#endif
 }
 
 // ---- URL normalization (all browser logic in C++) ----
@@ -128,6 +277,24 @@ static std::string NormalizeUrl(const std::string& input) {
     size_t e = url.find_last_not_of(" \t\r\n");
     url = url.substr(s, e - s + 1);
     if (url.empty()) return {};
+
+    // Any explicit scheme is kept verbatim: https:, http:, file:, about:,
+    // data:, mailto:, custom-app: ... Windows drive letters (C:/ or C:\) are
+    // paths, not schemes.
+    size_t colon = url.find(':');
+    if (colon != std::string::npos && colon > 0) {
+        bool validScheme = true;
+        for (size_t i = 0; i < colon; ++i) {
+            unsigned char c = (unsigned char)url[i];
+            bool ok = (i == 0) ? isalpha(c) : (isalnum(c) || c == '+' || c == '-' || c == '.');
+            if (!ok) { validScheme = false; break; }
+        }
+        bool driveLetter = colon == 1 && isalpha((unsigned char)url[0]) &&
+                           url.size() > 2 && (url[2] == '/' || url[2] == '\\');
+        if (validScheme && !driveLetter)
+            return url;
+    }
+
     if (url.find("file://") == 0 || url.find("about:") == 0 ||
         url.find("http://") == 0 || url.find("https://") == 0)
         return url;
@@ -152,12 +319,13 @@ static std::string NormalizeUrl(const std::string& input) {
 }
 
 // Strip URL prefix for display (e.g. "file:///F:/test" → "/F:/test", "about:blank" → "blank")
+// Display URL: the real address is reported (no host heuristics), only the
+// file:// prefix is shortened because it is just noise in an address bar.
 static std::string DisplayUrl(const std::string& url) {
-    const char* prefixes[] = {"file:///", "file://", "local://app/", "local://", "about:"};
-    for (auto p : prefixes) {
-        if (url.find(p) == 0)
-            return url.substr(strlen(p));
-    }
+    if (url.find("file:///") == 0)
+        return url.substr(8);
+    if (url.find("file://") == 0)
+        return url.substr(7);
     return url;
 }
 
@@ -185,22 +353,10 @@ static std::string Base64Decode(const std::string& in) {
     return out;
 }
 
-static std::string GetHost(const std::string& url) {
-    size_t start = url.find("://");
-    if (start == std::string::npos) start = 0;
-    else start += 3;
-    size_t end = url.find('/', start);
-    if (end == std::string::npos) end = url.find('?', start);
-    if (end == std::string::npos) end = url.find('#', start);
-    if (end == std::string::npos) end = url.length();
-    size_t port = url.find(':', start);
-    if (port != std::string::npos && port < end) end = port;
-    return url.substr(start, end - start);
-}
-
 // ---- Command queue (pipe thread -> main pump) ----
 enum class CmdType { Create, Navigate, Reload, Stop, CloseOne, Resize, EmbedDone, Quit,
-                     Back, Forward, Zoom, Find, StopFind, DevTools, ExecJS, None };
+                     Back, Forward, Zoom, Find, StopFind, DevTools, ExecJS,
+                     JsDialogResult, Nop };
 struct Cmd { CmdType type; int id = 0; std::string arg; };
 static std::queue<Cmd> g_cmdQueue;
 static std::mutex g_cmdMutex;
@@ -215,7 +371,7 @@ static void PushCmd(CmdType type, int id = 0, const std::string& arg = "") {
 
 static Cmd PopCmd() {
     std::lock_guard<std::mutex> lock(g_cmdMutex);
-    if (g_cmdQueue.empty()) return {CmdType::None};
+    if (g_cmdQueue.empty()) return {CmdType::Nop};
     auto c = g_cmdQueue.front();
     g_cmdQueue.pop();
     return c;
@@ -225,10 +381,7 @@ static Cmd PopCmd() {
 struct BrowserInstance {
     int id = 0;
     CefRefPtr<BrowserHandler> handler;
-    HWND parentHwnd = nullptr;
-    // Navigation host filter state (per browser, was global before multi-browser)
-    std::string lastNavigateHost;
-    ULONGLONG lastNavTick = 0;
+    CefWindowHandle parentWindow = 0;
     double zoomLevel = 0.0;   // CEF zoom level: 0 = 100%
 };
 static std::map<int, BrowserInstance> g_browsers;
@@ -238,16 +391,16 @@ static void SendEv(const std::string& line) {
     if (g_stdioServer) g_stdioServer->SendEvent(line);
 }
 
-static bool g_standaloneMode = false;
-
-static bool HasArg(LPCWSTR arg) {
+#if defined(_WIN32)
+static bool HasArg(const char* arg) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) return false;
     bool found = false;
-    size_t argLen = wcslen(arg);
+    size_t argLen = strlen(arg);
+    std::wstring warg(arg, arg + argLen);
     for (int i = 1; i < argc; i++) {
-        if (_wcsnicmp(argv[i], arg, argLen) == 0) { found = true; break; }
+        if (_wcsnicmp(argv[i], warg.c_str(), argLen) == 0) { found = true; break; }
     }
     LocalFree(argv);
     return found;
@@ -279,6 +432,28 @@ static std::string GetArgValue(const std::string& key) {
         result = result.substr(1, result.size() - 2);
     return result;
 }
+#elif defined(__linux__)
+static int g_argc = 0;
+static char** g_argv = nullptr;
+
+static bool HasArg(const char* arg) {
+    size_t len = strlen(arg);
+    for (int i = 1; i < g_argc; i++) {
+        if (strncmp(g_argv[i], arg, len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static std::string GetArgValue(const std::string& key) {
+    for (int i = 1; i < g_argc; i++) {
+        const char* a = g_argv[i];
+        if (strncmp(a, key.c_str(), key.size()) == 0 && a[key.size()] == '=')
+            return std::string(a + key.size() + 1);
+    }
+    return {};
+}
+#endif
 
 static std::string GetEnv(const char* name) {
     auto val = getenv(name);
@@ -340,7 +515,11 @@ static void ApplyCefSettingsFromArgs(CefSettings& settings) {
     std::string bc = GetArgValue("--cef-background-color");
     if (!bc.empty()) {
         unsigned long color = 0;
+#if defined(_WIN32)
         sscanf_s(bc.c_str(), "%lx", &color);
+#else
+        sscanf(bc.c_str(), "%lx", &color);
+#endif
         settings.background_color = (cef_color_t)color;
     }
 
@@ -350,6 +529,7 @@ static void ApplyCefSettingsFromArgs(CefSettings& settings) {
 }
 
 static void StripTypeFromCommandLine() {
+#if defined(_WIN32)
     LPWSTR cmd = GetCommandLineW();
     std::wstring wcmd(cmd);
     bool changed = false;
@@ -365,6 +545,168 @@ static void StripTypeFromCommandLine() {
         size_t len = wcslen(cmd) + 1;
         wcscpy_s(cmd, len, wcmd.c_str());
     }
+#else
+    // On Linux CefExecuteProcess already consumed any --type= subprocess
+    // invocation; main-process argv is owned by the CRT and is left untouched.
+#endif
+}
+
+// ---- Platform window / path helpers ----
+
+static std::string WindowToHex(CefWindowHandle window) {
+    char buf[32];
+#if defined(_WIN32)
+    snprintf(buf, sizeof(buf), "%I64X", (unsigned long long)(uintptr_t)window);
+#else
+    snprintf(buf, sizeof(buf), "%lX", (unsigned long)window);
+#endif
+    return std::string(buf);
+}
+
+#if defined(__linux__)
+static std::string GetExePath() {
+    char buf[PATH_MAX] = {0};
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    return n > 0 ? std::string(buf, (size_t)n) : std::string();
+}
+#endif
+
+// Per-user cache directory used when the managed side does not configure one.
+// Never falls back to the executable directory: that is often read-only
+// (Program Files) and makes CEF fail to create its profile.
+static std::string GetDefaultCachePath() {
+#if defined(_WIN32)
+    char buf[MAX_PATH] = {0};
+    if (FAILED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, buf))) {
+        std::string local = GetEnv("LOCALAPPDATA");
+        if (!local.empty()) {
+            strncpy_s(buf, local.c_str(), _TRUNCATE);
+        }
+    }
+    std::string root = buf[0] ? std::string(buf) : std::string(".");
+    return root + "\\CefAvalonia\\cef_cache";
+#else
+    std::string xdg = GetEnv("XDG_CACHE_HOME");
+    if (!xdg.empty())
+        return xdg + "/cefavalonia/cef_cache";
+
+    std::string home = GetEnv("HOME");
+    if (home.empty())
+        home = ".";
+    return home + "/.cache/cefavalonia/cef_cache";
+#endif
+}
+
+#if defined(__linux__)
+// CEF's Linux sandbox needs a SUID-root "chrome-sandbox" helper next to the
+// executable. Distributions rarely ship it preconfigured, and starting with the
+// sandbox enabled would abort at CefInitialize. Returning false lets the host
+// fall back to --no-sandbox with a clear warning instead of a black window.
+static bool LinuxSandboxAvailable() {
+    std::string exePath = GetExePath();
+    auto sep = exePath.find_last_of('/');
+    if (sep == std::string::npos)
+        return false;
+
+    std::string helper = exePath.substr(0, sep + 1) + "chrome-sandbox";
+
+    struct stat st;
+    if (stat(helper.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+        return false;
+
+    return (st.st_mode & S_ISUID) != 0 && st.st_uid == 0;
+}
+#endif
+
+#if defined(_WIN32)
+static ATOM RegisterHiddenClass() {
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kHiddenClass;
+    return RegisterClassExW(&wc);
+}
+#endif
+
+static CefWindowHandle CreateHiddenParentWindow(bool visible, const char* title) {
+#if defined(_WIN32)
+    (void)title;
+    if (!visible) {
+        return CreateWindowExW(0, kHiddenClass, L"", WS_POPUP | WS_CLIPCHILDREN,
+                               0, 0, 1, 1, nullptr, nullptr,
+                               GetModuleHandleW(nullptr), nullptr);
+    }
+    return CreateWindowExW(0, kHiddenClass, L"CEF Browser Test",
+                           WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 1280, 800,
+                           nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+#else
+    if (!g_xdisplay)
+        return 0;
+    int screen = DefaultScreen(g_xdisplay);
+    Window root = RootWindow(g_xdisplay, screen);
+    XSetWindowAttributes attrs = {};
+    attrs.background_pixel = BlackPixel(g_xdisplay, screen);
+    attrs.event_mask = StructureNotifyMask | ExposureMask;
+    Window w = XCreateWindow(
+        g_xdisplay, root, 0, 0, visible ? 1280 : 1, visible ? 800 : 1, 0,
+        CopyFromParent, InputOutput, CopyFromParent,
+        CWBackPixel | CWEventMask, &attrs);
+    if (!w)
+        return 0;
+    if (title)
+        XStoreName(g_xdisplay, w, title);
+    if (visible) {
+        XSetWMProtocols(g_xdisplay, w, &g_wmDeleteAtom, 1);
+        XMapWindow(g_xdisplay, w);
+    }
+    XFlush(g_xdisplay);
+    return w;
+#endif
+}
+
+static void MoveNativeWindow(CefWindowHandle window, int width, int height) {
+    if (!window)
+        return;
+#if defined(_WIN32)
+    MoveWindow(window, 0, 0, width, height, FALSE);
+#else
+    if (!g_xdisplay)
+        return;
+    XMoveResizeWindow(g_xdisplay, window, 0, 0, (unsigned)width, (unsigned)height);
+    XFlush(g_xdisplay);
+#endif
+}
+
+static void ShowNativeWindow(CefWindowHandle window, bool show) {
+    if (!window)
+        return;
+#if defined(_WIN32)
+    ShowWindow(window, show ? SW_SHOW : SW_HIDE);
+#else
+    if (!g_xdisplay)
+        return;
+    if (show) {
+        XMapRaised(g_xdisplay, window);
+    } else {
+        XUnmapWindow(g_xdisplay, window);
+    }
+    XFlush(g_xdisplay);
+#endif
+}
+
+static void DestroyNativeWindow(CefWindowHandle window) {
+    if (!window)
+        return;
+#if defined(_WIN32)
+    DestroyWindow(window);
+#else
+    if (!g_xdisplay)
+        return;
+    XDestroyWindow(g_xdisplay, window);
+    XFlush(g_xdisplay);
+#endif
 }
 
 static CefRefPtr<CefBrowser> FindBrowser(int id) {
@@ -428,17 +770,11 @@ static void DoZoom(int id, int delta) {
 static void DoFind(int id, const std::string& payload) {
     auto b = FindBrowser(id);
     if (!b) return;
-    // payload = "{text}|{forward}|{findNext}"
-    size_t p1 = payload.find('|');
-    std::string text = p1 == std::string::npos ? payload : payload.substr(0, p1);
-    std::string rest = p1 == std::string::npos ? "" : payload.substr(p1 + 1);
-    size_t p2 = rest.find('|');
-    bool forward = true;
-    bool findNext = false;
-    if (p2 != std::string::npos) {
-        forward = rest.substr(0, p2) != "0";
-        findNext = rest.substr(p2 + 1) == "1";
-    }
+    // payload = "{text}|{forward}|{findNext}" (text is escaped)
+    std::vector<std::string> fields = proto::Split(payload, 3);
+    std::string text = fields.size() > 0 ? fields[0] : "";
+    bool forward = fields.size() > 1 ? fields[1] != "0" : true;
+    bool findNext = fields.size() > 2 && fields[2] == "1";
     // CEF 109 signature: Find(searchText, forward, matchCase, findNext)
     b->GetHost()->Find(text, forward, false, findNext);
 }
@@ -461,7 +797,15 @@ static void DoShowDevTools(int id) {
     }
     if (!b || !handler) return;
     CefWindowInfo wi;
+#if defined(_WIN32)
     wi.SetAsPopup(nullptr, "DevTools");
+#else
+    // Linux CefWindowInfo has no SetAsPopup; host DevTools in a normal
+    // top-level window so the window is usable outside the embedded panel.
+    CefWindowHandle devToolsParent = CreateHiddenParentWindow(true, "DevTools");
+    if (!devToolsParent) return;
+    wi.SetAsChild(devToolsParent, CefRect(0, 0, 1200, 800));
+#endif
     CefBrowserSettings bs;
     // Reuse the inspected browser's own CefClient. Passing nullptr would leave
     // the DevTools window without handlers and can crash on first interaction.
@@ -477,6 +821,26 @@ static void DoExecJS(int id, const std::string& b64) {
     if (code.empty()) return;
     auto frame = b->GetMainFrame();
     if (frame) frame->ExecuteJavaScript(code, frame->GetURL(), 0);
+}
+
+// Answers a pending JavaScript dialog.
+static void DoResolveJsDialog(int id, const std::string& payload) {
+    CefRefPtr<BrowserHandler> handler;
+    {
+        std::lock_guard<std::mutex> lock(g_browsersMutex);
+        auto it = g_browsers.find(id);
+        if (it == g_browsers.end()) return;
+        handler = it->second.handler;
+    }
+
+    // payload = "{dialogId}|{accept}|{text}" (text is escaped)
+    std::vector<std::string> fields = proto::Split(payload, 3);
+    if (fields.empty()) return;
+
+    int dialogId = atoi(fields[0].c_str());
+    bool accept = fields.size() > 1 && fields[1] == "1";
+    std::string text = fields.size() > 2 ? fields[2] : "";
+    handler->ResolveJsDialog(dialogId, accept, text);
 }
 
 static void RequestCloseAllBrowsers() {
@@ -497,9 +861,7 @@ static void DoCreateBrowser(int id, const std::string& cachePath, const std::str
         if (g_browsers.count(id)) { DiagLog("DIAG: [C++] Create id=%d already exists", id); return; }
     }
 
-    DWORD style = WS_POPUP | WS_CLIPCHILDREN;   // hidden 1x1 parent; Resize moves the child
-    HWND parent = CreateWindowExW(0, kHiddenClass, L"", style, 0, 0, 1, 1,
-                                  nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    CefWindowHandle parent = CreateHiddenParentWindow(false, nullptr);
     if (!parent) { DiagLog("DIAG: [C++] Create id=%d parent window FAILED", id); SendEv("LoadError|" + std::to_string(id) + "|-100|CreateWindow failed|"); return; }
 
     auto handler = new BrowserHandler();
@@ -507,45 +869,31 @@ static void DoCreateBrowser(int id, const std::string& cachePath, const std::str
     handler->OnDownloadEvent = [id](const std::string& s) {
         SendEv(s);
     };
-    handler->OnBrowserReady = [id](HWND hwnd) {
-        char hwndHex[32];
-        sprintf_s(hwndHex, "%I64X", (unsigned long long)(LONG_PTR)hwnd);
-        SendEv("Ready|" + std::to_string(id) + "|" + hwndHex);
+    handler->OnBrowserReady = [id](CefWindowHandle window) {
+        SendEv("Ready|" + std::to_string(id) + "|" + WindowToHex(window));
     };
     handler->OnBrowserClosed = [id]() {
-        HWND parentToDestroy = nullptr;
+        CefWindowHandle parentToDestroy = 0;
         {
             std::lock_guard<std::mutex> lock(g_browsersMutex);
             auto it = g_browsers.find(id);
             if (it != g_browsers.end()) {
-                parentToDestroy = it->second.parentHwnd;
+                parentToDestroy = it->second.parentWindow;
                 g_browsers.erase(it);
             }
         }
-        if (parentToDestroy) DestroyWindow(parentToDestroy);
+        if (parentToDestroy) DestroyNativeWindow(parentToDestroy);
         // Host lifetime is owned by the C# side: it stays alive until an explicit
         // Quit or stdin EOF (parent process death). Do NOT exit just because the
         // last browser closed — the app may open a new tab afterwards.
     };
     handler->OnAddressChanged = [id](const std::string& u) {
-        std::string host = GetHost(u);
-        ULONGLONG nowTick = GetTickCount64();
-        {
-            std::lock_guard<std::mutex> lock(g_browsersMutex);
-            auto it = g_browsers.find(id);
-            if (it != g_browsers.end()) {
-                auto& bi = it->second;
-                if (!bi.lastNavigateHost.empty() && nowTick - bi.lastNavTick < 5000) {
-                    if (host.empty()) return;
-                    bool matches = (host.find(bi.lastNavigateHost) != std::string::npos ||
-                                    bi.lastNavigateHost.find(host) != std::string::npos);
-                    if (!matches) return;
-                }
-            }
-        }
-        SendEv("AddressChanged|" + std::to_string(id) + "|" + DisplayUrl(u));
+        // The handler already ignores sub-frame navigations, so this is the
+        // real top-level address: no host-based filtering is needed.
+        SendEv("AddressChanged|" + std::to_string(id) + "|" + proto::Escape(DisplayUrl(u)));
     };
     handler->OnLoadErrorEvent = [id](const std::string& s) {
+        // s = "{code}|{text}|{url}" (already escaped by BrowserHandler)
         SendEv("LoadError|" + std::to_string(id) + "|" + s);
     };
     handler->OnLoadingStateChanged = [id](bool isLoading, bool canGoBack, bool canGoForward) {
@@ -553,10 +901,15 @@ static void DoCreateBrowser(int id, const std::string& cachePath, const std::str
                std::string(canGoBack ? "1" : "0") + "|" + std::string(canGoForward ? "1" : "0"));
     };
     handler->OnTitleChangedCB = [id](const std::string& title) {
-        SendEv("TitleChanged|" + std::to_string(id) + "|" + title);
+        SendEv("TitleChanged|" + std::to_string(id) + "|" + proto::Escape(title));
     };
     handler->OnBeforePopupCB = [id](const std::string& popupUrl) {
-        SendEv("OpenPopup|" + std::to_string(id) + "|" + popupUrl);
+        SendEv("OpenPopup|" + std::to_string(id) + "|" + proto::Escape(popupUrl));
+    };
+    handler->OnJsDialog = [id](int dialogId, const std::string& type,
+                               const std::string& message, const std::string& defaultText) {
+        SendEv("JsDialog|" + std::to_string(id) + "|" + std::to_string(dialogId) + "|" +
+               type + "|" + proto::Escape(message) + "|" + proto::Escape(defaultText));
     };
 
     CefRequestContextSettings rcs;
@@ -582,24 +935,20 @@ static void ExecuteCmd(const Cmd& c) {
     DiagLog("DIAG: [C++] ExecuteCmd type=%d id=%d arg=%s", (int)c.type, c.id, c.arg.c_str());
     switch (c.type) {
         case CmdType::Create: {
-            // "cachePath|url" (either may be empty)
-            auto sep = c.arg.find('|');
-            std::string cachePath = sep != std::string::npos ? c.arg.substr(0, sep) : "";
-            std::string url = sep != std::string::npos ? c.arg.substr(sep + 1) : c.arg;
+            // "{cachePath}|{url}" (either may be empty, both escaped)
+            std::vector<std::string> fields = proto::Split(c.arg, 2);
+            std::string cachePath = fields.size() > 0 ? fields[0] : "";
+            std::string url = fields.size() > 1 ? fields[1] : "";
             DoCreateBrowser(c.id, cachePath, NormalizeUrl(url));
             break;
         }
         case CmdType::Navigate:
             {
-                std::lock_guard<std::mutex> lock(g_browsersMutex);
-                auto it = g_browsers.find(c.id);
-                if (it != g_browsers.end()) {
-                    it->second.lastNavigateHost = GetHost(c.arg);
-                    it->second.lastNavTick = GetTickCount64();
-                }
+                std::string navUrl = NormalizeUrl(proto::Unescape(c.arg));
+                DiagLog("DIAG: [C++] PostTask DoNavigate id=%d url=%s", c.id, navUrl.c_str());
+                if (navUrl.empty()) break;
+                CefPostTask(TID_UI, base::BindOnce(&DoNavigate, c.id, navUrl));
             }
-            DiagLog("DIAG: [C++] PostTask DoNavigate id=%d url=%s", c.id, c.arg.c_str());
-            CefPostTask(TID_UI, base::BindOnce(&DoNavigate, c.id, c.arg));
             break;
         case CmdType::Reload:
             CefPostTask(TID_UI, base::BindOnce(&DoReload, c.id));
@@ -611,14 +960,14 @@ static void ExecuteCmd(const Cmd& c) {
             CefPostTask(TID_UI, base::BindOnce(&DoCloseBrowser, c.id));
             break;
         case CmdType::Resize: {
-            // "w|h" — apply directly to this browser's HWND (latest wins)
-            HWND target = nullptr;
+            // "w|h" — apply directly to this browser's native window (latest wins)
+            CefWindowHandle target = 0;
             {
                 std::lock_guard<std::mutex> lock(g_browsersMutex);
                 auto it = g_browsers.find(c.id);
                 if (it != g_browsers.end()) {
                     // coalesce via per-instance dirty handled inline; direct move is fine here
-                    target = it->second.handler->GetBrowserHwnd();
+                    target = it->second.handler->GetBrowserWindowHandle();
                 }
             }
             if (!target) break;
@@ -626,17 +975,17 @@ static void ExecuteCmd(const Cmd& c) {
             if (sep2 == std::string::npos) break;
             int w = atoi(c.arg.substr(0, sep2).c_str());
             int h = atoi(c.arg.substr(sep2 + 1).c_str());
-            if (w > 0 && h > 0) MoveWindow(target, 0, 0, w, h, FALSE);
+            if (w > 0 && h > 0) MoveNativeWindow(target, w, h);
             break;
         }
         case CmdType::EmbedDone: {
-            HWND target = nullptr;
+            CefWindowHandle target = 0;
             {
                 std::lock_guard<std::mutex> lock(g_browsersMutex);
                 auto it = g_browsers.find(c.id);
-                if (it != g_browsers.end()) target = it->second.handler->GetBrowserHwnd();
+                if (it != g_browsers.end()) target = it->second.handler->GetBrowserWindowHandle();
             }
-            if (target) ShowWindow(target, SW_SHOW);
+            if (target) ShowNativeWindow(target, true);
             break;
         }
         case CmdType::Back:
@@ -660,36 +1009,73 @@ static void ExecuteCmd(const Cmd& c) {
         case CmdType::ExecJS:
             CefPostTask(TID_UI, base::BindOnce(&DoExecJS, c.id, c.arg));
             break;
+        case CmdType::JsDialogResult:
+            // Dialog answers must run on the UI thread: the CefJSDialogCallback
+            // is thread-affine to the browser's UI thread.
+            CefPostTask(TID_UI, base::BindOnce(&DoResolveJsDialog, c.id, c.arg));
+            break;
         case CmdType::Quit:
-            SetEvent(g_shutdownEvent);
+            RequestShutdown();
             break;
         default: break;
     }
 }
 
-static ATOM RegisterHiddenClass() {
-    WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = DefWindowProcW;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = kHiddenClass;
-    return RegisterClassExW(&wc);
-}
-
 // ========================================================================
-//  WinMain
+//  Entry point
 // ========================================================================
-int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-
+static int RunMain(int argc, char** argv
+#if defined(_WIN32)
+                   , HINSTANCE hInstance
+#endif
+) {
     g_diagEnabled = GetEnv("CEF_DIAG") == "1";
+
+#if defined(_WIN32)
+    (void)argc;
+    (void)argv;
+#else
+    g_argc = argc;
+    g_argv = argv;
+#endif
 
     // ---- Step 1: CEF subprocess detection ----
     // If --type= is present (CEF-spawned child process: renderer, GPU, etc.),
     // CefExecuteProcess handles the subprocess message loop and never returns.
     // Otherwise it returns -1 and we continue as the main browser process.
+#if defined(_WIN32)
     CefMainArgs mainArgs(hInstance);
+#else
+    std::vector<std::string> cefArgStorage;
+    cefArgStorage.reserve((size_t)argc);
+    for (int i = 0; i < argc; i++)
+        cefArgStorage.emplace_back(argv[i] ? argv[i] : "");
+    std::vector<char*> cefArgPtrs;
+    cefArgPtrs.reserve((size_t)argc + 1);
+    for (auto& s : cefArgStorage)
+        cefArgPtrs.push_back(s.data());
+    cefArgPtrs.push_back(nullptr);
+    CefMainArgs mainArgs(argc, cefArgPtrs.data());
+#endif
     g_pumpApp = new PumpApp();
-    int cefRet = CefExecuteProcess(mainArgs, g_pumpApp, nullptr);
+
+#if defined(_WIN32)
+    // Windows sandbox: the very same sandbox_info pointer must be handed to the
+    // subprocess entry point AND to CefInitialize. cef_sandbox.lib provides the
+    // implementation (linked in CMakeLists.txt).
+    CefScopedSandboxInfo sandboxInfo;
+    void* sandboxInfoPtr = sandboxInfo.sandbox_info();
+#else
+    void* sandboxInfoPtr = nullptr;
+#endif
+
+#if defined(__linux__)
+    // Must run before CefExecuteProcess/gtk_init: CEF/GDK may touch the
+    // locale during platform initialization.
+    if (!HasArg("--type="))
+        gtk_disable_setlocale();
+#endif
+    int cefRet = CefExecuteProcess(mainArgs, g_pumpApp, sandboxInfoPtr);
     if (cefRet >= 0)
         return cefRet;
 
@@ -700,7 +1086,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     std::string pipeName;
     std::string url = "about:blank";
     int hostPid = 0;
-    bool standalone = HasArg(L"--standalone");
+    bool standalone = HasArg("--standalone");
 
     std::string cliPipe = GetArgValue("--cef-pipe");
     std::string cliUrl  = GetArgValue("--cef-url");
@@ -713,35 +1099,85 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     if (pipeName.empty()) pipeName = GetEnv("CEF_PIPE");
     if (hostPid == 0) { std::string e = GetEnv("CEF_HOST_PID"); if (!e.empty()) { hostPid = atoi(e.c_str()); } }
 
-    // ---- Step 4: Events ----
+    // ---- Step 4: Platform events ----
+#if defined(_WIN32)
     g_browserReadyEvent  = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_shutdownEvent      = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    g_browserClosedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_pumpWakeEvent      = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // auto-reset
-    if (!g_browserReadyEvent || !g_shutdownEvent || !g_browserClosedEvent || !g_pumpWakeEvent)
+    if (!g_browserReadyEvent || !g_shutdownEvent || !g_pumpWakeEvent)
         return 1;
-
     RegisterHiddenClass();
+#endif
 
     // ---- Step 5: CEF Initialize ----
 
     CefSettings settings;
     settings.multi_threaded_message_loop = false;
-    // Event-driven pump: idle main thread blocks on kernel objects instead of
-    // polling CefDoMessageLoopWork at 1kHz. Overridable via --cef-external-message-pump=false.
+    // Event-driven pump: idle main thread blocks instead of polling
+    // CefDoMessageLoopWork at 1kHz. Overridable via --cef-external-message-pump=false.
     settings.external_message_pump = true;
-    settings.no_sandbox = true;
+    // Sandbox is ON unless the managed side passes --cef-no-sandbox=false
+    // (CefSettings default is already false, so nothing to set here).
 
-    char exePath[MAX_PATH];
-    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-    char* sep = strrchr(exePath, '\\');
-    if (sep) strcpy_s(sep + 1, MAX_PATH - (sep - exePath), "cache");
-    CefString(&settings.cache_path) = exePath;
+    // Default profile lives under the per-user cache dir; the executable
+    // directory is often read-only (e.g. Program Files) and would make CEF
+    // fail to create its profile.
+    CefString(&settings.cache_path) = GetDefaultCachePath();
 
     ApplyCefSettingsFromArgs(settings);
 
+#if defined(__linux__)
+    // Without a SUID-root chrome-sandbox helper Chromium refuses to start. Fall
+    // back to --no-sandbox with a loud warning rather than showing a black
+    // window; an explicit --cef-no-sandbox always wins.
+    if (!settings.no_sandbox && !HasArg("--cef-no-sandbox")) {
+        if (!LinuxSandboxAvailable()) {
+            settings.no_sandbox = true;
+            fprintf(stderr,
+                    "WARNING: chrome-sandbox (SUID root) not found next to the "
+                    "executable; starting without the CEF sandbox.\n");
+            fflush(stderr);
+        }
+    }
+#endif
+
+#if defined(__linux__)
+    // CEF on Linux needs the X11 backend for child-window embedding. GTK is
+    // used for native dialogs and also forced to X11 for consistency.
+    // (gtk_disable_setlocale() was called before CefExecuteProcess.)
+    gdk_set_allowed_backends("x11");
+    // GTK may consume/reorder its own arguments; use copies so our command-line
+    // helpers (--standalone, --cef-pipe, ...) keep working.
+    std::vector<std::string> gtkArgStorage;
+    gtkArgStorage.reserve((size_t)argc);
+    for (int i = 0; i < argc; i++)
+        gtkArgStorage.emplace_back(argv[i] ? argv[i] : "");
+    std::vector<char*> gtkArgv;
+    gtkArgv.reserve((size_t)argc + 1);
+    for (auto& s : gtkArgStorage)
+        gtkArgv.push_back(s.data());
+    gtkArgv.push_back(nullptr);
+    int gtkArgc = argc;
+    char** gtkArgvPtr = gtkArgv.data();
+    if (!gtk_init_check(&gtkArgc, &gtkArgvPtr)) {
+        DiagLog("DIAG: [C++] gtk_init_check FAILED (native dialogs disabled)");
+    } else {
+        g_gtkInitialized = true;
+    }
+    g_xdisplay = XOpenDisplay(nullptr);
+    if (!g_xdisplay) {
+        DiagLog("DIAG: [C++] XOpenDisplay FAILED (X11 embedding unavailable)");
+    } else {
+        g_wmDeleteAtom = XInternAtom(g_xdisplay, "WM_DELETE_WINDOW", False);
+        XSetErrorHandler([](Display*, XErrorEvent* e) -> int {
+            DiagLog("DIAG: [C++] X11 error code=%d request=%d", e->error_code, e->request_code);
+            return 0;
+        });
+    }
+#endif
+
     DiagLog("DIAG: [C++] Calling CefInitialize");
-    if (!CefInitialize(mainArgs, settings, g_pumpApp, nullptr)) {
+    if (!CefInitialize(mainArgs, settings, g_pumpApp, sandboxInfoPtr)) {
         DiagLog("DIAG: [C++] CefInitialize FAILED");
         return 1;
     }
@@ -751,9 +1187,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     // ---- Step 5b: Standalone mode auto-creates a single visible browser ----
     if (standalone) {
         g_handler = new BrowserHandler();
-        g_handler->OnBrowserReady = [](HWND hwnd) {
-            g_browserHwnd = hwnd;
-            SetEvent(g_browserReadyEvent);
+        g_handler->OnBrowserReady = [](CefWindowHandle window) {
+            g_browserWindow = window;
+            MarkBrowserReady();
         };
         g_handler->OnAddressChanged = [](const std::string& u) {
             SendEv("AddressChanged|" + DisplayUrl(u));
@@ -762,10 +1198,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             SendEv(s);
         };
 
-        DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE;
-        g_hiddenParent = CreateWindowExW(0, kHiddenClass, L"CEF Browser Test",
-            style, CW_USEDEFAULT, CW_USEDEFAULT, 1280, 800,
-            nullptr, nullptr, hInstance, nullptr);
+        g_hiddenParent = CreateHiddenParentWindow(true, "CEF Browser Test");
+        if (!g_hiddenParent) {
+            DiagLog("DIAG: [C++] standalone parent window FAILED");
+            CefShutdown();
+            return 1;
+        }
 
         CefWindowInfo wi;
         wi.SetAsChild(g_hiddenParent, CefRect(0, 0, 1280, 800));
@@ -774,32 +1212,29 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         CefBrowserHost::CreateBrowserSync(wi, g_handler, url, bs, nullptr, nullptr);
         DiagLog("DIAG: [C++] CreateBrowserSync returned");
 
-        // Wait for browser ready: event-driven pump (50ms cap is a safety floor only).
-        HANDLE waits[3] = { g_shutdownEvent, g_pumpWakeEvent, g_browserReadyEvent };
-        while (WaitForSingleObject(g_browserReadyEvent, 0) != WAIT_OBJECT_0) {
-            DWORD waitMs = PumpWaitTimeoutMs();
+        // Wait for browser ready (50ms cap is a safety floor only).
+        while (!IsBrowserReady()) {
+            uint32_t waitMs = PumpWaitTimeoutMs();
             if (waitMs > 50) waitMs = 50;
             uint32_t genBefore = PumpGenSnapshot();
-            DWORD wr = MsgWaitForMultipleObjectsEx(3, waits, waitMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-            if (wr == WAIT_OBJECT_0) {           // shutdown requested
+            auto result = WaitForPump(waitMs);
+            if (result == PumpWaitResult::Shutdown) {
                 CefShutdown();
                 return 1;
             }
-            if (wr == WAIT_OBJECT_0 + 2) break;  // browser ready
+            if (result == PumpWaitResult::BrowserReady)
+                break;
 
-            MSG msg;
-            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
             bool timerDue = false;
             {
                 std::lock_guard<std::mutex> lock(g_pumpMutex);
-                if (g_pumpDueTick != 0 && GetTickCount64() >= g_pumpDueTick) { g_pumpDueTick = 0; timerDue = true; }
+                if (g_pumpDueTick != 0 && NowMs() >= g_pumpDueTick) { g_pumpDueTick = 0; timerDue = true; }
             }
-            if (timerDue || PumpGenSnapshot() != genBefore || wr == WAIT_OBJECT_0 + 1)
+            if (timerDue || PumpGenSnapshot() != genBefore ||
+                result == PumpWaitResult::Wake || result == PumpWaitResult::Message)
                 CefDoMessageLoopWork();
         }
+        ResetBrowserReady();
         DiagLog("DIAG: [C++] Browser ready");
     }
 
@@ -833,10 +1268,15 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 } else if (cmd == "Navigate") {
                     int id; std::string navUrl;
                     if (!splitId(arg, id, navUrl)) return;
-                    navUrl = NormalizeUrl(navUrl);
-                    DiagLog("DIAG: [C++] Normalized url=%s", navUrl.c_str());
+                    // Escaped on the managed side; normalized after unescaping
+                    // in ExecuteCmd so the escape sequences stay intact here.
                     if (navUrl.empty()) return;
                     PushCmd(CmdType::Navigate, id, navUrl);
+                } else if (cmd == "JsDialogResult") {
+                    // arg = "{id}|{dialogId}|{accept}|{text}"
+                    int id; std::string payload;
+                    if (!splitId(arg, id, payload)) return;
+                    PushCmd(CmdType::JsDialogResult, id, payload);
                 } else if (cmd == "Reload" || cmd == "Stop" || cmd == "EmbedDone" ||
                            cmd == "Back" || cmd == "Forward" ||
                            cmd == "StopFind" || cmd == "DevTools") {
@@ -872,60 +1312,46 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 }
             },
             [&]() {
-                SetEvent(g_shutdownEvent);   // host disconnected → shut down
+                RequestShutdown();   // host disconnected → shut down
             },
             [&]() {
-                // No handshake needed: Ready events are sent per browser after Create.
+                // Handshake: the managed client verifies the version before it
+                // relies on escaped fields / JS dialog round-trips.
+                SendEv("Hello|" + std::to_string(proto::kVersion));
             }
         );
     } else {
-        if (g_browserHwnd)
-            ShowWindow(g_browserHwnd, SW_SHOW);
+        if (g_browserWindow)
+            ShowNativeWindow(g_browserWindow, true);
     }
 
     // ---- Step 7: Main message pump (event-driven external_message_pump) ----
-    // Blocks on {shutdown, pump-wake} + Win32 input. Wakes for: CEF scheduled work,
-    // IPC commands/resizes (WakePump), OS messages. Idle = 0% CPU.
+    // Blocks until shutdown, CEF-scheduled work, IPC commands, or native input.
+    // Idle = 0% CPU.
     bool running = true;
     while (running) {
         uint32_t genBefore = PumpGenSnapshot();
-        DWORD waitMs = PumpWaitTimeoutMs();
+        uint32_t waitMs = PumpWaitTimeoutMs();
 
-        HANDLE waits[2] = { g_shutdownEvent, g_pumpWakeEvent };
-        DWORD wr = MsgWaitForMultipleObjectsEx(2, waits, waitMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-
-        if (wr == WAIT_OBJECT_0)
-            break;                                   // shutdown requested
-
-        // Drain pending Win32 messages
-        MSG msg;
-        bool haveMsgs = false;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            haveMsgs = true;
-            if (msg.message == WM_QUIT) { running = false; break; }
-            if (standalone && msg.message == WM_CLOSE) {
-                SetEvent(g_shutdownEvent);
-                running = false;
-                break;
-            }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        auto result = WaitForPump(waitMs);
+        if (result == PumpWaitResult::Shutdown)
+            break;
 
         // IPC commands (PushCmd woke the pump)
         for (;;) {
             auto c = PopCmd();
-            if (c.type == CmdType::None) break;
+            if (c.type == CmdType::Nop) break;
             ExecuteCmd(c);
         }
 
-        // CEF work: due timer elapsed, or new work was scheduled, or OS input arrived
+        // CEF work: due timer elapsed, or new work was scheduled, or native input
         bool timerDue = false;
         {
             std::lock_guard<std::mutex> lock(g_pumpMutex);
-            if (g_pumpDueTick != 0 && GetTickCount64() >= g_pumpDueTick) { g_pumpDueTick = 0; timerDue = true; }
+            if (g_pumpDueTick != 0 && NowMs() >= g_pumpDueTick) { g_pumpDueTick = 0; timerDue = true; }
         }
-        if (timerDue || PumpGenSnapshot() != genBefore || haveMsgs || wr == WAIT_OBJECT_0 + 1)
+        if (timerDue || PumpGenSnapshot() != genBefore ||
+            result == PumpWaitResult::Wake || result == PumpWaitResult::Message)
             CefDoMessageLoopWork();
     }
 
@@ -948,9 +1374,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     // Gracefully close every remaining browser FIRST (server still up for events),
     // then tear down stdio LAST — Stop() unblocks the reader via CancelIoEx.
+    // Answer anything still waiting on a JS dialog: CloseBrowser(true) would
+    // otherwise block until the renderer is answered.
+    {
+        std::lock_guard<std::mutex> lock(g_browsersMutex);
+        for (auto& [k, inst] : g_browsers) {
+            if (inst.handler)
+                inst.handler->DismissAllDialogs();
+        }
+    }
+
     RequestCloseAllBrowsers();
     {
-        ULONGLONG deadline = GetTickCount64() + 5000;
+        uint64_t deadline = NowMs() + 5000;
         for (;;) {
             bool empty = false;
             {
@@ -958,37 +1394,55 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 empty = g_browsers.empty();
             }
             if (empty) break;
-            ULONGLONG now = GetTickCount64();
+            uint64_t now = NowMs();
             if (now >= deadline) break;
 
-            DWORD waitMs = PumpWaitTimeoutMs();
-            if (waitMs > (DWORD)(deadline - now)) waitMs = (DWORD)(deadline - now);
+            uint32_t waitMs = PumpWaitTimeoutMs();
+            if (waitMs > (uint32_t)(deadline - now)) waitMs = (uint32_t)(deadline - now);
             if (waitMs > 50) waitMs = 50;
             uint32_t genBefore = PumpGenSnapshot();
 
-            MSG msg;
-            bool haveMsgs = false;
-            if (MsgWaitForMultipleObjectsEx(0, nullptr, waitMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
-                == WAIT_OBJECT_0) {
-                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                    haveMsgs = true;
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
+            auto result = WaitForPump(waitMs);
 
             bool timerDue = false;
             {
                 std::lock_guard<std::mutex> lock(g_pumpMutex);
-                if (g_pumpDueTick != 0 && GetTickCount64() >= g_pumpDueTick) { g_pumpDueTick = 0; timerDue = true; }
+                if (g_pumpDueTick != 0 && NowMs() >= g_pumpDueTick) { g_pumpDueTick = 0; timerDue = true; }
             }
-            if (timerDue || PumpGenSnapshot() != genBefore || haveMsgs)
+            if (timerDue || PumpGenSnapshot() != genBefore ||
+                result == PumpWaitResult::Wake || result == PumpWaitResult::Message)
                 CefDoMessageLoopWork();
         }
     }
 
-    if (g_hiddenParent) DestroyWindow(g_hiddenParent);
+    if (ps) {
+        ps->Stop();
+        delete ps;
+        ps = nullptr;
+        g_stdioServer = nullptr;
+    }
+
+    DestroyNativeWindow(g_hiddenParent);
 
     CefShutdown();
+
+#if defined(__linux__)
+    if (g_xdisplay) {
+        XCloseDisplay(g_xdisplay);
+        g_xdisplay = nullptr;
+    }
+#endif
+
     return 0;
 }
+
+#if defined(_WIN32)
+int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    return RunMain(__argc, __argv, hInstance);
+}
+#else
+int main(int argc, char** argv) {
+    XInitThreads();
+    return RunMain(argc, argv);
+}
+#endif

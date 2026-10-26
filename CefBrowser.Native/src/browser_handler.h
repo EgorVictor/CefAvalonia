@@ -9,6 +9,8 @@
 #include "include/cef_dialog_handler.h"
 #include <string>
 #include <functional>
+#include <map>
+#include <mutex>
 #include <vector>
 
 class BrowserHandler : public CefClient,
@@ -107,12 +109,19 @@ public:
                       CefRefPtr<CefFileDialogCallback> callback) override;
 
     // Public accessors
-    HWND GetBrowserHwnd() const { return browser_hwnd_; }
+    CefWindowHandle GetBrowserWindowHandle() const { return browser_window_; }
     CefRefPtr<CefBrowser> GetBrowser() const { return browser_; }
     void SetBrowserId(int id) { browser_id_ = id; }
 
+    // Resolves a pending JavaScript dialog. Returns false when the id is unknown
+    // (already answered, or the dialog was closed with the browser).
+    bool ResolveJsDialog(int dialog_id, bool accept, const std::string& text);
+
+    // Answers every outstanding dialog with "dismiss" so shutdown cannot hang.
+    void DismissAllDialogs();
+
     // Callbacks
-    std::function<void(HWND)> OnBrowserReady;
+    std::function<void(CefWindowHandle)> OnBrowserReady;
     std::function<void(const std::string&)> OnAddressChanged;
     std::function<void(const std::string&)> OnLoadErrorEvent;
     std::function<void()> OnBrowserClosed;
@@ -121,10 +130,23 @@ public:
     std::function<void(const std::string&)> OnBeforePopupCB;
     std::function<void(const std::string&)> OnDownloadEvent;
 
+    // Set by the host: (dialog_id, type, message, default_text). When unset the
+    // handler falls back to native OS dialogs (standalone mode).
+    std::function<void(int, const std::string&, const std::string&, const std::string&)> OnJsDialog;
+
 private:
+    struct PendingDialog {
+        CefRefPtr<CefJSDialogCallback> callback;
+    };
+
+    static int NextDialogId();
+
     CefRefPtr<CefBrowser> browser_;
-    HWND browser_hwnd_ = nullptr;
+    CefWindowHandle browser_window_ = 0;
     int browser_id_ = 0;
+
+    std::mutex dialog_mutex_;
+    std::map<int, PendingDialog> pending_dialogs_;
 
     IMPLEMENT_REFCOUNTING(BrowserHandler);
 };

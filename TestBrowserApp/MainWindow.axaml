@@ -141,7 +141,7 @@
 
     <!-- 地址栏 + 查找条 -->
     <Border Grid.Row="1" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
-      <Grid RowDefinitions="*,Auto">
+      <Grid RowDefinitions="Auto,Auto">
 
         <!-- 地址栏行 -->
         <DockPanel Grid.Row="0" VerticalAlignment="Center" Margin="12,6">

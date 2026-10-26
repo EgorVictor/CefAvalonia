@@ -11,237 +11,506 @@ using System.Threading.Tasks;
 namespace CefSharp.Avalonia;
 
 /// <summary>
-/// Shared native host process (Chrome-style): ONE CefBrowser.Native.exe hosts
-/// N browser instances. Shared across browsers: GPU process, network service,
-/// storage service. Isolated per browser: renderer + optional cache dir.
-/// Ref-counted: the process starts on first AddRef and exits after Quit when
-/// the last browser releases (grace period 5s, then hard kill).
-/// Protocol v2: every command/event carries a browser id.
+/// Shared native host process (Chrome-style): ONE CefBrowser.Native executable
+/// hosts N browser instances. Shared across browsers: GPU process, network
+/// service, storage service. Isolated per browser: renderer + optional cache dir.
+///
+/// Lifecycle:
+///   * The process starts on the first <see cref="AddRef"/> and stays alive while
+///     the application is running (closing a tab only releases its slot).
+///   * If the process dies (crash, external kill) every registered sink is
+///     notified once and the host instance is discarded, so the next
+///     <see cref="GetOrCreate"/> starts a brand new process.
 /// </summary>
 public sealed class CefHostProcess : IDisposable
 {
     private static readonly object Gate = new();
-    private static readonly Dictionary<string, CefHostProcess> Instances = new();
+    private static readonly Dictionary<string, CefHostProcess> Instances =
+        new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
 
-    /// <summary>Get or create the shared host for a given native exe path.</summary>
-    public static CefHostProcess GetOrCreate(string exePath)
+    private sealed class Outbound
     {
-        lock (Gate)
+        public Outbound(string line, bool awaitWrite)
         {
-            var key = Path.GetFullPath(exePath);
-            if (!Instances.TryGetValue(key, out var host))
-            {
-                host = new CefHostProcess(exePath);
-                Instances[key] = host;
-            }
-            return host;
+            Line = line;
+            Completion = awaitWrite
+                ? new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
+                : null;
         }
+
+        public string Line { get; }
+        public TaskCompletionSource<bool>? Completion { get; }
     }
 
     private readonly string _exePath;
+    private readonly object _sync = new();
     private readonly Dictionary<int, BrowserProcessManager> _sinks = new();
-    private readonly Channel<string> _sendChannel = Channel.CreateBounded<string>(
-        new BoundedChannelOptions(256) { SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest });
 
+    private Channel<Outbound>? _channel;
     private Process? _process;
     private StreamWriter? _stdin;
-    private int _nextId;
-    private int _refs;
     private Task? _writerTask;
     private Task? _readerTask;
-    private static readonly string DiagLogPath = Path.Combine(AppContext.BaseDirectory, "cef_browser_diag.log");
+    private int _nextId;
+    private int _refs;
+    private int _generation;
+    private bool _disposed;
+    /// <summary>Process-level arguments of the first (host-creating) browser, used to warn on mismatches.</summary>
+    private string? _initialProcessArgs;
+    private bool _shutdownRequested;
+    /// <summary>Protocol version reported by the native host, or 0 before the handshake.</summary>
+    public int ProtocolVersion { get; private set; }
 
     private CefHostProcess(string exePath)
     {
         _exePath = exePath;
     }
 
-    /// <summary>
-    /// Register a sink and allocate its browser id. Starts the host process on
-    /// the first registration using the supplied process-level args
-    /// (--cef-cache-path must be stripped by the caller; it is per-browser now).
-    /// </summary>
-    public int AddRef(BrowserProcessManager sink, string processArgs)
+    static CefHostProcess()
     {
-        int id;
-        lock (_sinks)
+        // Last-resort cleanup so a consumer that forgets to call ShutdownAll does
+        // not leave an orphaned CefBrowser.Native (and its renderer children).
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
         {
-            id = ++_nextId;
-            _sinks[id] = sink;
-            _refs++;
-
-            if (_process == null)
-                StartProcess(processArgs);
-        }
-        return id;
+            try { ShutdownAll(1500); }
+            catch { /* process is going away */ }
+        };
     }
 
-    private void StartProcess(string processArgs)
+    /// <summary>True while the native process is running.</summary>
+    public bool IsRunning
     {
+        get
+        {
+            lock (_sync)
+                return !_disposed && _process is { HasExited: false };
+        }
+    }
+
+    /// <summary>
+    /// Get the shared host for a native executable path, creating a fresh
+    /// instance when the previous one has crashed or been disposed.
+    /// </summary>
+    public static CefHostProcess GetOrCreate(string exePath)
+    {
+        string key = Path.GetFullPath(exePath);
+        lock (Gate)
+        {
+            if (Instances.TryGetValue(key, out CefHostProcess? existing) && existing.IsRunning)
+                return existing;
+
+            // A dead instance is replaced. Its Exited handler is generation-guarded,
+            // so it will not disturb the new instance.
+            var host = new CefHostProcess(exePath);
+            Instances[key] = host;
+            return host;
+        }
+    }
+
+    /// <summary>
+    /// Register a sink and allocate its browser id. Starts the host process on
+    /// the first registration using the supplied process-level arguments.
+    /// Throws <see cref="InvalidOperationException"/> when the executable cannot
+    /// be started.
+    /// </summary>
+    public int AddRef(BrowserProcessManager sink, IReadOnlyList<string> processArguments)
+    {
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (_process == null || _process.HasExited)
+            {
+                StartProcessLocked(processArguments);
+            }
+            else
+            {
+                // The host is already running on the first WebView's process-level
+                // settings. Later browsers that request different process-level
+                // settings cannot change them (CEF settings are per-process), so
+                // surface the mismatch instead of silently ignoring it.
+                string joined = string.Join(" ", processArguments);
+                if (_initialProcessArgs != null && _initialProcessArgs != joined)
+                {
+                    CefDiagnostics.Warn(
+                        $"[CefHost] process-level CefSettings from this WebView differ from the first " +
+                        $"instance; only the first instance's settings take effect. this=[{joined}] first=[{_initialProcessArgs}]");
+                }
+            }
+
+            int id = ++_nextId;
+            _sinks[id] = sink;
+            _refs++;
+            return id;
+        }
+    }
+
+    private void StartProcessLocked(IReadOnlyList<string> processArguments)
+    {
+        // Discard state belonging to the previous (dead) process.
+        CleanupProcessLocked();
+
+        if (!File.Exists(_exePath))
+            throw new FileNotFoundException(
+                $"Native browser host not found: {_exePath}. Build CefBrowser.Native or set the native binaries path.",
+                _exePath);
+
         var psi = new ProcessStartInfo
         {
             FileName = _exePath,
-            Arguments = processArgs,
             WorkingDirectory = AppContext.BaseDirectory,
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
-            StandardOutputEncoding = Encoding.UTF8
+            StandardOutputEncoding = new UTF8Encoding(false),
+            StandardErrorEncoding = new UTF8Encoding(false),
+            StandardInputEncoding = new UTF8Encoding(false),
         };
 
-        _process = Process.Start(psi);
-        if (_process == null)
-            throw new InvalidOperationException("Failed to start CefBrowser.Native.exe host process");
+        foreach (string arg in processArguments)
+            psi.ArgumentList.Add(arg);
 
-        _stdin = _process.StandardInput;
-
-        // stderr → diag file (native DIAG logs are gated by CEF_DIAG=1)
-        _ = Task.Run(async () =>
+        if (!OperatingSystem.IsWindows())
         {
-            try
+            TryMakeExecutable(_exePath);
+
+            // libcef.so and friends live next to the native executable.
+            string nativeDir = Path.GetDirectoryName(_exePath) ?? AppContext.BaseDirectory;
+            string oldLibPath = Environment.GetEnvironmentVariable("LD_LIBRARY_PATH") ?? "";
+            psi.Environment["LD_LIBRARY_PATH"] = oldLibPath.Length == 0
+                ? nativeDir
+                : nativeDir + ":" + oldLibPath;
+        }
+
+        Process process = Process.Start(psi)
+            ?? throw new InvalidOperationException(
+                $"Failed to start {Path.GetFileName(_exePath)} host process");
+
+        _process = process;
+        _stdin = process.StandardInput;
+        _stdin.AutoFlush = false;
+        _shutdownRequested = false;
+        ProtocolVersion = 0;
+        _initialProcessArgs = string.Join(" ", processArguments);
+
+        Channel<Outbound> channel = Channel.CreateBounded<Outbound>(
+            new BoundedChannelOptions(512)
             {
-                using var err = _process.StandardError;
-                string? line;
-                while ((line = await err.ReadLineAsync()) != null)
-                {
-                    try { await File.AppendAllTextAsync(DiagLogPath, line + "\n"); } catch { }
-                }
-            }
-            catch { }
-        });
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
 
-        _writerTask = Task.Run(WriterThreadProc);
-        _readerTask = Task.Run(ReaderThreadProc);
+        _channel = channel;
+        int generation = ++_generation;
 
-        _process.EnableRaisingEvents = true;
-        _process.Exited += (_, _) =>
-        {
-            Debug.WriteLine("[CefHost] Host process exited");
-            BroadcastCrashed();
-        };
+        _writerTask = Task.Run(() => WriterLoopAsync(generation, channel, _stdin));
+        _readerTask = Task.Run(() => ReaderLoopAsync(generation, process));
+        _ = Task.Run(() => DrainStderrAsync(generation, process));
+
+        process.EnableRaisingEvents = true;
+        process.Exited += (_, _) => HandleProcessExit(generation, "native host process exited");
+
+        CefDiagnostics.Info(
+            $"[CefHost] started pid={process.Id} exe={_exePath} args={string.Join(' ', processArguments)}");
     }
 
-    private async Task WriterThreadProc()
+    private static void TryMakeExecutable(string path)
+    {
+        if (!OperatingSystem.IsLinux()) return;
+
+        try
+        {
+            UnixFileMode mode = File.GetUnixFileMode(path);
+            File.SetUnixFileMode(path, mode | UnixFileMode.UserExecute |
+                UnixFileMode.GroupExecute | UnixFileMode.OtherExecute);
+        }
+        catch (Exception ex)
+        {
+            CefDiagnostics.Warn($"[CefHost] chmod failed for {path}: {ex.Message}");
+        }
+    }
+
+    private async Task WriterLoopAsync(int generation, Channel<Outbound> channel, StreamWriter stdin)
     {
         try
         {
-            await foreach (var msg in _sendChannel.Reader.ReadAllAsync())
+            while (await channel.Reader.WaitToReadAsync().ConfigureAwait(false))
             {
-                if (_stdin == null) break;
-                try
+                while (channel.Reader.TryRead(out Outbound? message))
                 {
-                    await _stdin.WriteLineAsync(msg);
-                    Debug.WriteLine($"[CefHost] Sent: {msg}");
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"[CefHost] Write error: {ex.Message}");
-                    break;
+                    try
+                    {
+                        await stdin.WriteLineAsync(message.Line).ConfigureAwait(false);
+                        await stdin.FlushAsync().ConfigureAwait(false);
+                        message.Completion?.TrySetResult(true);
+                    }
+                    catch (Exception ex)
+                    {
+                        message.Completion?.TrySetResult(false);
+                        CefDiagnostics.Error($"[CefHost] write failed: {ex.Message}");
+                        channel.Writer.TryComplete();
+                        return;
+                    }
                 }
             }
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[CefHost] WriterThread error: {ex}");
+            if (generation == _generation)
+                CefDiagnostics.Error($"[CefHost] writer loop failed: {ex.Message}");
+        }
+        finally
+        {
+            // Never leave callers awaiting a write that will not happen.
+            while (channel.Reader.TryRead(out Outbound? pending))
+                pending.Completion?.TrySetResult(false);
         }
     }
 
-    private async Task ReaderThreadProc()
+    private async Task ReaderLoopAsync(int generation, Process process)
     {
         try
         {
-            var stdout = _process!.StandardOutput;
-            string? line;
-            while ((line = await stdout.ReadLineAsync()) != null)
+            StreamReader stdout = process.StandardOutput;
+            while (true)
             {
-                if (string.IsNullOrEmpty(line)) continue;
+                string? line = await stdout.ReadLineAsync().ConfigureAwait(false);
+                if (line == null) break;
+                if (line.Length == 0) continue;
+
+                if (line.StartsWith("Hello|", StringComparison.Ordinal))
+                {
+                    if (int.TryParse(line.AsSpan(6), out int version))
+                    {
+                        ProtocolVersion = version;
+                        if (version != CefProtocol.Version)
+                        {
+                            CefDiagnostics.Error(
+                                $"[CefHost] protocol mismatch: native={version} managed={CefProtocol.Version}");
+                        }
+                    }
+                    continue;
+                }
+
                 Dispatch(line);
             }
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[CefHost] ReaderThread error: {ex.Message}");
+            CefDiagnostics.Warn($"[CefHost] reader loop ended: {ex.Message}");
         }
 
-        BroadcastCrashed();
+        HandleProcessExit(generation, "native host stdout closed");
     }
 
-    /// <summary>Parse "Event|{id}|{rest...}" and route to the owning sink.</summary>
+    private async Task DrainStderrAsync(int generation, Process process)
+    {
+        try
+        {
+            StreamReader stderr = process.StandardError;
+            while (true)
+            {
+                string? line = await stderr.ReadLineAsync().ConfigureAwait(false);
+                if (line == null) break;
+                if (generation != _generation) return;
+                CefDiagnostics.Debug($"[native] {line}");
+            }
+        }
+        catch
+        {
+            // The process is gone; nothing to do.
+        }
+    }
+
+    /// <summary>Parse "Event|{id}|{rest...}" and route it to the owning sink.</summary>
     private void Dispatch(string line)
     {
         try
         {
-            var sep1 = line.IndexOf('|');
-            if (sep1 < 0) return;
-            var ev = line[..sep1];
+            int sep = line.IndexOf('|');
+            if (sep <= 0) return;
 
-            var sep2 = line.IndexOf('|', sep1 + 1);
-            if (sep2 < 0) return;
-            if (!int.TryParse(line[(sep1 + 1)..sep2], out var id)) return;
-            var rest = sep2 + 1 <= line.Length ? line[(sep2 + 1)..] : "";
+            string ev = line[..sep];
+            string tail = line[(sep + 1)..];
+
+            // Events may or may not carry a payload: "DownloadCanceled|3" has no
+            // rest, while "AddressChanged|3|https://..." does.
+            int idSep = tail.IndexOf('|');
+            int id;
+            string rest;
+            if (idSep < 0)
+            {
+                if (!int.TryParse(tail, out id)) return;
+                rest = "";
+            }
+            else
+            {
+                if (!int.TryParse(tail.AsSpan(0, idSep), out id)) return;
+                rest = tail[(idSep + 1)..];
+            }
 
             BrowserProcessManager? sink;
-            lock (_sinks)
+            lock (_sync)
             {
                 _sinks.TryGetValue(id, out sink);
             }
+
             sink?.HandleHostEvent(ev, rest);
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[CefHost] Dispatch error: {ex} line={line}");
+            CefDiagnostics.Error($"[CefHost] failed to dispatch '{line}': {ex.Message}");
         }
     }
 
-    internal void TrySend(string line) => _sendChannel.Writer.TryWrite(line);
-
-    private void BroadcastCrashed()
+    private void HandleProcessExit(int generation, string reason)
     {
         BrowserProcessManager[] sinks;
-        lock (_sinks)
+        Process? process;
+        StreamWriter? stdin;
+
+        lock (_sync)
         {
-            sinks = new BrowserProcessManager[_sinks.Count];
-            _sinks.Values.CopyTo(sinks, 0);
+            if (generation != _generation) return;
+            if (_process == null && _channel == null) return;
+
+            bool expected = _shutdownRequested;
+
+            process = _process;
+            stdin = _stdin;
+            _process = null;
+            _stdin = null;
+            _channel?.Writer.TryComplete();
+            _channel = null;
+            _refs = 0;
+
+            sinks = _sinks.Values.ToArray();
+            _sinks.Clear();
+
+            if (!expected)
+                CefDiagnostics.Error($"[CefHost] {reason} (pid={(process?.Id.ToString() ?? "?")})");
+
+            try { stdin?.Dispose(); } catch { /* ignore */ }
+            try { process?.Dispose(); } catch { /* ignore */ }
         }
-        foreach (var s in sinks)
-            s.OnHostExited();
+
+        // Removing the instance takes the static Gate. Do it outside _sync so
+        // GetOrCreate (Gate -> IsRunning -> _sync) can never deadlock with us.
+        RemoveInstance();
+
+        foreach (BrowserProcessManager sink in sinks)
+            sink.OnHostExited(reason);
+    }
+
+    private void RemoveInstance()
+    {
+        string key = Path.GetFullPath(_exePath);
+        lock (Gate)
+        {
+            if (Instances.TryGetValue(key, out CefHostProcess? current) && ReferenceEquals(current, this))
+                Instances.Remove(key);
+        }
+    }
+
+    private void CleanupProcessLocked()
+    {
+        try { _channel?.Writer.TryComplete(); } catch { /* ignore */ }
+        try { _stdin?.Dispose(); } catch { /* ignore */ }
+        try
+        {
+            if (_process is { HasExited: false })
+                _process.Kill(entireProcessTree: true);
+        }
+        catch { /* ignore */ }
+        try { _process?.Dispose(); } catch { /* ignore */ }
+
+        _channel = null;
+        _stdin = null;
+        _process = null;
     }
 
     /// <summary>
-    /// Unregister a browser. The host process itself is NOT terminated here:
-    /// it lives until an explicit <see cref="RequestShutdown"/> or stdin EOF
-    /// (parent app process death). Closing the last tab just frees its browser,
-    /// leaving the shared host ready for the next tab.
+    /// Fire-and-forget send. Returns false when the host is not running or the
+    /// outbound queue is full (the command was <b>not</b> sent).
     /// </summary>
+    public bool TrySend(string line)
+    {
+        Channel<Outbound>? channel = _channel;
+        if (channel == null) return false;
+        if (channel.Writer.TryWrite(new Outbound(line, awaitWrite: false))) return true;
+
+        CefDiagnostics.Warn("[CefHost] outbound queue is full; command dropped");
+        return false;
+    }
+
+    /// <summary>
+    /// Sends a command and completes when the bytes have been flushed to the
+    /// native process. Returns false on timeout or when the host is gone.
+    /// </summary>
+    public async Task<bool> SendAsync(string line, CancellationToken cancellationToken = default,
+        TimeSpan? timeout = null)
+    {
+        Channel<Outbound>? channel = _channel;
+        if (channel == null) return false;
+
+        var message = new Outbound(line, awaitWrite: true);
+        if (!channel.Writer.TryWrite(message))
+        {
+            CefDiagnostics.Warn("[CefHost] outbound queue is full; command dropped");
+            return false;
+        }
+
+        TimeSpan effectiveTimeout = timeout ?? TimeSpan.FromSeconds(10);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(effectiveTimeout);
+
+        try
+        {
+            return await message.Completion!.Task.WaitAsync(cts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            CefDiagnostics.Warn($"[CefHost] command timed out after {effectiveTimeout.TotalSeconds:0.#}s");
+            return false;
+        }
+    }
+
+    /// <summary>Unregister a browser slot. The host process itself stays alive.</summary>
     public void Release(int id)
     {
-        lock (_sinks)
+        lock (_sync)
         {
-            _sinks.Remove(id);
-            _refs--;
+            if (_sinks.Remove(id))
+                _refs--;
         }
     }
 
     /// <summary>
-    /// Explicit whole-host shutdown (e.g. app-level teardown): tells native to
-    /// close all browsers and exit. Normally unnecessary — stdin EOF on process
-    /// exit triggers the same clean path.
+    /// Ask the native host to close all browsers and exit. Safe to call more
+    /// than once; a hard kill is the caller's responsibility (see ShutdownAll).
     /// </summary>
     public void RequestShutdown()
     {
-        TrySend("Quit");
-        _sendChannel.Writer.TryComplete();
+        lock (_sync)
+        {
+            if (_shutdownRequested) return;
+            _shutdownRequested = true;
+        }
+
+        // Route Quit through the writer loop: StreamWriter is not thread-safe and
+        // must never be written to from two threads at once.
+        if (!TrySend("Quit"))
+            CefDiagnostics.Debug("[CefHost] Quit could not be queued (host already closing)");
     }
 
     /// <summary>
-    /// App-exit hook: asks every host to shut down, gives each a short grace
-    /// period, then force-kills survivors. Without this, CefBrowser.Native.exe
-    /// can outlive the app (e.g. when Avalonia's exit path closes the pipe
-    /// before the native side observes stdin EOF).
+    /// Application-exit hook: asks every host to shut down, gives each a short
+    /// grace period, then force-kills survivors.
     /// </summary>
-    public static void ShutdownAll(int graceMs = 2000)
+    public static void ShutdownAll(int graceMs = 3000)
     {
         CefHostProcess[] hosts;
         lock (Gate)
@@ -250,39 +519,49 @@ public sealed class CefHostProcess : IDisposable
             Instances.Clear();
         }
 
-        foreach (var h in hosts)
+        foreach (CefHostProcess host in hosts)
         {
-            try { h.RequestShutdown(); }
-            catch (Exception ex) { Debug.WriteLine($"[CefHost] ShutdownAll request error: {ex.Message}"); }
+            try { host.RequestShutdown(); }
+            catch (Exception ex) { CefDiagnostics.Warn($"[CefHost] shutdown request failed: {ex.Message}"); }
         }
 
-        foreach (var h in hosts)
+        foreach (CefHostProcess host in hosts)
         {
             try
             {
-                if (h._process != null && !h._process.WaitForExit(graceMs))
+                Process? process = host._process;
+                if (process != null && !process.WaitForExit(graceMs))
                 {
-                    Debug.WriteLine("[CefHost] Host did not exit in time, killing");
-                    h._process.Kill(entireProcessTree: true);
+                    CefDiagnostics.Warn("[CefHost] process did not exit in time; killing");
+                    process.Kill(entireProcessTree: true);
                 }
             }
-            catch (Exception ex) { Debug.WriteLine($"[CefHost] ShutdownAll kill error: {ex.Message}"); }
+            catch (Exception ex)
+            {
+                CefDiagnostics.Warn($"[CefHost] shutdown wait failed: {ex.Message}");
+            }
+
+            host.Dispose();
         }
     }
 
     public void Dispose()
     {
-        // Force path: only used in exceptional situations.
-        try
+        Process? process;
+
+        lock (_sync)
         {
-            _process?.Kill(entireProcessTree: true);
+            if (_disposed) return;
+            _disposed = true;
+            _shutdownRequested = true;
+
+            process = _process;
+            CleanupProcessLocked();
         }
-        catch { }
-        lock (Gate)
-        {
-            var key = Path.GetFullPath(_exePath);
-            if (Instances.TryGetValue(key, out var cur) && cur == this)
-                Instances.Remove(key);
-        }
+
+        RemoveInstance();
+
+        try { process?.Kill(entireProcessTree: true); } catch { /* ignore */ }
+        try { process?.Dispose(); } catch { /* ignore */ }
     }
 }
