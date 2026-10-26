@@ -2,7 +2,7 @@
 
 基于 **CEF (Chromium Embedded Framework)** 的 .NET Avalonia 浏览器控件，通过 C++ 原生子进程 + **stdio（标准输入/输出）IPC** 实现嵌入式浏览器 HWND 托管。
 
-支持 **Windows**（x64）与 **Linux**（x64，需 `chrome-sandbox` 或显式关闭沙箱）。目标框架为 **.NET 8**（.NET 8 本身不支持 Windows 7，请勿在 Win7 上部署）。
+支持 **Windows**（x64）与 **Linux**（x64，需 `chrome-sandbox` 或显式关闭沙箱）。目标框架为 **.NET 8**。
 
 ## 简介
 
