@@ -7,6 +7,7 @@
 #include "include/cef_download_item.h"
 #include "include/cef_jsdialog_handler.h"
 #include "include/cef_dialog_handler.h"
+#include "include/cef_render_handler.h"
 #include <string>
 #include <functional>
 #include <map>
@@ -19,7 +20,8 @@ class BrowserHandler : public CefClient,
                        public CefDisplayHandler,
                        public CefDownloadHandler,
                        public CefJSDialogHandler,
-                       public CefDialogHandler {
+                       public CefDialogHandler,
+                       public CefRenderHandler {
 public:
     BrowserHandler();
 
@@ -108,6 +110,36 @@ public:
                       const std::vector<CefString>& accept_filters,
                       CefRefPtr<CefFileDialogCallback> callback) override;
 
+    // ---- Off-screen rendering (OSR) ----
+    //
+    // Used on Linux, where embedding a native child window into Avalonia's X11
+    // window is unreliable: Chromium cannot create an EGL surface for a child of
+    // Avalonia's window (EGL_BAD_NATIVE_WINDOW), so the window is destroyed
+    // right after creation and the control stays blank/transparent.
+    //
+    // In OSR mode CEF renders into a POSIX shared memory segment
+    // (/dev/shm/cef_osr_{id}, BGRA, width*height*4 bytes) that the managed side
+    // maps directly and blits into a bitmap — no X11 child window involved.
+    void EnableOsr(int id, int width, int height);
+    bool IsOsr() const { return osr_enabled_; }
+    void SetOsrSize(int width, int height);
+
+    // (w, h, dirtyX, dirtyY, dirtyW, dirtyH) — pixels are already in the shm
+    // segment when this fires.
+    std::function<void(int, int, int, int, int, int)> OnPaintEvent;
+    // (w, h) — the shm segment was (re)created; the managed side must re-map it.
+    std::function<void(int, int)> OnOsrBufferEvent;
+
+    // CefRenderHandler (only called in OSR mode)
+    CefRefPtr<CefRenderHandler> GetRenderHandler() override;
+    void GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect) override;
+    void OnPaint(CefRefPtr<CefBrowser> browser,
+                 PaintElementType type,
+                 const RectList& dirtyRects,
+                 const void* buffer,
+                 int width,
+                 int height) override;
+
     // Public accessors
     CefWindowHandle GetBrowserWindowHandle() const { return browser_window_; }
     CefRefPtr<CefBrowser> GetBrowser() const { return browser_; }
@@ -147,6 +179,16 @@ private:
 
     std::mutex dialog_mutex_;
     std::map<int, PendingDialog> pending_dialogs_;
+
+    // OSR state
+    bool osr_enabled_ = false;
+    int osr_width_ = 1;
+    int osr_height_ = 1;
+    std::string osr_shm_name_;
+    int osr_fd_ = -1;
+    void* osr_buffer_ = nullptr;
+    size_t osr_buffer_size_ = 0;
+    std::mutex osr_mutex_;
 
     IMPLEMENT_REFCOUNTING(BrowserHandler);
 };

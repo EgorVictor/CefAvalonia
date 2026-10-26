@@ -181,12 +181,13 @@ public sealed class ExternalBrowserProcessHost : NativeControlHost
                 if (_xDisplay == IntPtr.Zero || _x11HostWindow == IntPtr.Zero)
                     return;
 
-                // When the browser was created directly inside our host window it
-                // is already a child. Reparenting it onto the same parent again
-                // emits an unmap/map pair that can invalidate the native drawing
-                // surface, so only move it when it really lives somewhere else
-                // (tab-switch re-embed).
-                if (GetXParent(_xDisplay, childHwnd) != _x11HostWindow)
+                // Only move the window when we positively know its current parent
+                // and that parent differs. GetXParent() returns Zero when
+                // XQueryTree fails, which is NOT evidence that a reparent is
+                // needed — and a redundant unmap/map pair invalidates the native
+                // drawing surface (the window then stays blank).
+                IntPtr currentParent = GetXParent(_xDisplay, childHwnd);
+                if (currentParent != IntPtr.Zero && currentParent != _x11HostWindow)
                     XReparentWindow(_xDisplay, childHwnd, _x11HostWindow, 0, 0);
 
                 if (w > 0 && h > 0)

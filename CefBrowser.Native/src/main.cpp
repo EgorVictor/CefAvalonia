@@ -357,7 +357,9 @@ static std::string Base64Decode(const std::string& in) {
 // ---- Command queue (pipe thread -> main pump) ----
 enum class CmdType { Create, Navigate, Reload, Stop, CloseOne, Resize, EmbedDone, Quit,
                      Back, Forward, Zoom, Find, StopFind, DevTools, ExecJS,
-                     JsDialogResult, SetHostWindow, Nop };
+                     JsDialogResult, SetHostWindow,
+                     MouseMove, MouseDown, MouseUp, MouseWheel,
+                     KeyDown, KeyUp, KeyChar, SetFocus, Nop };
 struct Cmd { CmdType type; int id = 0; std::string arg; };
 static std::queue<Cmd> g_cmdQueue;
 static std::mutex g_cmdMutex;
@@ -881,14 +883,26 @@ static void DoCreateBrowser(int id, const std::string& cachePath, const std::str
         if (it != g_hostWindows.end()) { hostWindow = it->second; g_hostWindows.erase(it); }
     }
 
+    // On Linux we render off-screen (OSR): Chromium cannot create an EGL surface
+    // for a child of Avalonia's X11 window, so a native child window is created
+    // and then immediately destroyed, leaving the control blank. OSR renders into
+    // shared memory (/dev/shm/cef_osr_{id}) instead — no parent window at all.
+#if defined(__linux__)
+    const bool osr = true;
+#else
+    const bool osr = false;
+#endif
+
     CefWindowHandle parent = 0;
     bool ownsParent = false;
-    if (hostWindow) {
-        parent = hostWindow;
-    } else {
-        parent = CreateHiddenParentWindow(false, nullptr);
-        ownsParent = true;
-        if (!parent) { DiagLog("DIAG: [C++] Create id=%d parent window FAILED", id); SendEv("LoadError|" + std::to_string(id) + "|-100|CreateWindow failed|"); return; }
+    if (!osr) {
+        if (hostWindow) {
+            parent = hostWindow;
+        } else {
+            parent = CreateHiddenParentWindow(false, nullptr);
+            ownsParent = true;
+            if (!parent) { DiagLog("DIAG: [C++] Create id=%d parent window FAILED", id); SendEv("LoadError|" + std::to_string(id) + "|-100|CreateWindow failed|"); return; }
+        }
     }
 
     auto handler = new BrowserHandler();
@@ -944,6 +958,20 @@ static void DoCreateBrowser(int id, const std::string& cachePath, const std::str
                type + "|" + proto::Escape(message) + "|" + proto::Escape(defaultText));
     };
 
+    if (osr) {
+        handler->EnableOsr(id, 1280, 800);
+        handler->OnPaintEvent = [id](int w, int h, int dx, int dy, int dw, int dh) {
+            SendEv("Paint|" + std::to_string(id) + "|" + std::to_string(w) + "|" +
+                   std::to_string(h) + "|" + std::to_string(dx) + "|" +
+                   std::to_string(dy) + "|" + std::to_string(dw) + "|" +
+                   std::to_string(dh));
+        };
+        handler->OnOsrBufferEvent = [id](int w, int h) {
+            SendEv("OsrBuffer|" + std::to_string(id) + "|" + std::to_string(w) + "|" +
+                   std::to_string(h));
+        };
+    }
+
     CefRequestContextSettings rcs;
     CefRefPtr<CefRequestContext> requestCtx;
     if (!cachePath.empty()) {
@@ -952,15 +980,72 @@ static void DoCreateBrowser(int id, const std::string& cachePath, const std::str
     }
 
     CefWindowInfo wi;
-    wi.SetAsChild(parent, CefRect(0, 0, 1280, 800));
+    if (osr) {
+        wi.SetAsWindowless(0);   // transparent = false
+    } else {
+        wi.SetAsChild(parent, CefRect(0, 0, 1280, 800));
+    }
     CefBrowserSettings bs;
-    DiagLog("DIAG: [C++] CreateBrowserSync id=%d url=%s cache=%s", id, url.c_str(), cachePath.c_str());
+    DiagLog("DIAG: [C++] CreateBrowserSync id=%d url=%s cache=%s osr=%d", id, url.c_str(), cachePath.c_str(), osr ? 1 : 0);
 
     {
         std::lock_guard<std::mutex> lock(g_browsersMutex);
         g_browsers[id] = {id, handler, parent, ownsParent};
     }
     CefBrowserHost::CreateBrowserSync(wi, handler, url.empty() ? "about:blank" : url, bs, nullptr, requestCtx);
+}
+
+// ---- OSR input forwarding (posted to the CEF UI thread) ----
+
+static CefRefPtr<BrowserHandler> OsrGetHandler(int id) {
+    std::lock_guard<std::mutex> lock(g_browsersMutex);
+    auto it = g_browsers.find(id);
+    return it != g_browsers.end() ? it->second.handler : nullptr;
+}
+
+static void DoMouseMove(int id, int x, int y, uint32 mods) {
+    auto h = OsrGetHandler(id);
+    if (!h || !h->GetBrowser()) return;
+    CefMouseEvent ev;
+    ev.x = x; ev.y = y; ev.modifiers = mods;
+    h->GetBrowser()->GetHost()->SendMouseMoveEvent(ev, false);
+}
+
+static void DoMouseClick(int id, int x, int y, uint32 mods, int button, bool mouseUp, int clicks) {
+    auto h = OsrGetHandler(id);
+    if (!h || !h->GetBrowser()) return;
+    CefMouseEvent ev;
+    ev.x = x; ev.y = y; ev.modifiers = mods;
+    h->GetBrowser()->GetHost()->SendMouseClickEvent(
+        ev, static_cast<cef_mouse_button_type_t>(button), mouseUp, clicks);
+}
+
+static void DoMouseWheel(int id, int x, int y, uint32 mods, int dx, int dy) {
+    auto h = OsrGetHandler(id);
+    if (!h || !h->GetBrowser()) return;
+    CefMouseEvent ev;
+    ev.x = x; ev.y = y; ev.modifiers = mods;
+    h->GetBrowser()->GetHost()->SendMouseWheelEvent(ev, dx, dy);
+}
+
+static void DoKeyEvent(int id, int type, uint32 mods, int winCode, int nativeCode, int charCode) {
+    auto h = OsrGetHandler(id);
+    if (!h || !h->GetBrowser()) return;
+    CefKeyEvent ev;
+    ev.type = static_cast<cef_key_event_type_t>(type);
+    ev.modifiers = mods;
+    ev.windows_key_code = winCode;
+    ev.native_key_code = nativeCode;
+    ev.is_system_key = 0;
+    ev.character = static_cast<char16>(charCode);
+    ev.unmodified_character = static_cast<char16>(charCode);
+    h->GetBrowser()->GetHost()->SendKeyEvent(ev);
+}
+
+static void DoSetFocus(int id, bool focus) {
+    auto h = OsrGetHandler(id);
+    if (!h || !h->GetBrowser()) return;
+    h->GetBrowser()->GetHost()->SetFocus(focus);
 }
 
 static void ExecuteCmd(const Cmd& c) {
@@ -989,6 +1074,54 @@ static void ExecuteCmd(const Cmd& c) {
             DiagLog("DIAG: [C++] SetHostWindow id=%d hw=%llu", c.id, (unsigned long long)hw);
             break;
         }
+        case CmdType::MouseMove: {
+            // "{x}|{y}|{mods}"
+            auto f = proto::Split(c.arg, 3);
+            if (f.size() < 3) break;
+            CefPostTask(TID_UI, base::BindOnce(&DoMouseMove, c.id,
+                atoi(f[0].c_str()), atoi(f[1].c_str()), (uint32)strtoul(f[2].c_str(), nullptr, 0)));
+            break;
+        }
+        case CmdType::MouseDown:
+        case CmdType::MouseUp: {
+            // "{x}|{y}|{mods}|{button}|{clickCount}"
+            auto f = proto::Split(c.arg, 5);
+            if (f.size() < 5) break;
+            bool up = (c.type == CmdType::MouseUp);
+            CefPostTask(TID_UI, base::BindOnce(&DoMouseClick, c.id,
+                atoi(f[0].c_str()), atoi(f[1].c_str()), (uint32)strtoul(f[2].c_str(), nullptr, 0),
+                atoi(f[3].c_str()), up, atoi(f[4].c_str())));
+            break;
+        }
+        case CmdType::MouseWheel: {
+            // "{x}|{y}|{mods}|{dx}|{dy}"
+            auto f = proto::Split(c.arg, 5);
+            if (f.size() < 5) break;
+            CefPostTask(TID_UI, base::BindOnce(&DoMouseWheel, c.id,
+                atoi(f[0].c_str()), atoi(f[1].c_str()), (uint32)strtoul(f[2].c_str(), nullptr, 0),
+                atoi(f[3].c_str()), atoi(f[4].c_str())));
+            break;
+        }
+        case CmdType::KeyDown:
+        case CmdType::KeyUp:
+        case CmdType::KeyChar: {
+            // "{mods}|{winCode}|{nativeCode}|{charCode}" (type is implied by the
+            // command: KeyDown → RAWKEYDOWN, KeyUp → KEYUP, KeyChar → CHAR).
+            auto f = proto::Split(c.arg, 4);
+            if (f.size() < 4) break;
+            int type = c.type == CmdType::KeyDown ? 0
+                     : c.type == CmdType::KeyUp   ? 2
+                                                  : 3;
+            CefPostTask(TID_UI, base::BindOnce(&DoKeyEvent, c.id, type,
+                (uint32)strtoul(f[0].c_str(), nullptr, 0),
+                atoi(f[1].c_str()), atoi(f[2].c_str()), atoi(f[3].c_str())));
+            break;
+        }
+        case CmdType::SetFocus: {
+            bool focus = (c.arg == "1");
+            CefPostTask(TID_UI, base::BindOnce(&DoSetFocus, c.id, focus));
+            break;
+        }
         case CmdType::Navigate:
             {
                 std::string navUrl = NormalizeUrl(proto::Unescape(c.arg));
@@ -1007,22 +1140,37 @@ static void ExecuteCmd(const Cmd& c) {
             CefPostTask(TID_UI, base::BindOnce(&DoCloseBrowser, c.id));
             break;
         case CmdType::Resize: {
-            // "w|h" — apply directly to this browser's native window (latest wins)
-            CefWindowHandle target = 0;
-            {
-                std::lock_guard<std::mutex> lock(g_browsersMutex);
-                auto it = g_browsers.find(c.id);
-                if (it != g_browsers.end()) {
-                    // coalesce via per-instance dirty handled inline; direct move is fine here
-                    target = it->second.handler->GetBrowserWindowHandle();
-                }
-            }
-            if (!target) break;
+            // "w|h"
             auto sep2 = c.arg.find('|');
             if (sep2 == std::string::npos) break;
             int w = atoi(c.arg.substr(0, sep2).c_str());
             int h = atoi(c.arg.substr(sep2 + 1).c_str());
-            if (w > 0 && h > 0) MoveNativeWindow(target, w, h);
+            if (w <= 0 || h <= 0) break;
+
+            CefRefPtr<BrowserHandler> handler;
+            {
+                std::lock_guard<std::mutex> lock(g_browsersMutex);
+                auto it = g_browsers.find(c.id);
+                if (it != g_browsers.end()) handler = it->second.handler;
+            }
+            if (!handler) break;
+
+            if (handler->IsOsr()) {
+                handler->SetOsrSize(w, h);
+                CefPostTask(TID_UI, base::BindOnce([](int id) {
+                    CefRefPtr<BrowserHandler> h;
+                    {
+                        std::lock_guard<std::mutex> lock(g_browsersMutex);
+                        auto it = g_browsers.find(id);
+                        if (it != g_browsers.end()) h = it->second.handler;
+                    }
+                    if (h && h->GetBrowser() && h->GetBrowser()->GetHost())
+                        h->GetBrowser()->GetHost()->WasResized();
+                }, c.id));
+            } else {
+                CefWindowHandle target = handler->GetBrowserWindowHandle();
+                if (target) MoveNativeWindow(target, w, h);
+            }
             break;
         }
         case CmdType::EmbedDone: {
@@ -1357,6 +1505,25 @@ static int RunMain(int argc, char** argv
                     int id; std::string wh;
                     if (!splitId(arg, id, wh)) return;
                     PushCmd(CmdType::Resize, id, wh);
+                } else if (cmd == "MouseMove" || cmd == "MouseDown" ||
+                           cmd == "MouseUp" || cmd == "MouseWheel" ||
+                           cmd == "KeyDown" || cmd == "KeyUp" ||
+                           cmd == "KeyChar") {
+                    // arg = "{id}|...payload..." — OSR input, forwarded verbatim
+                    int id; std::string payload;
+                    if (!splitId(arg, id, payload)) return;
+                    CmdType t = cmd == "MouseMove" ? CmdType::MouseMove
+                              : cmd == "MouseDown" ? CmdType::MouseDown
+                              : cmd == "MouseUp"   ? CmdType::MouseUp
+                              : cmd == "MouseWheel"? CmdType::MouseWheel
+                              : cmd == "KeyDown"   ? CmdType::KeyDown
+                              : cmd == "KeyUp"     ? CmdType::KeyUp
+                                                   : CmdType::KeyChar;
+                    PushCmd(t, id, payload);
+                } else if (cmd == "SetFocus") {
+                    int id; std::string payload;
+                    if (!splitId(arg, id, payload)) return;
+                    PushCmd(CmdType::SetFocus, id, payload);
                 } else if (cmd == "Close") {
                     int id = atoi(arg.c_str());
                     if (id <= 0) return;

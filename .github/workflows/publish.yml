@@ -22,6 +22,7 @@ permissions:
 
 jobs:
   build-windows:
+    needs: build-linux
     runs-on: windows-latest
 
     steps:
@@ -96,8 +97,16 @@ jobs:
 
       # Note: CefBrowser.Native.exe must be built BEFORE the dotnet build,
       # because the csproj's <Content> items reference ..\CefBrowser.Native\build\Release\*
-      - name: Build .NET library + pack NuGet
-        run: dotnet pack CefSharp.Avalonia\CefSharp.Avalonia.csproj -c Release -o artifacts
+      - name: Download Linux native (merge into the package)
+        uses: actions/download-artifact@v4
+        with:
+          name: native-linux-x64
+          path: artifacts/native-linux-x64
+
+      - name: Build .NET library + pack NuGet (win + linux natives)
+        run: |
+          dotnet pack CefSharp.Avalonia\CefSharp.Avalonia.csproj -c Release -o artifacts `
+            -p:CefNativeLinuxDir="${{ github.workspace }}\artifacts\native-linux-x64"
 
       # Build the demo app too, so compile errors surface in CI (it also copies
       # the native host + CEF binaries next to the assembly).
@@ -165,6 +174,13 @@ jobs:
           CEF=~/cef/cef_binary_${{ env.CEF_VER }}_linux64
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT="$CEF" -DCMAKE_MODULE_PATH="$CEF/cmake"
           cmake --build build --config Release
+
+      - name: Upload Linux native (for the merged package)
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-x64
+          path: CefBrowser.Native/build/Release/
+          if-no-files-found: error
 
       - name: Build .NET library
         run: dotnet build CefSharp.Avalonia/CefSharp.Avalonia.csproj -c Release

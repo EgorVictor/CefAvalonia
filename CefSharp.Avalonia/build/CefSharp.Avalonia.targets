@@ -13,14 +13,18 @@
 
   <PropertyGroup>
     <!--
-      Path to the native binaries within the installed package.
-      MSBuildThisFileDirectory resolves to {packageRoot}/build/,
-      so ../nativeBinaries/ points to {packageRoot}/nativeBinaries/.
+      Resolve the RID-specific native folder inside the installed package:
+      an explicit RuntimeIdentifier wins, otherwise fall back to the current OS.
+      MSBuildThisFileDirectory resolves to {packageRoot}/build/, so ../runtimes/
+      points to {packageRoot}/runtimes/.
     -->
-    <_CefNativePackageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)../nativeBinaries'))</_CefNativePackageDir>
+    <_CefRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</_CefRid>
+    <_CefRid Condition="'$(_CefRid)' == '' AND $([MSBuild]::IsOSPlatform('Windows'))">win-x64</_CefRid>
+    <_CefRid Condition="'$(_CefRid)' == '' AND $([MSBuild]::IsOSPlatform('Linux'))">linux-x64</_CefRid>
+    <_CefNativePackageDir Condition="'$(_CefRid)' != ''">$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)../runtimes/$(_CefRid)/native'))</_CefNativePackageDir>
   </PropertyGroup>
 
-  <ItemGroup>
+  <ItemGroup Condition="'$(_CefRid)' != ''">
     <_CefNativeFile Include="$(_CefNativePackageDir)**/*" />
   </ItemGroup>
 

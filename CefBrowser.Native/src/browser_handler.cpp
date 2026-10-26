@@ -857,3 +857,115 @@ bool BrowserHandler::OnFileDialog(CefRefPtr<CefBrowser> browser,
 
     return true;   // custom dialog used
 }
+
+// ========================================================================
+//  Off-screen rendering (OSR)
+// ========================================================================
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#endif
+#include <cstring>
+
+void BrowserHandler::EnableOsr(int id, int width, int height)
+{
+    std::lock_guard<std::mutex> lock(osr_mutex_);
+    osr_enabled_ = true;
+    osr_width_ = width > 0 ? width : 1;
+    osr_height_ = height > 0 ? height : 1;
+    osr_shm_name_ = "cef_osr_" + std::to_string(id);
+}
+
+void BrowserHandler::SetOsrSize(int width, int height)
+{
+    std::lock_guard<std::mutex> lock(osr_mutex_);
+    if (!osr_enabled_) return;
+    if (width > 0)  osr_width_ = width;
+    if (height > 0) osr_height_ = height;
+}
+
+CefRefPtr<CefRenderHandler> BrowserHandler::GetRenderHandler()
+{
+    // osr_enabled_ is set on the main thread before the browser is created, so
+    // this unsynchronized read is safe.
+    return osr_enabled_ ? this : nullptr;
+}
+
+void BrowserHandler::GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect)
+{
+    std::lock_guard<std::mutex> lock(osr_mutex_);
+    rect = CefRect(0, 0, osr_width_, osr_height_);
+}
+
+void BrowserHandler::OnPaint(CefRefPtr<CefBrowser> browser,
+                             PaintElementType type,
+                             const RectList& dirtyRects,
+                             const void* buffer,
+                             int width,
+                             int height)
+{
+    if (type != PET_VIEW)
+        return;
+
+    std::lock_guard<std::mutex> lock(osr_mutex_);
+    if (!osr_enabled_ || !buffer || width <= 0 || height <= 0)
+        return;
+
+    const size_t needed = (size_t)width * (size_t)height * 4;
+    osr_width_ = width;
+    osr_height_ = height;
+
+    bool recreated = false;
+#if defined(__linux__)
+    // (Re)create the shared memory segment when it is missing or too small.
+    if (!osr_buffer_ || needed > osr_buffer_size_) {
+        if (osr_buffer_) { munmap(osr_buffer_, osr_buffer_size_); osr_buffer_ = nullptr; }
+        if (osr_fd_ >= 0)   { close(osr_fd_); osr_fd_ = -1; }
+
+        int fd = shm_open(osr_shm_name_.c_str(), O_CREAT | O_RDWR, 0600);
+        if (fd >= 0 && ftruncate(fd, (off_t)needed) == 0) {
+            void* p = mmap(nullptr, needed, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (p != MAP_FAILED) {
+                osr_fd_ = fd;
+                osr_buffer_ = p;
+                osr_buffer_size_ = needed;
+                recreated = true;
+            } else {
+                close(fd);
+            }
+        } else if (fd >= 0) {
+            close(fd);
+        }
+    }
+#endif
+
+    if (!osr_buffer_ || needed > osr_buffer_size_)
+        return;   // allocation failed or OSR unsupported on this platform
+
+    memcpy(osr_buffer_, buffer, needed);
+
+    // Union of the dirty rects (fall back to the whole frame when empty).
+    int dx = 0, dy = 0, dw = width, dh = height;
+    if (!dirtyRects.empty()) {
+        int x1 = dirtyRects[0].x, y1 = dirtyRects[0].y;
+        int x2 = x1 + dirtyRects[0].width, y2 = y1 + dirtyRects[0].height;
+        for (size_t i = 1; i < dirtyRects.size(); ++i) {
+            const CefRect& r = dirtyRects[i];
+            x1 = std::min(x1, r.x); y1 = std::min(y1, r.y);
+            x2 = std::max(x2, r.x + r.width); y2 = std::max(y2, r.y + r.height);
+        }
+        dx = std::max(0, x1); dy = std::max(0, y1);
+        dw = std::min(width, x2) - dx;
+        dh = std::min(height, y2) - dy;
+        if (dw <= 0 || dh <= 0) { dx = 0; dy = 0; dw = width; dh = height; }
+    }
+
+    if (recreated && OnOsrBufferEvent)
+        OnOsrBufferEvent(width, height);
+
+    if (OnPaintEvent)
+        OnPaintEvent(width, height, dx, dy, dw, dh);
+}

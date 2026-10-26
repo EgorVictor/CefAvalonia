@@ -31,23 +31,31 @@
     <Content Include="buildTransitive\*" Pack="true" PackagePath="buildTransitive\" />
   </ItemGroup>
 
-  <!-- Native binary files to include in the NuGet package.
-       A package is built for the current OS: Windows includes the .exe, Linux
-       includes the extension-less executable and libcef.so. -->
-  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
-    <Content Include="..\CefBrowser.Native\build\Release\*.*" Exclude="..\CefBrowser.Native\build\Release\*.ilk;..\CefBrowser.Native\build\Release\*.obj;..\CefBrowser.Native\build\Release\*.pdb;..\CefBrowser.Native\build\Release\*.exp;..\CefBrowser.Native\build\Release\*.lib" Pack="true" PackagePath="nativeBinaries\%(Filename)%(Extension)">
+  <!-- Native binaries ship as RID-specific assets so ONE package serves both
+       Windows (win-x64) and Linux (linux-x64). Each block is guarded by the
+       platform marker file: a local dev pack only includes the platform that is
+       actually present, while CI stages both into dedicated dirs (via
+       -p:CefNativeWinDir=... / -p:CefNativeLinuxDir=...) before packing. -->
+  <PropertyGroup>
+    <CefNativeWinDir Condition="'$(CefNativeWinDir)' == ''">..\CefBrowser.Native\build\Release</CefNativeWinDir>
+    <CefNativeLinuxDir Condition="'$(CefNativeLinuxDir)' == ''">..\CefBrowser.Native\build\Release</CefNativeLinuxDir>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(CefNativeWinDir)\libcef.dll')">
+    <Content Include="$(CefNativeWinDir)\*.*"
+             Exclude="$(CefNativeWinDir)\*.ilk;$(CefNativeWinDir)\*.obj;$(CefNativeWinDir)\*.pdb;$(CefNativeWinDir)\*.exp;$(CefNativeWinDir)\*.lib"
+             Pack="true" PackagePath="runtimes\win-x64\native\%(Filename)%(Extension)">
       <Visible>false</Visible>
     </Content>
-    <Content Include="..\CefBrowser.Native\build\Release\locales\*.*" Pack="true" PackagePath="nativeBinaries\locales\%(Filename)%(Extension)">
+    <Content Include="$(CefNativeWinDir)\locales\*.*" Pack="true" PackagePath="runtimes\win-x64\native\locales\%(Filename)%(Extension)">
       <Visible>false</Visible>
     </Content>
   </ItemGroup>
 
-  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
-    <Content Include="..\CefBrowser.Native\build\Release\**\*" Exclude="..\CefBrowser.Native\build\Release\*.obj;..\CefBrowser.Native\build\Release\*.pdb;..\CefBrowser.Native\build\Release\*.a;..\CefBrowser.Native\build\Release\*.dll;..\CefBrowser.Native\build\Release\*.exe" Pack="true" PackagePath="nativeBinaries\%(RecursiveDir)%(Filename)%(Extension)">
-      <Visible>false</Visible>
-    </Content>
-    <Content Include="..\CefBrowser.Native\build\CefBrowser.Native" Pack="true" PackagePath="nativeBinaries\CefBrowser.Native" Condition="Exists('..\CefBrowser.Native\build\CefBrowser.Native')">
+  <ItemGroup Condition="Exists('$(CefNativeLinuxDir)\libcef.so')">
+    <Content Include="$(CefNativeLinuxDir)\**\*"
+             Exclude="$(CefNativeLinuxDir)\*.obj;$(CefNativeLinuxDir)\*.pdb;$(CefNativeLinuxDir)\*.a;$(CefNativeLinuxDir)\*.dll;$(CefNativeLinuxDir)\*.exe;$(CefNativeLinuxDir)\*.lib;$(CefNativeLinuxDir)\*.exp"
+             Pack="true" PackagePath="runtimes\linux-x64\native\%(RecursiveDir)%(Filename)%(Extension)">
       <Visible>false</Visible>
     </Content>
   </ItemGroup>

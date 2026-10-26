@@ -53,6 +53,9 @@ public sealed class BrowserProcessManager : IDisposable
     /// <summary>Last URL requested by the application or reported by the browser.</summary>
     public string? LastUrl => lastUrl;
 
+    /// <summary>Native browser id inside the shared host (0 until started).</summary>
+    public int BrowserId => _browserId;
+
     /// <summary>
     /// When set, this browser gets its own CEF request context and cache
     /// directory (isolated cookies/storage). Leave null to share the host's
@@ -105,6 +108,15 @@ public sealed class BrowserProcessManager : IDisposable
     public event Action<bool>? LoadingStateChanged;
     /// <summary>Raised on download lifecycle events.</summary>
     public event Action<string>? DownloadEvent;
+
+    /// <summary>
+    /// Raised on OSR Paint (Linux). Args: (w, h, dirtyX, dirtyY, dirtyW, dirtyH);
+    /// the pixels are already in the shared memory segment /dev/shm/cef_osr_{id}.
+    /// </summary>
+    public event Action<int, int, int, int, int, int>? OsrPaint;
+
+    /// <summary>Raised when the OSR shared memory segment was (re)created. Args: (w, h).</summary>
+    public event Action<int, int>? OsrBufferReady;
 
     /// <summary>
     /// Raised when the page opens a JavaScript dialog. The handler must call
@@ -278,6 +290,27 @@ public sealed class BrowserProcessManager : IDisposable
                 HandleJsDialog(arg);
                 break;
 
+            case "Paint":
+            {
+                string[] p = CefProtocol.Split(arg, 6);
+                if (p.Length >= 6 &&
+                    int.TryParse(p[0], out int w) && int.TryParse(p[1], out int h) &&
+                    int.TryParse(p[2], out int dx) && int.TryParse(p[3], out int dy) &&
+                    int.TryParse(p[4], out int dw) && int.TryParse(p[5], out int dh))
+                {
+                    OsrPaint?.Invoke(w, h, dx, dy, dw, dh);
+                }
+                break;
+            }
+
+            case "OsrBuffer":
+            {
+                string[] p = CefProtocol.Split(arg, 2);
+                if (p.Length >= 2 && int.TryParse(p[0], out int w) && int.TryParse(p[1], out int h))
+                    OsrBufferReady?.Invoke(w, h);
+                break;
+            }
+
             case "Pong":
                 CefDiagnostics.Debug($"[BPM {_browserId}] pong {arg}");
                 break;
@@ -389,6 +422,28 @@ public sealed class BrowserProcessManager : IDisposable
 
     public Task<bool> SendEmbedDoneAsync(CancellationToken cancellationToken = default)
         => SendAsync("EmbedDone", null, cancellationToken);
+
+    // ---- OSR input forwarding (Linux) ------------------------------------
+
+    public void SendMouseMove(int x, int y, uint modifiers)
+        => _ = SendAsync("MouseMove", null, default, $"{x}|{y}|{modifiers}");
+
+    public void SendMouseClick(int x, int y, uint modifiers, int button, bool mouseUp, int clickCount)
+        => _ = SendAsync(mouseUp ? "MouseUp" : "MouseDown", null, default,
+               $"{x}|{y}|{modifiers}|{button}|{clickCount}");
+
+    public void SendMouseWheel(int x, int y, uint modifiers, int dx, int dy)
+        => _ = SendAsync("MouseWheel", null, default, $"{x}|{y}|{modifiers}|{dx}|{dy}");
+
+    public void SendKeyEvent(bool keyDown, uint modifiers, int windowsKeyCode, int nativeKeyCode)
+        => _ = SendAsync(keyDown ? "KeyDown" : "KeyUp", null, default,
+               $"{modifiers}|{windowsKeyCode}|{nativeKeyCode}|0");
+
+    public void SendKeyChar(uint modifiers, int charCode)
+        => _ = SendAsync("KeyChar", null, default, $"{modifiers}|{charCode}|0|{charCode}");
+
+    public void SendFocus(bool focus)
+        => _ = SendAsync("SetFocus", null, default, focus ? "1" : "0");
 
     // ---- Internals --------------------------------------------------------
 

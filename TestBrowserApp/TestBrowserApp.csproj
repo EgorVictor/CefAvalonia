@@ -90,20 +90,38 @@
          nothing). Warn so the misconfiguration is visible immediately. -->
     <Warning Condition="!Exists('$(CefLinuxRoot)/Release')"
              Text="CefLinuxRoot/Release='$(CefLinuxRoot)/Release' does not exist; CEF runtime files will NOT be copied. Pass -p:CefLinuxRoot=/abs/path/to/cef_binary_..._linux64 (a literal '~' is NOT expanded in MSBuild arguments)." />
+    <Warning Condition="Exists('$(CefLinuxRoot)/Release') AND !Exists('$(CefLinuxRoot)/Resources')"
+             Text="CefLinuxRoot/Resources='$(CefLinuxRoot)/Resources' does not exist; icudtl.dat / *.pak / locales will NOT be copied and Chromium aborts inside CefInitialize (SIGTRAP)." />
     <ItemGroup>
       <_CefLinuxFiles Include="$(CefLinuxRoot)/Release/**/*" />
+      <!-- CEF Linux ships icudtl.dat / *.pak / locales/ under Resources/, NOT
+           under Release/. Copying only Release/ leaves stale .pak files from a
+           previous (or Windows) build in the output dir, and Chromium then aborts
+           inside CefInitialize (SIGTRAP in ResourceBundle::GetLocalizedString). -->
+      <_CefLinuxResources Include="$(CefLinuxRoot)/Resources/**/*" />
       <_NativeExe Include="$(_NativeExeSource)" Condition="Exists('$(_NativeExeSource)')" />
     </ItemGroup>
+    <!-- SkipUnchangedFiles=false on purpose: a wrong .pak left over from another
+         platform has a newer timestamp than the CEF distribution, so timestamp
+         comparison would keep the broken file. Always overwrite. -->
     <Copy SourceFiles="@(_CefLinuxFiles)"
           DestinationFiles="@(_CefLinuxFiles->'$(OutputPath)/%(RecursiveDir)%(Filename)%(Extension)')"
-          SkipUnchangedFiles="true"
+          SkipUnchangedFiles="false"
           Condition="Exists('$(CefLinuxRoot)/Release')" />
+    <Copy SourceFiles="@(_CefLinuxResources)"
+          DestinationFiles="@(_CefLinuxResources->'$(OutputPath)/%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="false"
+          Condition="Exists('$(CefLinuxRoot)/Resources')" />
     <Copy SourceFiles="@(_NativeExe)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true"
           Condition="Exists('$(_NativeExeSource)')" />
     <Copy SourceFiles="@(_CefLinuxFiles)"
           DestinationFiles="@(_CefLinuxFiles->'$(PublishDir)/%(RecursiveDir)%(Filename)%(Extension)')"
-          SkipUnchangedFiles="true"
+          SkipUnchangedFiles="false"
           Condition="'$(PublishDir)' != '' AND Exists('$(CefLinuxRoot)/Release')" />
+    <Copy SourceFiles="@(_CefLinuxResources)"
+          DestinationFiles="@(_CefLinuxResources->'$(PublishDir)/%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="false"
+          Condition="'$(PublishDir)' != '' AND Exists('$(CefLinuxRoot)/Resources')" />
     <Copy SourceFiles="@(_NativeExe)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true"
           Condition="'$(PublishDir)' != '' AND Exists('$(_NativeExeSource)')" />
     <!-- Guard each chmod separately: one combined command fails the build when

@@ -1,8 +1,15 @@
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Data;
+using Avalonia.Input;
+using Avalonia.Interactivity;
+using Avalonia.Media.Imaging;
+using Avalonia.Platform;
 using Avalonia.Threading;
 using System;
+using System.IO;
+using System.IO.MemoryMappedFiles;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Input;
@@ -43,6 +50,14 @@ public class WebView : UserControl, IDisposable
     private int _recoveryAttempts;
     private TopLevel? _topLevel;
     private string _lastFindText = "";
+
+    // OSR (Linux only): the rendered frame and its shared-memory source.
+    private readonly OsrSurface _osrSurface = new();
+    private WriteableBitmap? _osrBitmap;
+    private MemoryMappedFile? _osrMmf;
+    private MemoryMappedViewAccessor? _osrView;
+    private byte[] _osrPixels = Array.Empty<byte>();
+    private bool _browserReady;
 
     /// <summary>
     /// Single, bindable browser location. Setting it navigates; the value is
@@ -164,7 +179,9 @@ public class WebView : UserControl, IDisposable
 
     public WebView()
     {
-        Content = _browserHost;
+        // Linux renders off-screen into a bitmap (no native child window);
+        // Windows keeps the native-window-embedding host.
+        Content = OperatingSystem.IsLinux() ? _osrSurface : _browserHost;
         ClipToBounds = true;
 
         _resizeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
@@ -176,7 +193,7 @@ public class WebView : UserControl, IDisposable
     }
 
     /// <summary>True once the native browser process accepted this browser.</summary>
-    public bool IsBrowserAvailable => _manager != null && _cefHwnd != IntPtr.Zero;
+    public bool IsBrowserAvailable => _manager != null && (_browserReady || _cefHwnd != IntPtr.Zero);
 
     protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
     {
@@ -195,7 +212,8 @@ public class WebView : UserControl, IDisposable
             // Tab switch back: the HWND survived, only the Avalonia panel was
             // recreated. Re-embed it synchronously (or defer inside the host).
             CefDiagnostics.Debug($"[WebView] re-embed HWND=0x{_cefHwnd.ToInt64():X}");
-            _browserHost.EmbedWindow(_cefHwnd);
+            if (!OperatingSystem.IsLinux())
+                _browserHost.EmbedWindow(_cefHwnd);
             QueueResize();
             _ = _manager.SendEmbedDoneAsync();
         }
@@ -294,16 +312,26 @@ public class WebView : UserControl, IDisposable
             if (_disposed) return;
 
             _cefHwnd = hwnd;
+            _browserReady = true;
             _recoveryAttempts = 0;
             CefDiagnostics.Debug($"[WebView] browser ready HWND=0x{hwnd.ToInt64():X}");
 
-            _browserHost.EmbedWindow(hwnd);
+            if (!OperatingSystem.IsLinux())
+                _browserHost.EmbedWindow(hwnd);
             SendResize();
             if (_manager != null)
                 await _manager.SendEmbedDoneAsync();
         });
 
         manager.BrowserCrashed += () => Dispatcher.UIThread.Post(OnBrowserCrashed);
+
+        if (OperatingSystem.IsLinux())
+        {
+            manager.OsrPaint += (w, h, dx, dy, dw, dh) =>
+                Dispatcher.UIThread.Post(() => OnOsrPaint(w, h, dx, dy, dw, dh));
+            manager.OsrBufferReady += (w, h) =>
+                Dispatcher.UIThread.Post(() => OnOsrBufferReady(w, h));
+        }
     }
 
     private async void OnBrowserCrashed()
@@ -313,7 +341,9 @@ public class WebView : UserControl, IDisposable
         // The native child window died with the host: forget it before any
         // detach/reattach logic can touch a stale handle.
         _cefHwnd = IntPtr.Zero;
-        _browserHost.DetachEmbedded();
+        _browserReady = false;
+        if (!OperatingSystem.IsLinux())
+            _browserHost.DetachEmbedded();
         BrowserCrashed?.Invoke();
 
         if (!AutoRecover || _manager == null)
@@ -347,20 +377,10 @@ public class WebView : UserControl, IDisposable
 
         try
         {
-            // On X11 the browser window must be created inside the real host
-            // window: building it under a hidden, unmapped parent and moving it
-            // afterwards leaves the window unrealized, so the control stays
-            // transparent. Windows reparents reliably, so it keeps that path.
-            IntPtr hostWindow = IntPtr.Zero;
-            if (OperatingSystem.IsLinux())
-            {
-                hostWindow = await _browserHost.WaitForHostWindowAsync(TimeSpan.FromSeconds(5))
-                    .ConfigureAwait(true);
-            }
-
-            if (_manager == null || _disposed) return false;
-
-            bool ok = await _manager.StartAsync(Url, CefSettings, hostWindow).ConfigureAwait(true);
+            // Linux renders off-screen (no native host window); Windows uses a
+            // hidden parent + SetParent, also without a host window handed over
+            // up front. Either way the browser is created with hostWindow = Zero.
+            bool ok = await _manager.StartAsync(Url, CefSettings, IntPtr.Zero).ConfigureAwait(true);
             if (!ok)
                 CefDiagnostics.Error("[WebView] native host could not be started");
             return ok;
@@ -536,6 +556,207 @@ public class WebView : UserControl, IDisposable
         }
     }
 
+    // ---- OSR (Linux) ------------------------------------------------------
+
+    private void OnOsrBufferReady(int w, int h)
+    {
+        if (_disposed || w <= 0 || h <= 0) return;
+
+        CloseOsrMap();
+
+        BrowserProcessManager? manager = _manager;
+        if (manager == null) return;
+
+        string path = $"/dev/shm/cef_osr_{manager.BrowserId}";
+        try
+        {
+            _osrMmf = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.ReadWrite);
+            _osrView = _osrMmf.CreateViewAccessor(0, (long)w * h * 4, MemoryMappedFileAccess.ReadWrite);
+        }
+        catch (Exception ex)
+        {
+            CefDiagnostics.Error($"[WebView] OSR shared memory map failed ({path})", ex);
+            CloseOsrMap();
+            return;
+        }
+
+        _osrBitmap = new WriteableBitmap(new PixelSize(w, h), new Vector(96, 96), PixelFormats.Bgra8888);
+        _osrSurface.Bitmap = _osrBitmap;
+    }
+
+    private void OnOsrPaint(int w, int h, int dx, int dy, int dw, int dh)
+    {
+        WriteableBitmap? bitmap = _osrBitmap;
+        MemoryMappedViewAccessor? view = _osrView;
+        if (bitmap == null || view == null || w <= 0 || h <= 0) return;
+
+        int frameBytes = w * h * 4;
+        if (_osrPixels.Length < frameBytes)
+            _osrPixels = new byte[frameBytes];
+
+        try
+        {
+            view.ReadArray(0, _osrPixels, 0, frameBytes);
+        }
+        catch (Exception ex)
+        {
+            CefDiagnostics.Error("[WebView] OSR read failed", ex);
+            return;
+        }
+
+        int rowBytes = w * 4;
+        using (ILockedFramebuffer fb = bitmap.Lock())
+        {
+            int copyBytes = Math.Min(rowBytes, fb.RowBytes);
+            for (int y = 0; y < h; y++)
+                Marshal.Copy(_osrPixels, y * rowBytes, fb.Address + y * fb.RowBytes, copyBytes);
+        }
+
+        _osrSurface.InvalidateVisual();
+    }
+
+    private void CloseOsrMap()
+    {
+        _osrView?.Dispose();
+        _osrView = null;
+        _osrMmf?.Dispose();
+        _osrMmf = null;
+        _osrBitmap?.Dispose();
+        _osrBitmap = null;
+        _osrSurface.Bitmap = null;
+    }
+
+    // ---- OSR input forwarding (Linux) ------------------------------------
+
+    protected override void OnPointerMoved(PointerEventArgs e)
+    {
+        base.OnPointerMoved(e);
+        if (!OperatingSystem.IsLinux()) return;
+        var p = e.GetPosition(this);
+        _manager?.SendMouseMove((int)p.X, (int)p.Y, (uint)ToCefModifiers(e.KeyModifiers));
+    }
+
+    protected override void OnPointerPressed(PointerPressedEventArgs e)
+    {
+        base.OnPointerPressed(e);
+        if (!OperatingSystem.IsLinux()) return;
+        var p = e.GetPosition(this);
+        var props = e.GetCurrentPoint(this).Properties;
+        int button = props.IsMiddleButtonPressed ? 1 : props.IsRightButtonPressed ? 2 : 0;
+        uint mods = (uint)(ToCefModifiers(e.KeyModifiers) | ButtonFlag(button));
+        _manager?.SendMouseClick((int)p.X, (int)p.Y, mods, button, false, 1);
+    }
+
+    protected override void OnPointerReleased(PointerReleasedEventArgs e)
+    {
+        base.OnPointerReleased(e);
+        if (!OperatingSystem.IsLinux()) return;
+        var p = e.GetPosition(this);
+        int button = e.InitialPressMouseButton == MouseButton.Middle ? 1
+                   : e.InitialPressMouseButton == MouseButton.Right ? 2 : 0;
+        uint mods = (uint)(ToCefModifiers(e.KeyModifiers) | ButtonFlag(button));
+        _manager?.SendMouseClick((int)p.X, (int)p.Y, mods, button, true, 1);
+    }
+
+    protected override void OnPointerWheelChanged(PointerWheelEventArgs e)
+    {
+        base.OnPointerWheelChanged(e);
+        if (!OperatingSystem.IsLinux()) return;
+        var p = e.GetPosition(this);
+        var delta = e.Delta;
+        _manager?.SendMouseWheel((int)p.X, (int)p.Y,
+            (uint)ToCefModifiers(e.KeyModifiers), (int)Math.Round(delta.X), (int)Math.Round(delta.Y));
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (!OperatingSystem.IsLinux()) return;
+        _manager?.SendKeyEvent(true, (uint)ToCefModifiers(e.KeyModifiers), MapKey(e.Key), 0);
+    }
+
+    protected override void OnKeyUp(KeyEventArgs e)
+    {
+        base.OnKeyUp(e);
+        if (!OperatingSystem.IsLinux()) return;
+        _manager?.SendKeyEvent(false, (uint)ToCefModifiers(e.KeyModifiers), MapKey(e.Key), 0);
+    }
+
+    protected override void OnTextInput(TextInputEventArgs e)
+    {
+        base.OnTextInput(e);
+        if (!OperatingSystem.IsLinux() || string.IsNullOrEmpty(e.Text)) return;
+        foreach (char c in e.Text)
+        {
+            if (c == '\r' || c == '\n' || char.IsControl(c)) continue;
+            _manager?.SendKeyChar(0, c);
+        }
+    }
+
+    protected override void OnGotFocus(GotFocusEventArgs e)
+    {
+        base.OnGotFocus(e);
+        if (OperatingSystem.IsLinux())
+            _manager?.SendFocus(true);
+    }
+
+    protected override void OnLostFocus(RoutedEventArgs e)
+    {
+        base.OnLostFocus(e);
+        if (OperatingSystem.IsLinux())
+            _manager?.SendFocus(false);
+    }
+
+    private static int ButtonFlag(int button) => button switch
+    {
+        0 => 16,   // left
+        1 => 32,   // middle
+        2 => 64,   // right
+        _ => 0
+    };
+
+    private static int ToCefModifiers(KeyModifiers m)
+    {
+        int r = 0;
+        if ((m & KeyModifiers.Shift) != 0) r |= 2;
+        if ((m & KeyModifiers.Control) != 0) r |= 4;
+        if ((m & KeyModifiers.Alt) != 0) r |= 8;
+        return r;
+    }
+
+    // Maps Avalonia keys to Chromium "windows_key_code" values for KEYEVENT_*.
+    // Text entry goes through OnTextInput (char events); this map only supplies
+    // the physical key for raw keydown/keyup, so unknown keys map to 0.
+    private static int MapKey(Key key) => key switch
+    {
+        Key.Back => 8,
+        Key.Tab => 9,
+        Key.Enter or Key.Return => 13,
+        Key.Escape => 27,
+        Key.Space => 32,
+        Key.PageUp => 33,
+        Key.PageDown => 34,
+        Key.End => 35,
+        Key.Home => 36,
+        Key.Left => 37,
+        Key.Up => 38,
+        Key.Right => 39,
+        Key.Down => 40,
+        Key.Insert => 45,
+        Key.Delete => 46,
+        Key.D0 => 48, Key.D1 => 49, Key.D2 => 50, Key.D3 => 51, Key.D4 => 52,
+        Key.D5 => 53, Key.D6 => 54, Key.D7 => 55, Key.D8 => 56, Key.D9 => 57,
+        Key.A => 65, Key.B => 66, Key.C => 67, Key.D => 68, Key.E => 69, Key.F => 70,
+        Key.G => 71, Key.H => 72, Key.I => 73, Key.J => 74, Key.K => 75, Key.L => 76,
+        Key.M => 77, Key.N => 78, Key.O => 79, Key.P => 80, Key.Q => 81, Key.R => 82,
+        Key.S => 83, Key.T => 84, Key.U => 85, Key.V => 86, Key.W => 87, Key.X => 88,
+        Key.Y => 89, Key.Z => 90,
+        Key.NumPad0 => 96, Key.NumPad1 => 97, Key.NumPad2 => 98, Key.NumPad3 => 99,
+        Key.NumPad4 => 100, Key.NumPad5 => 101, Key.NumPad6 => 102, Key.NumPad7 => 103,
+        Key.NumPad8 => 104, Key.NumPad9 => 105,
+        _ => 0,
+    };
+
     // ---- Teardown ---------------------------------------------------------
 
     /// <summary>
@@ -553,7 +774,10 @@ public class WebView : UserControl, IDisposable
         // Forget the embedded HWND before the native browser is destroyed: the
         // host will destroy that window and we must never touch it afterwards.
         _cefHwnd = IntPtr.Zero;
-        _browserHost.DetachEmbedded();
+        _browserReady = false;
+        if (!OperatingSystem.IsLinux())
+            _browserHost.DetachEmbedded();
+        CloseOsrMap();
 
         _manager?.Dispose();
         _manager = null;

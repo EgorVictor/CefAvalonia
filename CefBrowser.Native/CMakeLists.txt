@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 project(CefBrowser.Native)
 
+# The source uses UTF-8 comments (em-dashes etc.). Tell MSVC so it does not trip
+# over C4819 (treated as error) when the host code page is not UTF-8.
+if(MSVC)
+  add_compile_options(/utf-8)
+endif()
+
 set(CEF_ROOT "" CACHE PATH "Path to extracted CEF binary distribution")
 find_package(CEF REQUIRED)
 
