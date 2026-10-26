@@ -2,7 +2,7 @@
 
 基于 **CEF (Chromium Embedded Framework)** 的 .NET Avalonia 浏览器控件，通过 C++ 原生子进程 + **stdio（标准输入/输出）IPC** 实现嵌入式浏览器 HWND 托管。
 
-支持 **Windows**（x64）与 **Linux**（x64，需 `chrome-sandbox` 或显式关闭沙箱）。目标框架为 **.NET 8**。
+支持 **Windows**（x64，原生窗口嵌入）与 **Linux**（x64，离屏渲染 OSR）。目标框架为 **.NET 8**。
 
 ## 简介
 
@@ -222,6 +222,51 @@ browser.CefSettings.Locale = "zh-CN";
 ```
 
 > 库本身只依赖 `Avalonia` 核心包（不再强制 `Avalonia.Desktop`），由消费方自行引用所需的平台后端。
+
+---
+
+## 部署须知（发布到目标机器）
+
+**发布本身是零配置的**：`dotnet publish -r win-x64` 或 `dotnet publish -r linux-x64`，NuGet 包会通过 `build/CefSharp.Avalonia.targets` 自动把对应平台的 CEF 运行时 + `CefBrowser.Native` 复制到输出目录，并在 Linux 上自动 `chmod +x`。**无需任何 `-p:` 参数或额外构建步骤。**
+
+但以下是目标机器上的**运行前提**（注意：这是部署约定，不是发布时设置）：
+
+> ## ⚠️ 三个必须注意的坑
+>
+> **坑 1 —— Linux 必须预装 CEF 系统库，否则启动即崩。**
+> NuGet 包和 `--self-contained` 发布都**不会**带上这些系统 `.so`（任何 Chromium 内核都一样）。缺了会在启动时直接报 `libnss3.so` / `libgtk-3.so.0` not found，或进程闪退。解法见下方 Linux 的 `apt install` 命令。
+>
+> **坑 2 —— `chrome-sandbox` 不设权限 = 自动回退无沙箱。**
+> 不 `chmod 4755` 时 CEF 会静默回退到无沙箱模式（只打一条警告），测试可用，但生产环境安全性降低。要真沙箱必须执行 `sudo chown root:root chrome-sandbox && sudo chmod 4755 chrome-sandbox`。
+>
+> **坑 3 —— 只支持 x64。**
+> 包内只带了 `win-x64` / `linux-x64` 的原生二进制。用 `win-x86`、`linux-arm` 等其它 RID 发布会找不到 `CefBrowser.Native`，直接启动失败。
+
+### Windows（x64）
+
+- .NET 8 Runtime（或用 `--self-contained` 免安装）。
+- 无需额外系统依赖，CEF 的 DLL 已随包部署。
+
+### Linux（x64）
+
+Linux 走**离屏渲染（OSR）**，不依赖 X11 子窗口嵌入。但 CEF/Chromium 依赖以下**系统动态库**（NuGet 包无法携带，任何 Chromium 内核程序都一样）：
+
+```bash
+# Debian / Ubuntu 系（含 Zorin）
+sudo apt install -y libnss3 libgtk-3-0 libgbm1 libasound2 libxshmfence1 \
+  libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libxtst6 libpango-1.0-0 \
+  libcairo2 libcups2 libdbus-1-3 libfontconfig1 libgl1
+```
+
+- **glibc**：要求 ≥ 2.35（Ubuntu 22.04 / Debian 12 及以上）。原生宿主必须用与目标机一致或更低版本的 glibc 编译，否则启动报 `GLIBC_x.y not found`。
+- **沙箱**：`chrome-sandbox` 未 setuid root 时 CEF 自动回退无沙箱（仅告警，可正常测试）。生产环境若要真沙箱：
+  ```bash
+  sudo chown root:root chrome-sandbox && sudo chmod 4755 chrome-sandbox
+  ```
+- **架构**：仅 x64（`win-x64` / `linux-x64`），不支持 32 位 / ARM。
+- **输入**：Linux OSR 模式已支持鼠标 + 基础键盘；中文 IME、光标形状、文本选择/拖拽暂未实现。
+
+> 若目标机器无法联网或不能 `apt install`，请用 **.deb 包**（把上面的库声明为 `Depends:`，安装时自动解析）或 **AppImage**（把依赖随镜像打包，单文件拷贝即运行）分发，**不要**把系统 `.so` 手工塞进发布目录——那样会因传递依赖与 glibc 版本耦合而不可靠。
 
 ---
 
