@@ -30,6 +30,9 @@ bld/
 [Ll]og/
 [Ll]ogs/
 build/
+# NuGet MSBuild targets live in folders named "build" and must stay tracked
+!CefSharp.Avalonia/build/
+!CefSharp.Avalonia.Linux/build/
 out/
 
 ## Logs
