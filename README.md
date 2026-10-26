@@ -209,9 +209,20 @@ browser.CefSettings.Locale = "zh-CN";
 
 ### 安装
 
+**Windows**（含 Windows 原生）：
+
 ```xml
-<PackageReference Include="CefSharp.Avalonia" Version="1.1.0" />
+<PackageReference Include="CefSharp.Avalonia" Version="1.2.0" />
 ```
+
+**Linux**（额外引用 Linux 原生包）：
+
+```xml
+<PackageReference Include="CefSharp.Avalonia" Version="1.2.0" />
+<PackageReference Include="CefSharp.Avalonia.Linux" Version="1.2.0" />
+```
+
+> 一个 CEF 发行包约 150–180 MB，Windows + Linux 两套塞进同一个 nupkg 会超过 NuGet.org 的 **250 MB 上限**，因此拆成两个包。跨平台发布（例如在 Windows 上执行 `dotnet publish -r linux-x64`）时，把 `CefSharp.Avalonia.Linux` 也引用上即可，SDK 会自动按 RID 选用对应原生文件。
 
 ### 目标框架要求（消费方）
 

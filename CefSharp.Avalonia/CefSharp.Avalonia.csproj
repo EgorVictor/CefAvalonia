@@ -31,14 +31,14 @@
     <Content Include="buildTransitive\*" Pack="true" PackagePath="buildTransitive\" />
   </ItemGroup>
 
-  <!-- Native binaries ship as RID-specific assets so ONE package serves both
-       Windows (win-x64) and Linux (linux-x64). Each block is guarded by the
-       platform marker file: a local dev pack only includes the platform that is
-       actually present, while CI stages both into dedicated dirs (via
-       -p:CefNativeWinDir=... / -p:CefNativeLinuxDir=...) before packing. -->
+  <!--
+    Native binaries ship as RID-specific assets. A single CEF distribution is
+    already ~150-180 MB, so two full distributions in one package would exceed
+    NuGet.org's 250 MB limit. Windows natives live here (win-x64); Linux natives
+    ship separately in the CefSharp.Avalonia.Linux package (linux-x64).
+  -->
   <PropertyGroup>
     <CefNativeWinDir Condition="'$(CefNativeWinDir)' == ''">..\CefBrowser.Native\build\Release</CefNativeWinDir>
-    <CefNativeLinuxDir Condition="'$(CefNativeLinuxDir)' == ''">..\CefBrowser.Native\build\Release</CefNativeLinuxDir>
   </PropertyGroup>
 
   <ItemGroup Condition="Exists('$(CefNativeWinDir)\libcef.dll')">
@@ -48,14 +48,6 @@
       <Visible>false</Visible>
     </Content>
     <Content Include="$(CefNativeWinDir)\locales\*.*" Pack="true" PackagePath="runtimes\win-x64\native\locales\%(Filename)%(Extension)">
-      <Visible>false</Visible>
-    </Content>
-  </ItemGroup>
-
-  <ItemGroup Condition="Exists('$(CefNativeLinuxDir)\libcef.so')">
-    <Content Include="$(CefNativeLinuxDir)\**\*"
-             Exclude="$(CefNativeLinuxDir)\*.obj;$(CefNativeLinuxDir)\*.pdb;$(CefNativeLinuxDir)\*.a;$(CefNativeLinuxDir)\*.dll;$(CefNativeLinuxDir)\*.exe;$(CefNativeLinuxDir)\*.lib;$(CefNativeLinuxDir)\*.exp"
-             Pack="true" PackagePath="runtimes\linux-x64\native\%(RecursiveDir)%(Filename)%(Extension)">
       <Visible>false</Visible>
     </Content>
   </ItemGroup>

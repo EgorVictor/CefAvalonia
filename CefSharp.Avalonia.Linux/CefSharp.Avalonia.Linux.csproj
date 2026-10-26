@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+
+    <!-- Content-only package: ships the Linux (x64) native binaries for
+         CefSharp.Avalonia. Kept separate from the main package because a single
+         CEF distribution is ~150-180 MB, and bundling both Windows + Linux in
+         one nupkg exceeds NuGet.org's 250 MB limit. -->
+    <PackageId>CefSharp.Avalonia.Linux</PackageId>
+    <Version>1.2.0</Version>
+    <Authors>CefBrowser</Authors>
+    <Description>Linux (x64) native binaries (CEF runtime + CefBrowser.Native host) for CefSharp.Avalonia.</Description>
+    <PackageTags>avalonia;cef;chromium;browser;linux</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/EgorVictor/CefAvalonia</PackageProjectUrl>
+
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <EnableDefaultEmbeddedResourceItems>false</EnableDefaultEmbeddedResourceItems>
+    <NoDefaultExcludes>true</NoDefaultExcludes>
+    <NoWarn>NU5128</NoWarn>
+
+    <!-- Default to the local native build dir; CI overrides with the downloaded
+         Linux native artifact (-p:CefNativeLinuxDir=...). -->
+    <CefNativeLinuxDir Condition="'$(CefNativeLinuxDir)' == ''">..\CefBrowser.Native\build\Release</CefNativeLinuxDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="build\*" Pack="true" PackagePath="build\" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(CefNativeLinuxDir)\libcef.so')">
+    <Content Include="$(CefNativeLinuxDir)\**\*"
+             Exclude="$(CefNativeLinuxDir)\*.obj;$(CefNativeLinuxDir)\*.pdb;$(CefNativeLinuxDir)\*.a;$(CefNativeLinuxDir)\*.dll;$(CefNativeLinuxDir)\*.exe;$(CefNativeLinuxDir)\*.lib;$(CefNativeLinuxDir)\*.exp"
+             Pack="true" PackagePath="runtimes\linux-x64\native\%(RecursiveDir)%(Filename)%(Extension)">
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+</Project>

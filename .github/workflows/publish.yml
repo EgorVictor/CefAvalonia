@@ -103,9 +103,12 @@ jobs:
           name: native-linux-x64
           path: artifacts/native-linux-x64
 
-      - name: Build .NET library + pack NuGet (win + linux natives)
+      - name: Pack CefSharp.Avalonia (managed + Windows natives)
+        run: dotnet pack CefSharp.Avalonia\CefSharp.Avalonia.csproj -c Release -o artifacts
+
+      - name: Pack CefSharp.Avalonia.Linux (Linux natives)
         run: |
-          dotnet pack CefSharp.Avalonia\CefSharp.Avalonia.csproj -c Release -o artifacts `
+          dotnet pack CefSharp.Avalonia.Linux\CefSharp.Avalonia.Linux.csproj -c Release -o artifacts `
             -p:CefNativeLinuxDir="${{ github.workspace }}\artifacts\native-linux-x64"
 
       # Build the demo app too, so compile errors surface in CI (it also copies
