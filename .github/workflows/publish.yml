@@ -149,21 +149,45 @@ jobs:
         with:
           user: yhq   # nuget.org account (package owner)
 
+      # Push package by package (not one 'dotnet nuget push *.nupkg'): a failure
+      # on one package must not hide the others, and a 409 (already published)
+      # must not abort the run. Set the NUGET_CLASSIC_API_KEY repository secret
+      # to fall back to a classic key — needed to bootstrap a BRAND-NEW package
+      # id, which Trusted Publishing alone may refuse (HTTP 403).
       - name: Push to nuget.org (trusted publishing)
         if: env.PACKAGE_VERSION != ''
+        shell: pwsh
+        env:
+          NUGET_FALLBACK_KEY: ${{ secrets.NUGET_CLASSIC_API_KEY }}
         run: |
-          Get-ChildItem artifacts\*.nupkg | ForEach-Object {
-            "{0}  {1:N1} MB" -f $_.Name, ($_.Length / 1MB)
-          }
           $tooBig = Get-ChildItem artifacts\*.nupkg | Where-Object { $_.Length -gt 250MB }
           if ($tooBig) {
             $tooBig | ForEach-Object { Write-Host "::error::$($_.Name) is $([math]::Round($_.Length/1MB,1)) MB — NuGet.org limit is 250 MB" }
             exit 1
           }
-          dotnet nuget push artifacts\*.nupkg `
-            --api-key ${{ steps.login.outputs.NUGET_API_KEY }} `
-            --source https://api.nuget.org/v3/index.json `
-            --skip-duplicate
+          $failed = @()
+          foreach ($pkg in Get-ChildItem artifacts\*.nupkg) {
+            "{0}  {1:N1} MB" -f $pkg.Name, ($pkg.Length / 1MB)
+            dotnet nuget push $pkg.FullName `
+              --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" `
+              --source https://api.nuget.org/v3/index.json `
+              --skip-duplicate
+            if ($LASTEXITCODE -ne 0) {
+              if ($env:NUGET_FALLBACK_KEY) {
+                Write-Host "::warning::OIDC push rejected for $($pkg.Name); retrying with classic API key"
+                dotnet nuget push $pkg.FullName `
+                  --api-key $env:NUGET_FALLBACK_KEY `
+                  --source https://api.nuget.org/v3/index.json `
+                  --skip-duplicate
+              }
+              if ($LASTEXITCODE -ne 0) { $failed += $pkg.Name }
+            }
+          }
+          if ($failed.Count -gt 0) {
+            $failed | ForEach-Object { Write-Host "::error::failed to push $_" }
+            exit 1
+          }
+          Write-Host "All packages published."
 
   build-linux:
     runs-on: ubuntu-latest
