@@ -108,6 +108,19 @@ jobs:
           name: native-linux-x64
           path: artifacts/native-linux-x64
 
+      # Diagnostics: the Linux package must stay well under NuGet.org's 250 MB
+      # limit. Print what the native build actually produced so an oversized
+      # package can be traced to a specific file instead of guessed at.
+      - name: Audit Linux native dir (size check)
+        shell: pwsh
+        run: |
+          $dir = "${{ github.workspace }}\artifacts\native-linux-x64"
+          $files = Get-ChildItem $dir -Recurse -File
+          "TOTAL: {0:N1} MB in {1} files" -f (($files | Measure-Object Length -Sum).Sum / 1MB), $files.Count
+          $files | Sort-Object Length -Descending | Select-Object -First 20 `
+            @{n='MB';e={[math]::Round($_.Length/1MB,1)}}, `
+            @{n='File';e={$_.FullName.Substring($dir.Length)}} | Format-Table -AutoSize | Out-String
+
       - name: Pack CefSharp.Avalonia (managed + Windows natives)
         run: dotnet pack CefSharp.Avalonia\CefSharp.Avalonia.csproj -c Release -o artifacts
 

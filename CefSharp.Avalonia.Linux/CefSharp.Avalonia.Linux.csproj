@@ -31,28 +31,43 @@
     <Content Include="build\*" Pack="true" PackagePath="build\" />
   </ItemGroup>
 
+  <!--
+    WHITELIST, not a recursive glob: the native build output dir also carries
+    build artifacts (libcef_dll_wrapper static lib, object files, CMake files),
+    and excluding them by extension was not enough — the package still came out
+    at ~318 MB and NuGet.org rejected it with HTTP 413 (>250 MB limit).
+
+    Only the files CEF actually loads at runtime are listed here, which keeps
+    the package at ~110 MB, the same order as the Windows one (~116 MB).
+  -->
   <ItemGroup Condition="Exists('$(CefNativeLinuxDir)\libcef.so')">
-    <!-- Exclude build/CMake intermediates RECURSIVELY: the old single-level
-         exclude let subdirectories (CMakeFiles/, *.dir/, libcef_dll_wrapper
-         artifacts ...) into the package, pushing it past NuGet.org's 250 MB
-         limit (HTTP 413 on push). -->
-    <Content Include="$(CefNativeLinuxDir)\**\*"
-             Exclude="$(CefNativeLinuxDir)\**\*.o;
-                      $(CefNativeLinuxDir)\**\*.obj;
-                      $(CefNativeLinuxDir)\**\*.a;
-                      $(CefNativeLinuxDir)\**\*.lib;
-                      $(CefNativeLinuxDir)\**\*.exp;
-                      $(CefNativeLinuxDir)\**\*.pdb;
-                      $(CefNativeLinuxDir)\**\*.ilk;
-                      $(CefNativeLinuxDir)\**\*.nupkg;
-                      $(CefNativeLinuxDir)\**\CMakeFiles\**;
-                      $(CefNativeLinuxDir)\**\*.dir\**;
-                      $(CefNativeLinuxDir)\**\*.vcxproj*;
-                      $(CefNativeLinuxDir)\**\*.cmake;
-                      $(CefNativeLinuxDir)\CMakeCache.txt;
-                      $(CefNativeLinuxDir)\cmake_install.cmake;
-                      $(CefNativeLinuxDir)\Makefile"
-             Pack="true" PackagePath="runtimes\linux-x64\native\%(RecursiveDir)%(Filename)%(Extension)">
+    <!-- Host executable + sandbox helper -->
+    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\CefBrowser.Native" />
+    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\chrome-sandbox" />
+
+    <!-- CEF shared libraries -->
+    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\libcef.so" />
+    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\libEGL.so" />
+    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\libGLESv2.so" />
+    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\libvk_swiftshader.so" />
+    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\libvulkan.so.1" />
+    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\vk_swiftshader_icd.json" />
+
+    <!-- Resources: ICU data, V8 snapshots, .pak bundles + localized strings -->
+    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\*.dat" />
+    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\*.bin" />
+    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\*.pak" />
+
+    <Content Include="@(CefLinuxNativeFile)"
+             Pack="true" PackagePath="runtimes\linux-x64\native\">
+      <Visible>false</Visible>
+    </Content>
+
+    <!-- Localized strings keep their own subfolder. PackagePath ends with a
+         separator so NuGet appends each file name itself: %(RecursiveDir) is
+         only populated for '**' globs, which silently flattened locales/. -->
+    <Content Include="$(CefNativeLinuxDir)\locales\*.pak"
+             Pack="true" PackagePath="runtimes\linux-x64\native\locales\">
       <Visible>false</Visible>
     </Content>
   </ItemGroup>
