@@ -41,11 +41,14 @@
     compressed, so no package containing it can ever fit under NuGet.org's
     250 MB hard limit. Everything else here is ~93 MB raw (~40-50 MB packed).
 
-    Consumers must supply libcef.so themselves, either by pointing
-    CefLinuxRoot/CEF_ROOT at a CEF 109 Linux64 distribution, or (once
-    implemented) by letting the control download and cache it on first run.
+    Consumers must supply libcef.so themselves, either by pointing CEF_ROOT
+    (or CEFAVALONIA_CEF_ROOT) at a CEF 109 Linux64 distribution, or by letting
+    the control download and cache it on first run (see CefRuntimeResolver).
   -->
-  <ItemGroup Condition="Exists('$(CefNativeLinuxDir)\libcef.so')">
+  <!-- Gate on the host executable, not libcef.so: the latter is intentionally
+       not shipped (too large for nuget.org), so a slim build without it would
+       otherwise produce an EMPTY package. CefBrowser.Native is always built. -->
+  <ItemGroup Condition="Exists('$(CefNativeLinuxDir)\CefBrowser.Native')">
     <!-- Host executable + sandbox helper -->
     <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\CefBrowser.Native" />
     <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\chrome-sandbox" />
