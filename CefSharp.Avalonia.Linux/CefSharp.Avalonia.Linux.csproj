@@ -45,9 +45,9 @@
     (or CEFAVALONIA_CEF_ROOT) at a CEF 109 Linux64 distribution, or by letting
     the control download and cache it on first run (see CefRuntimeResolver).
   -->
-  <!-- Gate on the host executable, not libcef.so: the latter is intentionally
-       not shipped (too large for nuget.org), so a slim build without it would
-       otherwise produce an EMPTY package. CefBrowser.Native is always built. -->
+   <!-- Gate on the host executable, NOT libcef.so: libcef.so is no longer part
+       of this package, so gating on it would silently emit an EMPTY package
+       whenever the native build dir lacks it. -->
   <ItemGroup Condition="Exists('$(CefNativeLinuxDir)\CefBrowser.Native')">
     <!-- Host executable + sandbox helper -->
     <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\CefBrowser.Native" />

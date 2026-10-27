@@ -39,12 +39,17 @@ public static class CefRuntimeResolver
         "https://github.com/EgorVictor/CefAvalonia/releases/download/cef-runtime-{0}/libcef-{0}-linux-x64.tar.gz";
 
     /// <summary>
-    /// SHA-256 of the release asset, filled in when the asset is published.
-    /// Left empty on purpose: with no checksum the download is REFUSED rather
-    /// than fetching an unverified binary. Update it together with
-    /// <c>docs/cef-runtime</c> whenever the CEF version is bumped.
+    /// SHA-256 of the release asset published at tag <c>cef-runtime-109.1.11</c>.
+    /// With no checksum the download is REFUSED rather than fetching an
+    /// unverified binary.
+    ///
+    /// This hashes the EXACT file uploaded to the release, which is immutable:
+    /// re-tarring libcef.so elsewhere yields different bytes and therefore a
+    /// different hash. If the asset is ever rebuilt, update this constant and
+    /// the uploaded file together.
     /// </summary>
-    private const string ReleaseAssetSha256 = "";
+    private const string ReleaseAssetSha256 =
+        "e5307c50e1f76cefef3f893ba70b1d7c86c153531d0d77987fbf7bf3878e4569";
 
     private static readonly SemaphoreSlim Gate = new(1, 1);
     private static string? _resolvedDirectory;

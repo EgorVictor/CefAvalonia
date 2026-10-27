@@ -7,14 +7,14 @@ name: CEF Linux runtime asset
 # CefRuntimeResolver downloads this asset on first run, verifies its SHA-256 and
 # caches it under ~/.cache/cefavalonia/libcef/<version>.
 #
-# Run manually (Actions -> CEF Linux runtime asset -> Run workflow), or push a
-# 'cef-runtime-*' tag. After it completes, copy the printed SHA-256 into
-# CefRuntimeResolver.ReleaseAssetSha256 and the download path starts working.
+# Manual trigger only. Do NOT re-add a 'push: tags: cef-runtime-*' trigger:
+# the release is immutable, so the workflow's asset upload would fail after a
+# manually published release — the manually uploaded asset is authoritative.
+# After publishing, copy the SHA-256 of the uploaded file into
+# CefRuntimeResolver.ReleaseAssetSha256.
 
 on:
   workflow_dispatch:
-  push:
-    tags: ['cef-runtime-*']
 
 permissions:
   contents: write
@@ -50,7 +50,10 @@ jobs:
           set -euo pipefail
           cd "$HOME/cef/cef_binary_${{ env.CEF_VER }}_linux64/Release"
           OUT="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-x64.tar.gz"
-          tar -czf "$OUT" libcef.so
+          # Reproducible: deterministic tar metadata + gzip without name/timestamp,
+          # so the produced bytes (and therefore the SHA-256) are stable across runs
+          # and match CefRuntimeResolver.ReleaseAssetSha256.
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -cf - libcef.so | gzip -n -c > "$OUT"
           ls -lh "$OUT"
 
       - name: Compute SHA-256
