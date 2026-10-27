@@ -151,6 +151,19 @@ public sealed class BrowserProcessManager : IDisposable
         lastUrl = url;
         _hostWindow = hostWindow;
 
+        // Linux only (no-op elsewhere): libcef.so cannot ship inside the NuGet
+        // package, so resolve it before spawning the host. Starting the host
+        // without it would fail with an opaque dynamic-loader error.
+        if (!await CefRuntimeResolver.EnsureAsync(exePath, cancellationToken).ConfigureAwait(false))
+        {
+            CefDiagnostics.Error(
+                "[BPM] libcef.so is unavailable; the native browser host cannot start. " +
+                "Copy libcef.so next to CefBrowser.Native, set CEF_ROOT to a CEF 109 Linux64 " +
+                "distribution, or enable the one-time download by assigning " +
+                "CefRuntimeResolver.ExpectedSha256.");
+            return false;
+        }
+
         CefHostProcess host;
         int browserId;
         try

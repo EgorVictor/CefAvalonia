@@ -1,0 +1,89 @@
+name: CEF Linux runtime asset
+
+# Publishes libcef.so as a GitHub Release asset.
+#
+# It cannot live inside the NuGet package: ~1.05 GB raw / ~240 MB compressed,
+# which on its own blows NuGet.org's 250 MB per-package limit. Instead
+# CefRuntimeResolver downloads this asset on first run, verifies its SHA-256 and
+# caches it under ~/.cache/cefavalonia/libcef/<version>.
+#
+# Run manually (Actions -> CEF Linux runtime asset -> Run workflow), or push a
+# 'cef-runtime-*' tag. After it completes, copy the printed SHA-256 into
+# CefRuntimeResolver.ReleaseAssetSha256 and the download path starts working.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['cef-runtime-*']
+
+permissions:
+  contents: write
+
+env:
+  CEF_VER: 109.1.11+g6d4fdb2+chromium-109.0.5414.87
+  CEF_SHORT_VER: 109.1.11
+  CEF_RUNTIME_TAG: cef-runtime-109.1.11
+
+jobs:
+  upload-libcef:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Cache CEF binaries
+        id: cache-cef
+        uses: actions/cache@v4
+        with:
+          path: ~/cef
+          key: cef-linux-${{ env.CEF_VER }}
+
+      - name: Download & extract CEF (Linux64)
+        if: steps.cache-cef.outputs.cache-hit != 'true'
+        run: |
+          URL="https://cef-builds.spotifycdn.com/cef_binary_${{ env.CEF_VER }}_linux64.tar.bz2"
+          mkdir -p ~/cef
+          curl -sL -o ~/cef/cef.tar.bz2 "$URL"
+          tar -xf ~/cef/cef.tar.bz2 -C ~/cef
+          rm ~/cef/cef.tar.bz2
+
+      - name: Package libcef.so
+        run: |
+          set -euo pipefail
+          cd "$HOME/cef/cef_binary_${{ env.CEF_VER }}_linux64/Release"
+          OUT="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-x64.tar.gz"
+          tar -czf "$OUT" libcef.so
+          ls -lh "$OUT"
+
+      - name: Compute SHA-256
+        id: sha
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-x64.tar.gz"
+          SHA=$(sha256sum "$OUT" | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "### libcef.so asset SHA-256"
+            echo ""
+            echo '```'
+            echo "$SHA"
+            echo '```'
+            echo ""
+            echo "Paste this value into \`CefRuntimeResolver.ReleaseAssetSha256\`."
+            echo "Until then the runtime download is refused (unverified binaries are never fetched)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ASSET="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-x64.tar.gz"
+          if gh release view "${{ env.CEF_RUNTIME_TAG }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "${{ env.CEF_RUNTIME_TAG }}" "$ASSET" \
+              --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "${{ env.CEF_RUNTIME_TAG }}" "$ASSET" \
+              --repo "${{ github.repository }}" \
+              --title "CEF ${{ env.CEF_SHORT_VER }} Linux x64 runtime (libcef.so)" \
+              --latest=false \
+              --notes "libcef.so only, consumed by CefRuntimeResolver on first run. SHA-256: ${{ steps.sha.outputs.sha256 }}"
+          fi

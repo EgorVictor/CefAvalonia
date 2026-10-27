@@ -224,6 +224,30 @@ browser.CefSettings.Locale = "zh-CN";
 
 > 一个 CEF 发行包约 150–180 MB，Windows + Linux 两套塞进同一个 nupkg 会超过 NuGet.org 的 **250 MB 上限**，因此拆成两个包。跨平台发布（例如在 Windows 上执行 `dotnet publish -r linux-x64`）时，把 `CefSharp.Avalonia.Linux` 也引用上即可，SDK 会自动按 RID 选用对应原生文件。
 
+> ## ⚠️ Linux：`libcef.so` 不在包内，首次运行会自动下载
+>
+> `libcef.so` 原始约 **1.05 GB**、压缩后仍约 **240 MB**，任何包含它的包都会超过 NuGet.org 的 250 MB 硬上限，因此 `CefSharp.Avalonia.Linux` 只带宿主程序 + 支持文件（约 93 MB），**不含 `libcef.so`**。
+>
+> 运行时由 `CefRuntimeResolver` 按以下顺序解析：
+> 1. `CefBrowser.Native` 所在目录（手动部署时把 `libcef.so` 拷到旁边即可）
+> 2. `CEF_ROOT` / `CEFAVALONIA_CEF_ROOT` 指向的 CEF 发行目录（离线环境推荐）
+> 3. 已在 `LD_LIBRARY_PATH` 中的目录
+> 4. 缓存目录 `~/.cache/cefavalonia/libcef/109.1.11/`
+> 5. 从 GitHub Release 下载（**校验 SHA-256 后才解压**，之后复用缓存）
+>
+> 相关开关：
+> ```csharp
+> // 自托管镜像
+> CefRuntimeResolver.DownloadUrl = "https://your-mirror/libcef-109.1.11-linux-x64.tar.gz";
+> CefRuntimeResolver.ExpectedSha256 = "<该文件的 SHA-256>";   // 为空时拒绝下载
+> ```
+> ```bash
+> export CEF_ROOT=/path/to/cef_binary_109.1.11..._linux64   # 离线：直接指定
+> export CEFAVALONIA_NO_DOWNLOAD=1                          # 离线：禁用下载
+> export XDG_CACHE_HOME=/custom/cache                        # 自定义缓存位置
+> ```
+> 下载资产由 `.github/workflows/cef-runtime.yml` 生成（Release tag `cef-runtime-109.1.11`）；跑完后需把输出的 SHA-256 填进 `CefRuntimeResolver.ReleaseAssetSha256`，否则下载会被拒绝（绝不拉取未校验的二进制）。
+
 ### 目标框架要求（消费方）
 
 ```xml

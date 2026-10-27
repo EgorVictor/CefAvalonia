@@ -176,12 +176,22 @@ public sealed class CefHostProcess : IDisposable
         {
             TryMakeExecutable(_exePath);
 
-            // libcef.so and friends live next to the native executable.
+            // libcef.so and friends live next to the native executable. On Linux
+            // CefRuntimeResolver may have provisioned it elsewhere (cache dir or
+            // CEF_ROOT override) because it is too large to ship in the package.
             string nativeDir = Path.GetDirectoryName(_exePath) ?? AppContext.BaseDirectory;
+
+            var libraryDirs = new List<string> { nativeDir };
+            string? resolved = CefRuntimeResolver.ResolvedDirectory;
+            if (!string.IsNullOrEmpty(resolved) && !libraryDirs.Contains(resolved))
+                libraryDirs.Add(resolved);
+
             string oldLibPath = Environment.GetEnvironmentVariable("LD_LIBRARY_PATH") ?? "";
-            psi.Environment["LD_LIBRARY_PATH"] = oldLibPath.Length == 0
-                ? nativeDir
-                : nativeDir + ":" + oldLibPath;
+            string libraryPath = string.Join(":", libraryDirs);
+            if (oldLibPath.Length != 0)
+                libraryPath += ":" + oldLibPath;
+
+            psi.Environment["LD_LIBRARY_PATH"] = libraryPath;
         }
 
         Process process = Process.Start(psi)

@@ -37,16 +37,20 @@
     and excluding them by extension was not enough — the package still came out
     at ~318 MB and NuGet.org rejected it with HTTP 413 (>250 MB limit).
 
-    Only the files CEF actually loads at runtime are listed here, which keeps
-    the package at ~110 MB, the same order as the Windows one (~116 MB).
+    libcef.so is deliberately NOT shipped: it is ~1.05 GB raw / ~240 MB
+    compressed, so no package containing it can ever fit under NuGet.org's
+    250 MB hard limit. Everything else here is ~93 MB raw (~40-50 MB packed).
+
+    Consumers must supply libcef.so themselves, either by pointing
+    CefLinuxRoot/CEF_ROOT at a CEF 109 Linux64 distribution, or (once
+    implemented) by letting the control download and cache it on first run.
   -->
   <ItemGroup Condition="Exists('$(CefNativeLinuxDir)\libcef.so')">
     <!-- Host executable + sandbox helper -->
     <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\CefBrowser.Native" />
     <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\chrome-sandbox" />
 
-    <!-- CEF shared libraries -->
-    <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\libcef.so" />
+    <!-- CEF shared libraries (libcef.so excluded — see note above) -->
     <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\libEGL.so" />
     <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\libGLESv2.so" />
     <CefLinuxNativeFile Include="$(CefNativeLinuxDir)\libvk_swiftshader.so" />
