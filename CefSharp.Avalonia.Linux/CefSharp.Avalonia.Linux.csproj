@@ -32,8 +32,26 @@
   </ItemGroup>
 
   <ItemGroup Condition="Exists('$(CefNativeLinuxDir)\libcef.so')">
+    <!-- Exclude build/CMake intermediates RECURSIVELY: the old single-level
+         exclude let subdirectories (CMakeFiles/, *.dir/, libcef_dll_wrapper
+         artifacts ...) into the package, pushing it past NuGet.org's 250 MB
+         limit (HTTP 413 on push). -->
     <Content Include="$(CefNativeLinuxDir)\**\*"
-             Exclude="$(CefNativeLinuxDir)\*.obj;$(CefNativeLinuxDir)\*.pdb;$(CefNativeLinuxDir)\*.a;$(CefNativeLinuxDir)\*.dll;$(CefNativeLinuxDir)\*.exe;$(CefNativeLinuxDir)\*.lib;$(CefNativeLinuxDir)\*.exp"
+             Exclude="$(CefNativeLinuxDir)\**\*.o;
+                      $(CefNativeLinuxDir)\**\*.obj;
+                      $(CefNativeLinuxDir)\**\*.a;
+                      $(CefNativeLinuxDir)\**\*.lib;
+                      $(CefNativeLinuxDir)\**\*.exp;
+                      $(CefNativeLinuxDir)\**\*.pdb;
+                      $(CefNativeLinuxDir)\**\*.ilk;
+                      $(CefNativeLinuxDir)\**\*.nupkg;
+                      $(CefNativeLinuxDir)\**\CMakeFiles\**;
+                      $(CefNativeLinuxDir)\**\*.dir\**;
+                      $(CefNativeLinuxDir)\**\*.vcxproj*;
+                      $(CefNativeLinuxDir)\**\*.cmake;
+                      $(CefNativeLinuxDir)\CMakeCache.txt;
+                      $(CefNativeLinuxDir)\cmake_install.cmake;
+                      $(CefNativeLinuxDir)\Makefile"
              Pack="true" PackagePath="runtimes\linux-x64\native\%(RecursiveDir)%(Filename)%(Extension)">
       <Visible>false</Visible>
     </Content>

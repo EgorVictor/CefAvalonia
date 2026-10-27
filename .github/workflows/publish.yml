@@ -80,9 +80,14 @@ jobs:
         if: env.PACKAGE_VERSION != ''
         shell: pwsh
         run: |
-          $csproj = "CefSharp.Avalonia\CefSharp.Avalonia.csproj"
-          (Get-Content $csproj) -replace '<Version>.*?</Version>', "<Version>$env:PACKAGE_VERSION</Version>" | Set-Content $csproj
-          Write-Host "Updated csproj version to $env:PACKAGE_VERSION"
+          $csprojs = @(
+            "CefSharp.Avalonia\CefSharp.Avalonia.csproj",
+            "CefSharp.Avalonia.Linux\CefSharp.Avalonia.Linux.csproj"
+          )
+          foreach ($csproj in $csprojs) {
+            (Get-Content $csproj) -replace '<Version>.*?</Version>', "<Version>$env:PACKAGE_VERSION</Version>" | Set-Content $csproj
+            Write-Host "Updated $csproj version to $env:PACKAGE_VERSION"
+          }
 
       - name: CMake configure
         run: |
@@ -134,9 +139,18 @@ jobs:
       - name: Push to nuget.org (trusted publishing)
         if: env.PACKAGE_VERSION != ''
         run: |
+          Get-ChildItem artifacts\*.nupkg | ForEach-Object {
+            "{0}  {1:N1} MB" -f $_.Name, ($_.Length / 1MB)
+          }
+          $tooBig = Get-ChildItem artifacts\*.nupkg | Where-Object { $_.Length -gt 250MB }
+          if ($tooBig) {
+            $tooBig | ForEach-Object { Write-Host "::error::$($_.Name) is $([math]::Round($_.Length/1MB,1)) MB — NuGet.org limit is 250 MB" }
+            exit 1
+          }
           dotnet nuget push artifacts\*.nupkg `
             --api-key ${{ steps.login.outputs.NUGET_API_KEY }} `
-            --source https://api.nuget.org/v3/index.json
+            --source https://api.nuget.org/v3/index.json `
+            --skip-duplicate
 
   build-linux:
     runs-on: ubuntu-latest
