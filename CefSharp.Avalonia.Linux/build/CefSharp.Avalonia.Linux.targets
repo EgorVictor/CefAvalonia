@@ -9,7 +9,10 @@
     non-RID build case.
   -->
   <PropertyGroup>
-    <_CefLinuxNativePackageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)../runtimes/linux-x64/native'))</_CefLinuxNativePackageDir>
+    <_CefLinuxRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</_CefLinuxRid>
+    <_CefLinuxRid Condition="'$(_CefLinuxRid)' == '' AND $([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) == 'Arm64'">linux-arm64</_CefLinuxRid>
+    <_CefLinuxRid Condition="'$(_CefLinuxRid)' == ''">linux-x64</_CefLinuxRid>
+    <_CefLinuxNativePackageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)../runtimes/$(_CefLinuxRid)/native'))</_CefLinuxNativePackageDir>
   </PropertyGroup>
 
   <ItemGroup>

@@ -35,7 +35,7 @@
     Native binaries ship as RID-specific assets. A single CEF distribution is
     already ~150-180 MB, so two full distributions in one package would exceed
     NuGet.org's 250 MB limit. Windows natives live here (win-x64); Linux natives
-    ship separately in the CefSharp.Avalonia.Linux package (linux-x64).
+    ship separately in the CefSharp.Avalonia.Linux package (linux-x64 / linux-arm64).
   -->
   <PropertyGroup>
     <CefNativeWinDir Condition="'$(CefNativeWinDir)' == ''">..\CefBrowser.Native\build\Release</CefNativeWinDir>

@@ -4,6 +4,7 @@ using System.Formats.Tar;
 using System.IO;
 using System.IO.Compression;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -35,11 +36,15 @@ public static class CefRuntimeResolver
     /// <summary>CEF version the native host was built against. Must match the downloaded binary exactly.</summary>
     public const string CefVersion = "109.1.11";
 
+    /// <summary>Linux architecture segment used in release asset names and cache paths.</summary>
+    public static string LinuxArchitecture =>
+        RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "arm64" : "x64";
+
     private const string DefaultDownloadUrlFormat =
-        "https://github.com/EgorVictor/CefAvalonia/releases/download/cef-runtime-{0}/libcef-{0}-linux-x64.tar.gz";
+        "https://github.com/EgorVictor/CefAvalonia/releases/download/cef-runtime-{0}/libcef-{0}-linux-{1}.tar.gz";
 
     /// <summary>
-    /// SHA-256 of the release asset published at tag <c>cef-runtime-109.1.11</c>.
+    /// SHA-256 of the x64 release asset published at tag <c>cef-runtime-109.1.11</c>.
     /// With no checksum the download is REFUSED rather than fetching an
     /// unverified binary.
     ///
@@ -48,19 +53,29 @@ public static class CefRuntimeResolver
     /// different hash. If the asset is ever rebuilt, update this constant and
     /// the uploaded file together.
     /// </summary>
-    private const string ReleaseAssetSha256 =
+    private const string ReleaseAssetSha256X64 =
         "e5307c50e1f76cefef3f893ba70b1d7c86c153531d0d77987fbf7bf3878e4569";
+
+    /// <summary>
+    /// SHA-256 of the arm64 release asset. Must be filled in once the arm64
+    /// asset is published by <c>cef-runtime.yml</c>; until then downloads on
+    /// arm64 are refused (unverified binaries are never fetched).
+    /// </summary>
+    private const string? ReleaseAssetSha256Arm64 = null;
 
     private static readonly SemaphoreSlim Gate = new(1, 1);
     private static string? _resolvedDirectory;
 
     /// <summary>Override the download URL (self-hosted mirror, intranet, ...).</summary>
-    public static string DownloadUrl { get; set; } = string.Format(DefaultDownloadUrlFormat, CefVersion);
+    public static string DownloadUrl { get; set; } = string.Format(DefaultDownloadUrlFormat, CefVersion, LinuxArchitecture);
 
     /// <summary>
     /// Expected SHA-256 of the archive. When null or empty, downloading is refused.
     /// </summary>
-    public static string? ExpectedSha256 { get; set; } = ReleaseAssetSha256;
+    public static string? ExpectedSha256 { get; set; } =
+        RuntimeInformation.ProcessArchitecture == Architecture.Arm64
+            ? ReleaseAssetSha256Arm64
+            : ReleaseAssetSha256X64;
 
     /// <summary>Directory containing the <c>libcef.so</c> in use, or null before resolution.</summary>
     public static string? ResolvedDirectory => _resolvedDirectory;
@@ -168,9 +183,10 @@ public static class CefRuntimeResolver
         if (string.IsNullOrWhiteSpace(expected))
         {
             CefDiagnostics.Error(
-                "[CefRuntime] libcef.so not found and no expected SHA-256 is configured, so an unverified " +
-                "binary will not be downloaded. Copy libcef.so next to CefBrowser.Native, set CEF_ROOT, or " +
-                "assign CefRuntimeResolver.ExpectedSha256.");
+                $"[CefRuntime] libcef.so not found and no expected SHA-256 is configured for linux-{LinuxArchitecture}, " +
+                "so an unverified binary will not be downloaded. Point CEF_ROOT / CEFAVALONIA_CEF_ROOT at a local " +
+                "CEF distribution, copy libcef.so next to CefBrowser.Native, or set " +
+                "CEFAVALONIA_LIBCEF_SHA256 / CefRuntimeResolver.ExpectedSha256.");
             return null;
         }
 
@@ -263,7 +279,13 @@ public static class CefRuntimeResolver
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache")
             : xdg;
 
-        return Path.Combine(baseDir, "cefavalonia", "libcef", CefVersion);
+        // Keep the historical x64 cache path for backwards compatibility; only
+        // arm64 gets its own subfolder so the two architectures never clobber
+        // each other's cached libcef.so.
+        string versionSegment = LinuxArchitecture == "x64"
+            ? CefVersion
+            : CefVersion + "-" + LinuxArchitecture;
+        return Path.Combine(baseDir, "cefavalonia", "libcef", versionSegment);
     }
 
     private static string ComputeSha256(string path)

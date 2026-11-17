@@ -1,17 +1,17 @@
 name: CEF Linux runtime asset
 
-# Publishes libcef.so as a GitHub Release asset.
+# Publishes libcef.so as a GitHub Release asset (one per architecture).
 #
 # It cannot live inside the NuGet package: ~1.05 GB raw / ~240 MB compressed,
 # which on its own blows NuGet.org's 250 MB per-package limit. Instead
 # CefRuntimeResolver downloads this asset on first run, verifies its SHA-256 and
-# caches it under ~/.cache/cefavalonia/libcef/<version>.
+# caches it under ~/.cache/cefavalonia/libcef/<version>[-<arch>].
 #
-# Manual trigger only. Do NOT re-add a 'push: tags: cef-runtime-*' trigger:
-# the release is immutable, so the workflow's asset upload would fail after a
-# manually published release — the manually uploaded asset is authoritative.
-# After publishing, copy the SHA-256 of the uploaded file into
-# CefRuntimeResolver.ReleaseAssetSha256.
+# Manual trigger only. The asset name is part of the public contract: consumers
+# pin its SHA-256 in CefRuntimeResolver, so a rebuilt asset must never silently
+# replace the published bytes (that would break every existing install). The
+# "Verify against CefRuntimeResolver pin" step enforces exactly that and prints
+# the value to paste when the pin is still missing.
 
 on:
   workflow_dispatch:
@@ -29,6 +29,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: Cache CEF binaries
         id: cache-cef
         uses: actions/cache@v4
@@ -45,34 +47,66 @@ jobs:
           tar -xf ~/cef/cef.tar.bz2 -C ~/cef
           rm ~/cef/cef.tar.bz2
 
+      # Deterministic on purpose: fixed tar metadata + gzip -n makes the bytes
+      # (and therefore the SHA-256) identical on any machine and architecture,
+      # so a pin computed locally matches the one produced on the runner.
       - name: Package libcef.so
+        env:
+          ARCH: x64
         run: |
           set -euo pipefail
           cd "$HOME/cef/cef_binary_${{ env.CEF_VER }}_linux64/Release"
-          OUT="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-x64.tar.gz"
-          # Reproducible: deterministic tar metadata + gzip without name/timestamp,
-          # so the produced bytes (and therefore the SHA-256) are stable across runs
-          # and match CefRuntimeResolver.ReleaseAssetSha256.
+          OUT="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-${ARCH}.tar.gz"
           tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -cf - libcef.so | gzip -n -c > "$OUT"
           ls -lh "$OUT"
 
       - name: Compute SHA-256
         id: sha
+        env:
+          ARCH: x64
         run: |
           set -euo pipefail
-          OUT="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-x64.tar.gz"
+          OUT="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-${ARCH}.tar.gz"
           SHA=$(sha256sum "$OUT" | cut -d' ' -f1)
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Verify against CefRuntimeResolver pin
+        env:
+          ARCH: x64
+          CONST_NAME: ReleaseAssetSha256X64
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-${ARCH}.tar.gz"
+          SHA=$(sha256sum "$OUT" | cut -d' ' -f1)
+          PINNED=$(grep -oE "${CONST_NAME}[[:space:]]*=[[:space:]]*\"[0-9a-f]{64}\"" \
+                     CefSharp.Avalonia/CefRuntimeResolver.cs \
+                   | grep -oE '[0-9a-f]{64}' || true)
           {
-            echo "### libcef.so asset SHA-256"
+            echo "### libcef.so ${ARCH} asset SHA-256"
             echo ""
             echo '```'
             echo "$SHA"
             echo '```'
             echo ""
-            echo "Paste this value into \`CefRuntimeResolver.ReleaseAssetSha256\`."
-            echo "Until then the runtime download is refused (unverified binaries are never fetched)."
+            if [ -n "$PINNED" ] && [ "$PINNED" = "$SHA" ]; then
+              echo "Already pinned in \`CefRuntimeResolver.${CONST_NAME}\`."
+            else
+              echo "Paste into \`CefRuntimeResolver.${CONST_NAME}\`:"
+              echo '```csharp'
+              echo "${CONST_NAME} = \"${SHA}\";"
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$PINNED" ]; then
+            echo "::warning::${CONST_NAME} has not been pinned yet. The asset is uploaded, but ${ARCH} downloads stay refused until the value above is committed."
+          elif [ "$PINNED" != "$SHA" ]; then
+            echo "::error::${ARCH} asset SHA-256 ${SHA} does not match pinned ${PINNED}."
+            echo "::error::Refusing to upload: every existing install would break on the new bytes. Update the pin and CEF_SHORT_VER/CEF_VER together if this rebuild was intended."
+            exit 1
+          else
+            echo "${ARCH} asset matches the pinned SHA-256."
+          fi
 
       - name: Create or update the release
         env:
@@ -86,7 +120,104 @@ jobs:
           else
             gh release create "${{ env.CEF_RUNTIME_TAG }}" "$ASSET" \
               --repo "${{ github.repository }}" \
-              --title "CEF ${{ env.CEF_SHORT_VER }} Linux x64 runtime (libcef.so)" \
+              --title "CEF ${{ env.CEF_SHORT_VER }} Linux runtime (libcef.so)" \
               --latest=false \
-              --notes "libcef.so only, consumed by CefRuntimeResolver on first run. SHA-256: ${{ steps.sha.outputs.sha256 }}"
+              --notes "libcef.so only, consumed by CefRuntimeResolver on first run. Per-architecture assets; SHA-256 is pinned in CefSharp.Avalonia/CefRuntimeResolver.cs."
+          fi
+
+  upload-libcef-arm64:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache CEF binaries
+        id: cache-cef
+        uses: actions/cache@v4
+        with:
+          path: ~/cef
+          key: cef-linux-arm-${{ env.CEF_VER }}
+
+      - name: Download & extract CEF (Linux ARM64)
+        if: steps.cache-cef.outputs.cache-hit != 'true'
+        run: |
+          URL="https://cef-builds.spotifycdn.com/cef_binary_${{ env.CEF_VER }}_linuxarm64.tar.bz2"
+          mkdir -p ~/cef
+          curl -sL -o ~/cef/cef.tar.bz2 "$URL"
+          tar -xf ~/cef/cef.tar.bz2 -C ~/cef
+          rm ~/cef/cef.tar.bz2
+
+      - name: Package libcef.so
+        env:
+          ARCH: arm64
+        run: |
+          set -euo pipefail
+          cd "$HOME/cef/cef_binary_${{ env.CEF_VER }}_linuxarm64/Release"
+          OUT="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-${ARCH}.tar.gz"
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -cf - libcef.so | gzip -n -c > "$OUT"
+          ls -lh "$OUT"
+
+      - name: Compute SHA-256
+        id: sha
+        env:
+          ARCH: arm64
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-${ARCH}.tar.gz"
+          SHA=$(sha256sum "$OUT" | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Verify against CefRuntimeResolver pin
+        env:
+          ARCH: arm64
+          CONST_NAME: ReleaseAssetSha256Arm64
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-${ARCH}.tar.gz"
+          SHA=$(sha256sum "$OUT" | cut -d' ' -f1)
+          PINNED=$(grep -oE "${CONST_NAME}[[:space:]]*=[[:space:]]*\"[0-9a-f]{64}\"" \
+                     CefSharp.Avalonia/CefRuntimeResolver.cs \
+                   | grep -oE '[0-9a-f]{64}' || true)
+          {
+            echo "### libcef.so ${ARCH} asset SHA-256"
+            echo ""
+            echo '```'
+            echo "$SHA"
+            echo '```'
+            echo ""
+            if [ -n "$PINNED" ] && [ "$PINNED" = "$SHA" ]; then
+              echo "Already pinned in \`CefRuntimeResolver.${CONST_NAME}\`."
+            else
+              echo "Paste into \`CefRuntimeResolver.${CONST_NAME}\`:"
+              echo '```csharp'
+              echo "${CONST_NAME} = \"${SHA}\";"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$PINNED" ]; then
+            echo "::warning::${CONST_NAME} has not been pinned yet. The asset is uploaded, but ${ARCH} downloads stay refused until the value above is committed."
+          elif [ "$PINNED" != "$SHA" ]; then
+            echo "::error::${ARCH} asset SHA-256 ${SHA} does not match pinned ${PINNED}."
+            echo "::error::Refusing to upload: every existing install would break on the new bytes. Update the pin and CEF_SHORT_VER/CEF_VER together if this rebuild was intended."
+            exit 1
+          else
+            echo "${ARCH} asset matches the pinned SHA-256."
+          fi
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ASSET="$RUNNER_TEMP/libcef-${{ env.CEF_SHORT_VER }}-linux-arm64.tar.gz"
+          if gh release view "${{ env.CEF_RUNTIME_TAG }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "${{ env.CEF_RUNTIME_TAG }}" "$ASSET" \
+              --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "${{ env.CEF_RUNTIME_TAG }}" "$ASSET" \
+              --repo "${{ github.repository }}" \
+              --title "CEF ${{ env.CEF_SHORT_VER }} Linux runtime (libcef.so)" \
+              --latest=false \
+              --notes "libcef.so only, consumed by CefRuntimeResolver on first run. Per-architecture assets; SHA-256 is pinned in CefSharp.Avalonia/CefRuntimeResolver.cs."
           fi
