@@ -147,6 +147,12 @@ public sealed class BrowserProcessManager : IDisposable
         }
 
         settings ??= new CefSettings();
+        // Linux has no native child-window embedding: the host always renders
+        // off-screen and blits frames from shared memory. CEF only invokes
+        // OnPaint when windowless rendering is enabled process-wide, so force it
+        // even if the caller left it unset (the host enforces this too).
+        if (OperatingSystem.IsLinux() && settings.WindowlessRenderingEnabled != true)
+            settings.WindowlessRenderingEnabled = true;
         _settings = settings;
         lastUrl = url;
         _hostWindow = hostWindow;
@@ -158,7 +164,7 @@ public sealed class BrowserProcessManager : IDisposable
         {
             CefDiagnostics.Error(
                 "[BPM] libcef.so is unavailable; the native browser host cannot start. " +
-                "Copy libcef.so next to CefBrowser.Native, set CEF_ROOT to a CEF 109 Linux64 " +
+                "Copy libcef.so next to CefBrowser.Native, set CEF_ROOT to a CEF 109 Linux " +
                 "distribution, or enable the one-time download by assigning " +
                 "CefRuntimeResolver.ExpectedSha256.");
             return false;

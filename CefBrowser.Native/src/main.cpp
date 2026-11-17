@@ -481,6 +481,13 @@ static void ApplyCefSettingsFromArgs(CefSettings& settings) {
     };
 
     int b;
+#if defined(__linux__)
+    // Linux always uses off-screen rendering (see DoCreateBrowser). Chromium
+    // only calls CefRenderHandler::OnPaint when this process-level setting is
+    // on, so a managed caller that forgets --cef-windowless-rendering-enabled
+    // would otherwise get a live browser that never paints a single frame.
+    settings.windowless_rendering_enabled = true;
+#endif
     if ((b = setBool("--cef-no-sandbox")) >= 0) settings.no_sandbox = b;
     setStr(settings, "--cef-browser-subprocess-path", settings.browser_subprocess_path);
     setStr(settings, "--cef-framework-dir-path", settings.framework_dir_path);

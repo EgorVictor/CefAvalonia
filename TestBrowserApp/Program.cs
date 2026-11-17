@@ -31,14 +31,12 @@ class Program
             e.SetObserved();
         };
 
-        // CEF_DIAG=1 turns on verbose library diagnostics and routes them to the
-        // same log file, so native-host embedding problems (X11 reparent, etc.)
-        // are visible on Linux where Debug.WriteLine goes nowhere.
+        // CEF_DIAG=1 turns on verbose library diagnostics. The sink is always
+        // installed so Error-level failures (missing system library, glibc too
+        // old, host crash) land in testapp_debug.log even without CEF_DIAG.
         if (Environment.GetEnvironmentVariable("CEF_DIAG") == "1")
-        {
             CefDiagnostics.Level = CefLogLevel.Debug;
-            CefDiagnostics.Sink = (level, message) => Log($"[{level}] {message}");
-        }
+        CefDiagnostics.Sink = (level, message) => Log($"[{level}] {message}");
 
         BuildAvaloniaApp()
             .StartWithClassicDesktopLifetime(args);

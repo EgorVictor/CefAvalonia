@@ -58,6 +58,13 @@ public sealed class CefHostProcess : IDisposable
     /// <summary>Process-level arguments of the first (host-creating) browser, used to warn on mismatches.</summary>
     private string? _initialProcessArgs;
     private bool _shutdownRequested;
+    /// <summary>
+    /// Last lines the native host wrote to stderr. Surfaced when the process dies
+    /// before/without the handshake, where the usual cause (missing system
+    /// library, glibc too old) is only printed there.
+    /// </summary>
+    private readonly Queue<string> _recentStderr = new();
+    private const int MaxRecentStderrLines = 20;
     /// <summary>Protocol version reported by the native host, or 0 before the handshake.</summary>
     public int ProtocolVersion { get; private set; }
 
@@ -202,6 +209,7 @@ public sealed class CefHostProcess : IDisposable
         _stdin = process.StandardInput;
         _stdin.AutoFlush = false;
         _shutdownRequested = false;
+        _recentStderr.Clear();
         ProtocolVersion = 0;
         _initialProcessArgs = string.Join(" ", processArguments);
 
@@ -326,7 +334,28 @@ public sealed class CefHostProcess : IDisposable
                 string? line = await stderr.ReadLineAsync().ConfigureAwait(false);
                 if (line == null) break;
                 if (generation != _generation) return;
-                CefDiagnostics.Debug($"[native] {line}");
+
+                lock (_sync)
+                {
+                    if (generation != _generation) return;
+                    _recentStderr.Enqueue(line);
+                    while (_recentStderr.Count > MaxRecentStderrLines)
+                        _recentStderr.Dequeue();
+                }
+
+                // The dynamic loader fails before CEF (and the stdio protocol)
+                // ever starts, so these lines are the only clue the user gets.
+                // Surface them at Error level instead of hiding them behind
+                // CEF_DIAG, which would leave a silently blank browser.
+                if (line.Contains("GLIBC_", StringComparison.Ordinal) ||
+                    line.Contains("error while loading shared libraries", StringComparison.OrdinalIgnoreCase))
+                {
+                    CefDiagnostics.Error($"[native] {line}");
+                }
+                else
+                {
+                    CefDiagnostics.Debug($"[native] {line}");
+                }
             }
         }
         catch
@@ -401,7 +430,34 @@ public sealed class CefHostProcess : IDisposable
             _sinks.Clear();
 
             if (!expected)
-                CefDiagnostics.Error($"[CefHost] {reason} (pid={(process?.Id.ToString() ?? "?")})");
+            {
+                string message = $"[CefHost] {reason} (pid={(process?.Id.ToString() ?? "?")})";
+                if (_recentStderr.Count > 0)
+                {
+                    string detail = string.Join(Environment.NewLine, _recentStderr);
+                    message += Environment.NewLine + "native stderr:" + Environment.NewLine + detail;
+
+                    // Turn the two classic startup failures into an actionable hint.
+                    // The loader prints these before any CEF code runs, so they would
+                    // otherwise only be visible with CEF_DIAG=1.
+                    if (detail.Contains("GLIBC_", StringComparison.Ordinal) &&
+                        detail.Contains("not found", StringComparison.OrdinalIgnoreCase))
+                    {
+                        message += Environment.NewLine +
+                            "hint: the native host was built for a newer glibc than this " +
+                            "distribution provides. Rebuild it on the oldest supported distro " +
+                            "(Ubuntu 22.04 for x64) or use an artifact built for this system.";
+                    }
+                    else if (detail.Contains("error while loading shared libraries", StringComparison.OrdinalIgnoreCase))
+                    {
+                        message += Environment.NewLine +
+                            "hint: a system library required by CEF is missing. See the Linux " +
+                            "apt install list in README.md.";
+                    }
+                }
+                _recentStderr.Clear();
+                CefDiagnostics.Error(message);
+            }
 
             try { stdin?.Dispose(); } catch { /* ignore */ }
             try { process?.Dispose(); } catch { /* ignore */ }

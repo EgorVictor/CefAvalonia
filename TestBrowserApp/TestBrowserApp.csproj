@@ -12,6 +12,7 @@
     <!-- Path to the extracted CEF 109.1.11 Linux64 distribution. Can also be
          overridden with: dotnet build -p:CefLinuxRoot=/path/to/cef_binary_... -->
     <CefLinuxRoot Condition="'$(CefLinuxRoot)' == '' AND '$(CefRoot)' != ''">$(CefRoot)</CefLinuxRoot>
+    <CefLinuxRoot Condition="'$(CefLinuxRoot)' == '' AND $([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) == 'Arm64'">$(HOME)/cef/cef_binary_109.1.11+g6d4fdb2+chromium-109.0.5414.87_linuxarm64</CefLinuxRoot>
     <CefLinuxRoot Condition="'$(CefLinuxRoot)' == ''">$(HOME)/cef/cef_binary_109.1.11+g6d4fdb2+chromium-109.0.5414.87_linux64</CefLinuxRoot>
   </PropertyGroup>
 
@@ -81,6 +82,10 @@
     <PropertyGroup>
       <_NativeExeSource Condition="Exists('..\CefBrowser.Native\build\Release\CefBrowser.Native')">..\CefBrowser.Native\build\Release\CefBrowser.Native</_NativeExeSource>
       <_NativeExeSource Condition="'$(_NativeExeSource)' == '' AND Exists('..\CefBrowser.Native\build\CefBrowser.Native')">..\CefBrowser.Native\build\CefBrowser.Native</_NativeExeSource>
+      <!-- Linux native builds are configured into build-linux/ (see BUILD.md),
+           so look there too instead of failing with "build the native project". -->
+      <_NativeExeSource Condition="'$(_NativeExeSource)' == '' AND Exists('..\CefBrowser.Native\build-linux\Release\CefBrowser.Native')">..\CefBrowser.Native\build-linux\Release\CefBrowser.Native</_NativeExeSource>
+      <_NativeExeSource Condition="'$(_NativeExeSource)' == '' AND Exists('..\CefBrowser.Native\build-linux\CefBrowser.Native')">..\CefBrowser.Native\build-linux\CefBrowser.Native</_NativeExeSource>
     </PropertyGroup>
     <!-- Same policy as Windows: require a real build, do not fall back to a
          checked-in prebuilt binary. -->
