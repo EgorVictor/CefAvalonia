@@ -87,6 +87,13 @@ elseif(OS_LINUX)
       ${CMAKE_DL_LIBS}
       pthread
   )
+
+  # GCC 8 (our ABI baseline: Rocky 8) keeps std::filesystem in a separate
+  # libstdc++fs.a; GCC 9+ merged it into libstdc++. libcef_dll_wrapper may use
+  # it depending on the CEF version, so link it only where it can exist.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+    target_link_libraries(CefBrowser.Native PRIVATE stdc++fs)
+  endif()
 endif()
 
 COPY_FILES(CefBrowser.Native "${CEF_BINARY_FILES}" "${CEF_BINARY_DIR}" "${CEF_TARGET_OUT_DIR}")

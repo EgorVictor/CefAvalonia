@@ -10,6 +10,11 @@ on:
         description: 'Package version (e.g., 1.0.1)'
         required: true
         type: string
+      publish:
+        description: 'Push the built packages to nuget.org (leave OFF to only build + verify)'
+        required: false
+        type: boolean
+        default: false
 
 env:
   DOTNET_VERSION: 8.0.x
@@ -22,7 +27,7 @@ permissions:
 
 jobs:
   build-windows:
-    needs: build-linux
+    needs: [build-linux, build-linux-arm]
     runs-on: windows-latest
 
     steps:
@@ -108,6 +113,12 @@ jobs:
           name: native-linux-x64
           path: artifacts/native-linux-x64
 
+      - name: Download Linux ARM64 native (merge into the package)
+        uses: actions/download-artifact@v4
+        with:
+          name: native-linux-arm64
+          path: artifacts/native-linux-arm64
+
       # Diagnostics: the Linux package must stay well under NuGet.org's 250 MB
       # limit. Print what the native build actually produced so an oversized
       # package can be traced to a specific file instead of guessed at.
@@ -127,7 +138,8 @@ jobs:
       - name: Pack CefSharp.Avalonia.Linux (Linux natives)
         run: |
           dotnet pack CefSharp.Avalonia.Linux\CefSharp.Avalonia.Linux.csproj -c Release -o artifacts `
-            -p:CefNativeLinuxDir="${{ github.workspace }}\artifacts\native-linux-x64"
+            -p:CefNativeLinuxDir="${{ github.workspace }}\artifacts\native-linux-x64" `
+            -p:CefNativeLinuxArm64Dir="${{ github.workspace }}\artifacts\native-linux-arm64"
 
       # Build the demo app too, so compile errors surface in CI (it also copies
       # the native host + CEF binaries next to the assembly).
@@ -140,6 +152,70 @@ jobs:
           name: nuget-package
           path: artifacts\*.nupkg
           if-no-files-found: error
+
+  # Publishing is a separate job on purpose: the .nupkg that reaches nuget.org
+  # is then the exact bytes that were verified. A package version cannot be
+  # deleted from nuget.org (only unlisted), so a bad native binary must never
+  # leave this workflow.
+  publish:
+    needs: [build-windows]
+    # Tags publish automatically; a manual dispatch must opt in explicitly, so
+    # the new container baseline can be exercised on a branch without creating
+    # an undeletable nuget.org version.
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Download NuGet packages
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget-package
+          path: artifacts
+
+      # Re-check the natives AS PACKED, not as built. The build-time gate proves
+      # the files in build/Release are fine; this proves the files that actually
+      # landed under runtimes/<rid>/native/ inside the .nupkg are the same ones.
+      - name: Verify natives inside the .nupkg (glibc 2.28 / GLIBCXX 3.4.25)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          pkgs=(artifacts/*.nupkg)
+          if [ ${#pkgs[@]} -eq 0 ]; then
+            echo "::error::no .nupkg found in artifacts/"; exit 1
+          fi
+          tmp="$(mktemp -d)"
+          for pkg in "${pkgs[@]}"; do
+            echo "== $pkg"
+            rm -rf "$tmp/x"; mkdir -p "$tmp/x"
+            unzip -q "$pkg" -d "$tmp/x"
+            native_dirs=$(find "$tmp/x/runtimes" -type d -name native 2>/dev/null || true)
+            if [ -z "$native_dirs" ]; then
+              echo "::error::$pkg contains no runtimes/*/native payload"; exit 1
+            fi
+            while IFS= read -r -d '' f; do
+              if [ "$(head -c 4 "$f" | od -An -c | tr -d ' ')" = "177ELF" ]; then
+                ./scripts/check-linux-abi.sh "$f" 2.28 3.4.25
+              fi
+            done < <(find "$tmp/x/runtimes" -type f -print0)
+
+            # Shipping linux-arm64 natives is only half the story: consumers also
+            # need the pinned SHA-256 of the arm64 libcef.so release asset, or the
+            # runtime download is refused by design. Warn instead of failing —
+            # x64 users are unaffected.
+            if [ -n "$(find "$tmp/x/runtimes/linux-arm64" -name CefBrowser.Native -print -quit 2>/dev/null)" ]; then
+              if ! grep -qE 'ReleaseAssetSha256Arm64[[:space:]]*=[[:space:]]*"[0-9a-f]{64}"' \
+                     CefSharp.Avalonia/CefRuntimeResolver.cs; then
+                echo "::warning::runtimes/linux-arm64 ships natives, but ReleaseAssetSha256Arm64 is not pinned yet — ARM64 users cannot auto-download libcef.so (CEFAVALONIA_CEF_ROOT only). Run the 'CEF Linux runtime asset' workflow and paste the printed SHA-256."
+              fi
+            fi
+          done
 
       # Trusted Publishing: exchange the Actions OIDC token for a short-lived
       # NuGet API key (dotnet nuget push cannot do this exchange by itself).
@@ -155,42 +231,49 @@ jobs:
       # to fall back to a classic key — needed to bootstrap a BRAND-NEW package
       # id, which Trusted Publishing alone may refuse (HTTP 403).
       - name: Push to nuget.org (trusted publishing)
-        if: env.PACKAGE_VERSION != ''
-        shell: pwsh
         env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
           NUGET_FALLBACK_KEY: ${{ secrets.NUGET_CLASSIC_API_KEY }}
         run: |
-          $tooBig = Get-ChildItem artifacts\*.nupkg | Where-Object { $_.Length -gt 250MB }
-          if ($tooBig) {
-            $tooBig | ForEach-Object { Write-Host "::error::$($_.Name) is $([math]::Round($_.Length/1MB,1)) MB — NuGet.org limit is 250 MB" }
+          set -uo pipefail
+          shopt -s nullglob
+          failed=()
+          for pkg in artifacts/*.nupkg; do
+            size=$(stat -c%s "$pkg")
+            if [ "$size" -gt $((250 * 1024 * 1024)) ]; then
+              echo "::error::$pkg is $((size / 1048576)) MB — NuGet.org limit is 250 MB"
+              exit 1
+            fi
+            printf '%s  %s\n' "$pkg" "$(du -h "$pkg" | cut -f1)"
+            if ! dotnet nuget push "$pkg" \
+                   --api-key "$NUGET_API_KEY" \
+                   --source https://api.nuget.org/v3/index.json \
+                   --skip-duplicate; then
+              if [ -n "${NUGET_FALLBACK_KEY:-}" ]; then
+                echo "::warning::OIDC push rejected for $pkg; retrying with classic API key"
+                dotnet nuget push "$pkg" \
+                  --api-key "$NUGET_FALLBACK_KEY" \
+                  --source https://api.nuget.org/v3/index.json \
+                  --skip-duplicate || failed+=("$pkg")
+              else
+                failed+=("$pkg")
+              fi
+            fi
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            printf '::error::failed to push %s\n' "${failed[@]}"
             exit 1
-          }
-          $failed = @()
-          foreach ($pkg in Get-ChildItem artifacts\*.nupkg) {
-            "{0}  {1:N1} MB" -f $pkg.Name, ($pkg.Length / 1MB)
-            dotnet nuget push $pkg.FullName `
-              --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" `
-              --source https://api.nuget.org/v3/index.json `
-              --skip-duplicate
-            if ($LASTEXITCODE -ne 0) {
-              if ($env:NUGET_FALLBACK_KEY) {
-                Write-Host "::warning::OIDC push rejected for $($pkg.Name); retrying with classic API key"
-                dotnet nuget push $pkg.FullName `
-                  --api-key $env:NUGET_FALLBACK_KEY `
-                  --source https://api.nuget.org/v3/index.json `
-                  --skip-duplicate
-              }
-              if ($LASTEXITCODE -ne 0) { $failed += $pkg.Name }
-            }
-          }
-          if ($failed.Count -gt 0) {
-            $failed | ForEach-Object { Write-Host "::error::failed to push $_" }
-            exit 1
-          }
-          Write-Host "All packages published."
+          fi
+          echo "All packages published."
 
   build-linux:
-    runs-on: ubuntu-latest
+    # The runner label no longer decides the ABI: the native host is compiled
+    # inside a Rocky 8 container (glibc 2.28, GCC 8.5 -> GLIBCXX 3.4.25).
+    # That is the oldest baseline we claim to support, and it is the only one
+    # that also runs on Kylin V10 (desktop 2.31 / server 2.28) and UOS 20 (2.28).
+    # A binary built on the runner itself (Ubuntu 22.04+, glibc 2.35) imports
+    # GLIBC_2.34 and dies on those systems with "version 'GLIBC_2.34' not found".
+    runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v4
@@ -199,11 +282,6 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
-
-      - name: Install CEF build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libgtk-3-dev
 
       - name: Cache CEF binaries
         id: cache-cef-linux
@@ -222,12 +300,38 @@ jobs:
           tar -xf ~/cef/cef.tar.bz2 -C ~/cef
           rm ~/cef/cef.tar.bz2
 
-      - name: Build native (Linux)
-        working-directory: CefBrowser.Native
+      # Compile inside Rocky 8 so the host only imports glibc 2.28 / GLIBCXX
+      # 3.4.25 symbols. The container is what sets the ABI, not the runner.
+      # NOTE: `dnf install gcc-c++` must stay on the default GCC 8.5 — switching
+      # to gcc-toolset-* would raise GLIBCXX back to 3.4.29/3.4.30.
+      - name: Build native (Linux x64, glibc 2.28 baseline)
         run: |
-          CEF=~/cef/cef_binary_${{ env.CEF_VER }}_linux64
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT="$CEF" -DCMAKE_MODULE_PATH="$CEF/cmake"
-          cmake --build build --config Release
+          docker run --rm \
+            -e CEF_ROOT="/cef/cef_binary_${{ env.CEF_VER }}_linux64" \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v "$HOME/cef:/cef:ro" \
+            -w /work/CefBrowser.Native \
+            rockylinux:8 bash -ec '
+              dnf install -y gcc-c++ make cmake ninja-build gtk3-devel libX11-devel pkgconfig
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCEF_ROOT="$CEF_ROOT" -DCMAKE_MODULE_PATH="$CEF_ROOT/cmake"
+              cmake --build build --config Release
+            '
+          # The container runs as root, so its outputs are root-owned. dotnet pack
+          # (later job) must be able to read them.
+          sudo chown -R "$(id -u):$(id -g)" CefBrowser.Native/build
+
+      # Gate EVERY ELF that goes into the package, not just the host: the aux
+      # .so files come from the CEF distribution today (glibc 2.14-2.17, no
+      # GLIBCXX at all), but a future CEF bump could silently raise the floor.
+      - name: Verify Linux x64 ABI baseline (glibc 2.28 / GLIBCXX 3.4.25)
+        run: |
+          set -euo pipefail
+          OUT=CefBrowser.Native/build/Release
+          ./scripts/check-linux-abi.sh "$OUT/CefBrowser.Native" 2.28 3.4.25
+          for f in chrome-sandbox libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1; do
+            ./scripts/check-linux-abi.sh "$OUT/$f" 2.28 3.4.25
+          done
 
       - name: Upload Linux native (for the merged package)
         uses: actions/upload-artifact@v4
@@ -254,4 +358,82 @@ jobs:
         with:
           name: CefBrowser-Linux-x64
           path: publish-linux/
+          if-no-files-found: error
+
+  build-linux-arm:
+    # GitHub only offers ARM64 Linux runners on Ubuntu 24.04, whose glibc is
+    # 2.39 — far above every Kylin/UOS release. The container fixes that: it is
+    # native aarch64 (no qemu), so it builds at full speed with the same
+    # glibc 2.28 / GLIBCXX 3.4.25 baseline as x64.
+    # (almalinux:8 is an equivalent drop-in if rockylinux:8 ever stops
+    # publishing arm64 images.)
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache CEF binaries
+        id: cache-cef-linux-arm
+        uses: actions/cache@v4
+        with:
+          path: ~/cef
+          key: cef-linux-arm-${{ env.CEF_VER }}
+
+      - name: Download & extract CEF (Linux ARM64)
+        if: steps.cache-cef-linux-arm.outputs.cache-hit != 'true'
+        run: |
+          VER="${{ env.CEF_VER }}"
+          URL="https://cef-builds.spotifycdn.com/cef_binary_${VER}_linuxarm64.tar.bz2"
+          mkdir -p ~/cef
+          curl -sL -o ~/cef/cef.tar.bz2 "$URL"
+          tar -xf ~/cef/cef.tar.bz2 -C ~/cef
+          rm ~/cef/cef.tar.bz2
+
+      - name: Build native (Linux ARM64, glibc 2.28 baseline)
+        run: |
+          docker run --rm \
+            -e CEF_ROOT="/cef/cef_binary_${{ env.CEF_VER }}_linuxarm64" \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v "$HOME/cef:/cef:ro" \
+            -w /work/CefBrowser.Native \
+            rockylinux:8 bash -ec '
+              dnf install -y gcc-c++ make cmake ninja-build gtk3-devel libX11-devel pkgconfig
+              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCEF_ROOT="$CEF_ROOT" -DCMAKE_MODULE_PATH="$CEF_ROOT/cmake"
+              cmake --build build --config Release
+            '
+          sudo chown -R "$(id -u):$(id -g)" CefBrowser.Native/build
+
+      - name: Verify Linux ARM64 ABI baseline (glibc 2.28 / GLIBCXX 3.4.25)
+        run: |
+          set -euo pipefail
+          OUT=CefBrowser.Native/build/Release
+          ./scripts/check-linux-abi.sh "$OUT/CefBrowser.Native" 2.28 3.4.25
+          for f in chrome-sandbox libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1; do
+            ./scripts/check-linux-abi.sh "$OUT/$f" 2.28 3.4.25
+          done
+
+      - name: Upload Linux ARM64 native (for the merged package)
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-arm64
+          path: CefBrowser.Native/build/Release/
+          if-no-files-found: error
+
+      - name: Publish demo app (linux-arm64)
+        run: |
+          dotnet publish TestBrowserApp/TestBrowserApp.csproj -c Release -r linux-arm64 \
+            -o publish-linux-arm64 \
+            -p:CefLinuxRoot="$HOME/cef/cef_binary_${{ env.CEF_VER }}_linuxarm64"
+
+      - name: Upload Linux ARM64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CefBrowser-Linux-arm64
+          path: publish-linux-arm64/
           if-no-files-found: error

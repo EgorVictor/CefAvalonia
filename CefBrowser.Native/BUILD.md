@@ -79,3 +79,14 @@ Avalonia (C#, .NET 8)
 
 Avalonia → C++: `Navigate|url`, `Reload`, `Stop`, `Close`, `EmbedDone`, `Resize|w|h`
 C++ → Avalonia: `Ready|HWND_HEX`, `AddressChanged|url`, `LoadError|code|text|url`
+
+## Linux ARM64
+
+Use the same CMake flow with an ARM64 CEF distribution (`cef_binary_..._linuxarm64`):
+
+```bash
+CEF=~/cef/cef_binary_109.1.11+g6d4fdb2+chromium-109.0.5414.87_linuxarm64
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCEF_ROOT="$CEF" -DCMAKE_MODULE_PATH="$CEF/cmake"
+cmake --build build --config Release
+```
