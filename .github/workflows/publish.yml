@@ -309,8 +309,14 @@ jobs:
             -v "$HOME/cef:/cef:ro" \
             -w /work/CefBrowser.Native \
             rockylinux:8 bash -ec '
-              dnf install -y gcc-c++ make cmake gtk3-devel libX11-devel pkgconfig \
-                nss-devel nspr-devel alsa-lib-devel
+              # Rocky 8 AppStream/BaseOS can be out of sync on a mirror, which
+              # surfaces as "nothing provides libstdc++ = X needed by gcc-c++".
+              # Align first, then allow non-best candidates, then retry once on
+              # a fresh mirror set.
+              dnf update -y || true
+              dnf install -y --nobest gcc-c++ make cmake gtk3-devel libX11-devel pkgconfig \
+                nss-devel nspr-devel alsa-lib-devel \
+                || { dnf clean all; dnf install -y --nobest gcc-c++ make cmake gtk3-devel libX11-devel pkgconfig nss-devel nspr-devel alsa-lib-devel; }
               cmake -B build -DCMAKE_BUILD_TYPE=Release \
                 -DCEF_ROOT="$CEF_ROOT" -DCMAKE_MODULE_PATH="$CEF_ROOT/cmake"
               cmake --build build --config Release --parallel "$(nproc)"
