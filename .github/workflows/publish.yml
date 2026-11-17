@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   build-windows:
-    needs: [build-linux, build-linux-arm]
+    needs: [build-linux]
     runs-on: windows-latest
 
     steps:
@@ -113,12 +113,6 @@ jobs:
           name: native-linux-x64
           path: artifacts/native-linux-x64
 
-      - name: Download Linux ARM64 native (merge into the package)
-        uses: actions/download-artifact@v4
-        with:
-          name: native-linux-arm64
-          path: artifacts/native-linux-arm64
-
       # Diagnostics: the Linux package must stay well under NuGet.org's 250 MB
       # limit. Print what the native build actually produced so an oversized
       # package can be traced to a specific file instead of guessed at.
@@ -138,8 +132,7 @@ jobs:
       - name: Pack CefSharp.Avalonia.Linux (Linux natives)
         run: |
           dotnet pack CefSharp.Avalonia.Linux\CefSharp.Avalonia.Linux.csproj -c Release -o artifacts `
-            -p:CefNativeLinuxDir="${{ github.workspace }}\artifacts\native-linux-x64" `
-            -p:CefNativeLinuxArm64Dir="${{ github.workspace }}\artifacts\native-linux-arm64"
+            -p:CefNativeLinuxDir="${{ github.workspace }}\artifacts\native-linux-x64"
 
       # Build the demo app too, so compile errors surface in CI (it also copies
       # the native host + CEF binaries next to the assembly).
@@ -363,87 +356,4 @@ jobs:
         with:
           name: CefBrowser-Linux-x64
           path: publish-linux/
-          if-no-files-found: error
-
-  build-linux-arm:
-    # GitHub only offers ARM64 Linux runners on Ubuntu 24.04, whose glibc is
-    # 2.39 — far above every Kylin/UOS release. The container fixes that: it is
-    # native aarch64 (no qemu), so it builds at full speed with the same
-    # glibc 2.28 / GLIBCXX 3.4.25 baseline as x64.
-    # (almalinux:8 is an equivalent drop-in if rockylinux:8 ever stops
-    # publishing arm64 images.)
-    runs-on: ubuntu-24.04-arm
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
-
-      - name: Cache CEF binaries
-        id: cache-cef-linux-arm
-        uses: actions/cache@v4
-        with:
-          path: ~/cef
-          key: cef-linux-arm-${{ env.CEF_VER }}
-
-      - name: Download & extract CEF (Linux ARM64)
-        if: steps.cache-cef-linux-arm.outputs.cache-hit != 'true'
-        run: |
-          VER="${{ env.CEF_VER }}"
-          URL="https://cef-builds.spotifycdn.com/cef_binary_${VER}_linuxarm64.tar.bz2"
-          mkdir -p ~/cef
-          curl -sL -o ~/cef/cef.tar.bz2 "$URL"
-          tar -xf ~/cef/cef.tar.bz2 -C ~/cef
-          rm ~/cef/cef.tar.bz2
-
-      - name: Build native (Linux ARM64, glibc 2.28 baseline)
-        run: |
-          docker run --rm \
-            -e CEF_ROOT="/cef/cef_binary_${{ env.CEF_VER }}_linuxarm64" \
-            -v "$GITHUB_WORKSPACE:/work" \
-            -v "$HOME/cef:/cef:ro" \
-            -w /work/CefBrowser.Native \
-            rockylinux:8 bash -ec '
-              dnf install -y gcc-c++ make cmake gtk3-devel libX11-devel pkgconfig \
-                nss-devel nspr-devel alsa-lib-devel
-              # CEF auto-detects any 64-bit arch as x86_64 and injects
-              # -m64/-march=x86-64, which aarch64 GCC rejects. PROJECT_ARCH=arm64
-              # is the value CEF itself supports to suppress those x86-only flags.
-              cmake -B build -DCMAKE_BUILD_TYPE=Release \
-                -DPROJECT_ARCH=arm64 \
-                -DCEF_ROOT="$CEF_ROOT" -DCMAKE_MODULE_PATH="$CEF_ROOT/cmake"
-              cmake --build build --config Release --parallel "$(nproc)"
-            '
-          sudo chown -R "$(id -u):$(id -g)" CefBrowser.Native/build
-
-      - name: Verify Linux ARM64 ABI baseline (glibc 2.28 / GLIBCXX 3.4.25)
-        run: |
-          set -euo pipefail
-          OUT=CefBrowser.Native/build/Release
-          ./scripts/check-linux-abi.sh "$OUT/CefBrowser.Native" 2.28 3.4.25
-          for f in chrome-sandbox libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1; do
-            ./scripts/check-linux-abi.sh "$OUT/$f" 2.28 3.4.25
-          done
-
-      - name: Upload Linux ARM64 native (for the merged package)
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-linux-arm64
-          path: CefBrowser.Native/build/Release/
-          if-no-files-found: error
-
-      - name: Publish demo app (linux-arm64)
-        run: |
-          dotnet publish TestBrowserApp/TestBrowserApp.csproj -c Release -r linux-arm64 \
-            -o publish-linux-arm64 \
-            -p:CefLinuxRoot="$HOME/cef/cef_binary_${{ env.CEF_VER }}_linuxarm64"
-
-      - name: Upload Linux ARM64 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: CefBrowser-Linux-arm64
-          path: publish-linux-arm64/
           if-no-files-found: error
