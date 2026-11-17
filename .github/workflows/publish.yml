@@ -304,6 +304,10 @@ jobs:
       # 3.4.25 symbols. The container is what sets the ABI, not the runner.
       # NOTE: `dnf install gcc-c++` must stay on the default GCC 8.5 — switching
       # to gcc-toolset-* would raise GLIBCXX back to 3.4.29/3.4.30.
+      # NOTE: no `-G Ninja` on purpose. `ninja-build` lives in Rocky 8's
+      # powertools repo, which is disabled in this image, so `dnf install
+      # ninja-build` fails with "Unable to find a match". The default Unix
+      # Makefiles generator needs nothing beyond `make`.
       - name: Build native (Linux x64, glibc 2.28 baseline)
         run: |
           docker run --rm \
@@ -312,10 +316,10 @@ jobs:
             -v "$HOME/cef:/cef:ro" \
             -w /work/CefBrowser.Native \
             rockylinux:8 bash -ec '
-              dnf install -y gcc-c++ make cmake ninja-build gtk3-devel libX11-devel pkgconfig
-              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              dnf install -y gcc-c++ make cmake gtk3-devel libX11-devel pkgconfig
+              cmake -B build -DCMAKE_BUILD_TYPE=Release \
                 -DCEF_ROOT="$CEF_ROOT" -DCMAKE_MODULE_PATH="$CEF_ROOT/cmake"
-              cmake --build build --config Release
+              cmake --build build --config Release --parallel "$(nproc)"
             '
           # The container runs as root, so its outputs are root-owned. dotnet pack
           # (later job) must be able to read them.
@@ -402,10 +406,10 @@ jobs:
             -v "$HOME/cef:/cef:ro" \
             -w /work/CefBrowser.Native \
             rockylinux:8 bash -ec '
-              dnf install -y gcc-c++ make cmake ninja-build gtk3-devel libX11-devel pkgconfig
-              cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              dnf install -y gcc-c++ make cmake gtk3-devel libX11-devel pkgconfig
+              cmake -B build -DCMAKE_BUILD_TYPE=Release \
                 -DCEF_ROOT="$CEF_ROOT" -DCMAKE_MODULE_PATH="$CEF_ROOT/cmake"
-              cmake --build build --config Release
+              cmake --build build --config Release --parallel "$(nproc)"
             '
           sudo chown -R "$(id -u):$(id -g)" CefBrowser.Native/build
 
