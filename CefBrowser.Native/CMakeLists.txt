@@ -86,6 +86,10 @@ elseif(OS_LINUX)
       PkgConfig::X11
       ${CMAKE_DL_LIBS}
       pthread
+      # shm_open() lives in librt on glibc < 2.34 (our Rocky 8 baseline).
+      # Newer glibc folded it into libc, where linking librt is a harmless
+      # no-op, so this works across all supported baselines.
+      rt
   )
 
   # GCC 8 (our ABI baseline: Rocky 8) keeps std::filesystem in a separate

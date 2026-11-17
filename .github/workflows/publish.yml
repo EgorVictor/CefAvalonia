@@ -407,7 +407,11 @@ jobs:
             -w /work/CefBrowser.Native \
             rockylinux:8 bash -ec '
               dnf install -y gcc-c++ make cmake gtk3-devel libX11-devel pkgconfig
+              # CEF auto-detects any 64-bit arch as x86_64 and injects
+              # -m64/-march=x86-64, which aarch64 GCC rejects. PROJECT_ARCH=arm64
+              # is the value CEF itself supports to suppress those x86-only flags.
               cmake -B build -DCMAKE_BUILD_TYPE=Release \
+                -DPROJECT_ARCH=arm64 \
                 -DCEF_ROOT="$CEF_ROOT" -DCMAKE_MODULE_PATH="$CEF_ROOT/cmake"
               cmake --build build --config Release --parallel "$(nproc)"
             '
