@@ -374,9 +374,10 @@ ldd ./CefBrowser.Native | grep -i "not found"
   sudo chown root:root chrome-sandbox && sudo chmod 4755 chrome-sandbox
   ```
 - **架构**：支持 x64（`win-x64` / `linux-x64`）与 arm64（`linux-arm64`），不支持 32 位。
-  > `linux-arm64` 的原生包已经产出，但 `libcef.so` 的 arm64 运行时资产尚未回填 SHA-256，
-  > 因此 ARM64 上的首次自动下载会被拒绝（宁可不下载也不下载未校验的二进制）。
-  > 暂时可用 `CEFAVALONIA_CEF_ROOT` 指向本地 CEF arm64 分发包。
+  > `linux-arm64` 的 `libcef.so` 运行时资产（`libcef-109.1.11-linux-arm64.tar.gz`）需要先手动
+  > 跑一次 **CEF Linux runtime asset** workflow 上传到 release。它的 SHA-256 已内置在
+  > `CefRuntimeResolver.ReleaseAssetSha256Arm64`，workflow 发现打包字节与该值不符会拒绝上传。
+  > 上传之前，可先用 `CEFAVALONIA_CEF_ROOT` 指向本地 CEF arm64 分发包。
 - **输入**：Linux OSR 模式已支持鼠标 + 基础键盘；中文 IME、光标形状、文本选择/拖拽暂未实现。
 
 > 若目标机器无法联网或不能 `apt install`，请用 **.deb 包**（把上面的库声明为 `Depends:`，安装时自动解析）或 **AppImage**（把依赖随镜像打包，单文件拷贝即运行）分发，**不要**把系统 `.so` 手工塞进发布目录——那样会因传递依赖与 glibc 版本耦合而不可靠。

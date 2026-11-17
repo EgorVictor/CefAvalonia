@@ -57,11 +57,19 @@ public static class CefRuntimeResolver
         "e5307c50e1f76cefef3f893ba70b1d7c86c153531d0d77987fbf7bf3878e4569";
 
     /// <summary>
-    /// SHA-256 of the arm64 release asset. Must be filled in once the arm64
-    /// asset is published by <c>cef-runtime.yml</c>; until then downloads on
-    /// arm64 are refused (unverified binaries are never fetched).
+    /// SHA-256 of the arm64 release asset (<c>libcef-109.1.11-linux-arm64.tar.gz</c>
+    /// at tag <c>cef-runtime-109.1.11</c>). Same rules as the x64 constant above:
+    /// the hash covers the exact bytes uploaded to the release, and a missing
+    /// value means downloads on arm64 are REFUSED rather than unverified.
+    ///
+    /// Computed from the official CEF 109 <c>linuxarm64</c> distribution using the
+    /// same deterministic archive command as <c>cef-runtime.yml</c>
+    /// (<c>tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner | gzip -n</c>).
+    /// That command reproduces the x64 constant byte-for-byte, so the value does
+    /// not depend on the machine or architecture that packed the archive.
     /// </summary>
-    private const string? ReleaseAssetSha256Arm64 = null;
+    private const string? ReleaseAssetSha256Arm64 =
+        "b0e00f6346161131050b73659d8f18cc2e68f0bb6ebb9d2c43ef09061621c556";
 
     private static readonly SemaphoreSlim Gate = new(1, 1);
     private static string? _resolvedDirectory;
