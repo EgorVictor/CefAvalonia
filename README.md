@@ -315,8 +315,13 @@ glibc **只保证向前兼容**：老系统编译 → 新系统可运行；在�
 | Ubuntu 24.04 | 2.39 | 3.4.33 |
 
 云构建环境（CI / Docker）必须用**最老的支持版本**。因此 `publish.yml` 里的
-`CefBrowser.Native` **不在 runner 上编译，而是在 `rockylinux:8` 容器里编译**
-（glibc 2.28、默认 GCC 8.5 → GLIBCXX 3.4.25），x64 与 arm64 用同一个基线。
+`CefBrowser.Native` **不在 runner 上编译，而是在容器里编译**：
+
+- **x64**：`rockylinux:8`（glibc 2.28、默认 GCC 8.5 → GLIBCXX 3.4.25）；
+- **arm64**：`ubuntu:20.04`（glibc 2.31、默认 GCC 9 → GLIBCXX 3.4.28），因为
+  CEF 官方 linuxarm64 的 `libcef.so` 引用了 `exp/log/pow` 的 `GLIBC_2.29` 符号，
+  无法降到 2.28，而 Ubuntu 20.04 正好与麒麟桌面 V10 的底子一致。
+
 runner 标签（`ubuntu-22.04` / `ubuntu-24.04-arm`）只影响 .NET 工具链，不影响产物 ABI。
 
 > 为什么不用 runner 直接编译：在 Ubuntu 22.04+ 上编译出来的宿主会引用
@@ -363,12 +368,13 @@ strings "$L" | grep -E '^GLIBCXX_3\.4\.[0-9]+$' | sort -V | tail -1
 ldd ./CefBrowser.Native | grep -i "not found"
 ```
 
-> `libcef.so` 是 CEF 官方预编译产物（要求 glibc 2.17，且不依赖 GLIBCXX），
-> 不受本项目 CI 编译环境影响；真正随编译环境变化的是 `CefBrowser.Native`。
+> `libcef.so` 是 CEF 官方预编译产物（x64 要求 glibc 2.17、arm64 要求 2.29，
+> 都不依赖 GLIBCXX），不受本项目 CI 编译环境影响；真正随编译环境变化的是
+> `CefBrowser.Native`。
 >
 > 只支持 glibc 系发行版；Alpine/musl 不能直接运行。
 
-- **glibc**：要求 ≥ 2.28（Ubuntu 20.04 / Debian 10 / RHEL 8 / 麒麟 V10 / UOS 20 及以上）。
+- **glibc**：x64 要求 ≥ 2.28（Ubuntu 20.04 / Debian 10 / RHEL 8 / 麒麟 V10 / UOS 20 及以上）；arm64 要求 ≥ 2.31（麒麟桌面 V10 / Ubuntu 20.04 及以上，CEF 官方 arm64 二进制要求 GLIBC_2.29，无法降到 2.28）。
 - **沙箱**：`chrome-sandbox` 未 setuid root 时 CEF 自动回退无沙箱（仅告警，可正常测试）。生产环境若要真沙箱：
   ```bash
   sudo chown root:root chrome-sandbox && sudo chmod 4755 chrome-sandbox
@@ -378,6 +384,8 @@ ldd ./CefBrowser.Native | grep -i "not found"
   > 跑一次 **CEF Linux runtime asset** workflow 上传到 release。它的 SHA-256 已内置在
   > `CefRuntimeResolver.ReleaseAssetSha256Arm64`，workflow 发现打包字节与该值不符会拒绝上传。
   > 上传之前，可先用 `CEFAVALONIA_CEF_ROOT` 指向本地 CEF arm64 分发包。
+  > arm64 基线为 glibc 2.31 / GLIBCXX 3.4.28（麒麟桌面 V10 / Ubuntu 20.04 及以上），
+  > 不支持 glibc 2.28 的麒麟服务器 V10 / UOS 20。
 - **输入**：Linux OSR 模式已支持鼠标 + 基础键盘；中文 IME、光标形状、文本选择/拖拽暂未实现。
 
 > 若目标机器无法联网或不能 `apt install`，请用 **.deb 包**（把上面的库声明为 `Depends:`，安装时自动解析）或 **AppImage**（把依赖随镜像打包，单文件拷贝即运行）分发，**不要**把系统 `.so` 手工塞进发布目录——那样会因传递依赖与 glibc 版本耦合而不可靠。
