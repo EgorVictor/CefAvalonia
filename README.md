@@ -100,9 +100,15 @@ CefBrowser/
 │   ├── ExternalBrowserProcessHost.cs # HWND 嵌入 (NativeControlHost)
 │   ├── CefSettings.cs              # CefSettings 镜像类
 │   ├── CefProtocol.cs              # 行协议转义/切分
-│   ├── CefDiagnostics.cs           # 可配置诊断日志
-│   ├── build/                      # NuGet 打包 MSBuild targets
-│   └── buildTransitive/
+│   └── CefDiagnostics.cs           # 可配置诊断日志
+│
+├── CefSharp.Avalonia.Windows/      # Windows (x64) 原生 NuGet 包（仅内容）
+│   ├── CefSharp.Avalonia.Windows.csproj
+│   └── build/                      # 复制原生到输出目录的 MSBuild targets
+│
+├── CefSharp.Avalonia.Linux/        # Linux (x64) 原生 NuGet 包（仅内容）
+│   ├── CefSharp.Avalonia.Linux.csproj
+│   └── build/                      # 复制原生到输出目录的 MSBuild targets
 │
 ├── TestBrowserApp/                 # 测试演示应用 (.NET 8)
 │   ├── TestBrowserApp.csproj
@@ -209,20 +215,23 @@ browser.CefSettings.Locale = "zh-CN";
 
 ### 安装
 
-**Windows**（含 Windows 原生）：
+主包 `CefSharp.Avalonia` **只含托管代码**（约 100 KB）。原生 CEF 运行时按平台单独引用：
+
+**Windows**（托管 + Windows 原生两个包）：
 
 ```xml
-<PackageReference Include="CefSharp.Avalonia" Version="1.2.0" />
+<PackageReference Include="CefSharp.Avalonia" Version="1.3.0" />
+<PackageReference Include="CefSharp.Avalonia.Windows" Version="1.3.0" />
 ```
 
-**Linux**（额外引用 Linux 原生包）：
+**Linux**（托管 + Linux 原生两个包）：
 
 ```xml
-<PackageReference Include="CefSharp.Avalonia" Version="1.2.0" />
-<PackageReference Include="CefSharp.Avalonia.Linux" Version="1.2.0" />
+<PackageReference Include="CefSharp.Avalonia" Version="1.3.0" />
+<PackageReference Include="CefSharp.Avalonia.Linux" Version="1.3.0" />
 ```
 
-> 一个 CEF 发行包约 150–180 MB，Windows + Linux 两套塞进同一个 nupkg 会超过 NuGet.org 的 **250 MB 上限**，因此拆成两个包。跨平台发布（例如在 Windows 上执行 `dotnet publish -r linux-x64`）时，把 `CefSharp.Avalonia.Linux` 也引用上即可，SDK 会自动按 RID 选用对应原生文件。
+> **为什么拆成三个包**：一个 CEF 发行包约 150–180 MB。早期版本把 Windows 原生塞进主包，导致 Linux 用户还原时也要下载 116 MB 的 Windows CEF（国内网络下极慢）。从 1.3.0 起，托管代码、Windows 原生、Linux 原生各自独立——**Linux 项目只下载 34 MB 的 Linux 包**，不会再碰 Windows 那 116 MB。同时每个包都远低于 NuGet.org 的 250 MB 上限。跨平台发布（例如在 Windows 上执行 `dotnet publish -r linux-x64`）时，把两个原生包都引用上即可，SDK 会按 RID 自动选用对应文件。
 
 > ## ⚠️ Linux：`libcef.so` 不在包内，首次运行会自动下载
 >
@@ -262,7 +271,7 @@ browser.CefSettings.Locale = "zh-CN";
 
 ## 部署须知（发布到目标机器）
 
-**发布本身是零配置的**：`dotnet publish -r win-x64` 或 `dotnet publish -r linux-x64`，NuGet 包会通过 `build/CefSharp.Avalonia.targets` 自动把对应平台的 CEF 运行时 + `CefBrowser.Native` 复制到输出目录，并在 Linux 上自动 `chmod +x`。**无需任何 `-p:` 参数或额外构建步骤。**（目前仅发布 x64 原生二进制。）
+**发布本身是零配置的**：`dotnet publish -r win-x64` 或 `dotnet publish -r linux-x64`，对应的原生包会通过自己的 `build/CefSharp.Avalonia.Windows.targets` / `build/CefSharp.Avalonia.Linux.targets` 自动把 CEF 运行时 + `CefBrowser.Native` 复制到输出目录，并在 Linux 上自动 `chmod +x`。**无需任何 `-p:` 参数或额外构建步骤。**（目前仅发布 x64 原生二进制。）
 
 但以下是目标机器上的**运行前提**（注意：这是部署约定，不是发布时设置）：
 

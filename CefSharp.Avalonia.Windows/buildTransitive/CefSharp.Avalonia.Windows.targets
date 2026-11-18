@@ -1,0 +1,35 @@
+<Project>
+  <!-- Transitive variant: same copy logic as build/CefSharp.Avalonia.Windows.targets,
+       placed in buildTransitive/ so consumers that reach this package through a
+       transitive dependency also get the native binaries copied. -->
+  <PropertyGroup>
+    <_CefWinNativePackageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)../runtimes/win-x64/native'))</_CefWinNativePackageDir>
+    <!-- Only copy for a Windows build, or a win-* RID publish. When both native
+         packages are referenced (e.g. for cross-publishing), this prevents the
+         Windows payload from leaking into a Linux output directory. -->
+    <_CefWinRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</_CefWinRid>
+    <_CefWinRid Condition="'$(_CefWinRid)' == ''">win-x64</_CefWinRid>
+    <_CefWinRidOk Condition="$(_CefWinRid.StartsWith('win'))">true</_CefWinRidOk>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <_CefWinNativeFile Include="$(_CefWinNativePackageDir)**/*" />
+  </ItemGroup>
+
+  <Target Name="CopyCefWinNativeBinaries" AfterTargets="Build"
+          Condition="$([MSBuild]::IsOSPlatform('Windows')) AND '$(_CefWinRidOk)' == 'true'"
+          Inputs="@(_CefWinNativeFile)" Outputs="@(_CefWinNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')">
+    <Copy SourceFiles="@(_CefWinNativeFile)" DestinationFiles="@(_CefWinNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <ItemGroup>
+      <ResolvedFileToPublish Include="@(_CefWinNativeFile)">
+        <RelativePath>%(_CefWinNativeFile.RecursiveDir)%(_CefWinNativeFile.Filename)%(_CefWinNativeFile.Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+    <Message Text="Copied CEF Windows native binaries to $(OutDir)" Importance="high" />
+  </Target>
+
+  <Target Name="CleanCefWinNativeBinaries" AfterTargets="Clean">
+    <Delete Files="@(_CefWinNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')" Condition="Exists('%(Identity)')" />
+  </Target>
+</Project>

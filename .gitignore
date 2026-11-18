@@ -35,6 +35,7 @@ build-linux/
 build-arm64/
 # NuGet MSBuild targets live in folders named "build" and must stay tracked
 !CefSharp.Avalonia/build/
+!CefSharp.Avalonia.Windows/build/
 !CefSharp.Avalonia.Linux/build/
 out/
 

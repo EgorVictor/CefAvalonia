@@ -4,13 +4,13 @@
     <Nullable>enable</Nullable>
 
     <!-- Content-only package: ships the Linux (x64) native binaries for
-         CefSharp.Avalonia. Kept separate from the main package because a single
-         CEF distribution is ~150-180 MB, and bundling both Windows + Linux in
-         one nupkg exceeds NuGet.org's 250 MB limit. -->
+         CefSharp.Avalonia. Kept separate from the managed-only main package and
+         from CefSharp.Avalonia.Windows so a Linux restore downloads only this
+         package's payload, not the ~116 MB Windows CEF runtime. -->
     <PackageId>CefSharp.Avalonia.Linux</PackageId>
-    <Version>1.2.0</Version>
+    <Version>1.3.0</Version>
     <Authors>CefBrowser</Authors>
-    <Description>Linux (x64 + arm64) native binaries (CEF runtime + CefBrowser.Native host) for CefSharp.Avalonia.</Description>
+    <Description>Linux (x64) native binaries (CEF runtime + CefBrowser.Native host) for CefSharp.Avalonia. Reference this together with CefSharp.Avalonia.</Description>
     <PackageTags>avalonia;cef;chromium;browser;linux</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/EgorVictor/CefAvalonia</PackageProjectUrl>
@@ -25,7 +25,6 @@
     <!-- Default to the local native build dir; CI overrides with the downloaded
          Linux native artifact (-p:CefNativeLinuxDir=...). -->
     <CefNativeLinuxDir Condition="'$(CefNativeLinuxDir)' == ''">..\CefBrowser.Native\build\Release</CefNativeLinuxDir>
-  <CefNativeLinuxArm64Dir Condition="'$(CefNativeLinuxArm64Dir)' == ''">..\CefBrowser.Native\build-arm64\Release</CefNativeLinuxArm64Dir>
   </PropertyGroup>
 
   <ItemGroup>
@@ -76,30 +75,6 @@
          only populated for '**' globs, which silently flattened locales/. -->
     <Content Include="$(CefNativeLinuxDir)\locales\*.pak"
              Pack="true" PackagePath="runtimes\linux-x64\native\locales\">
-      <Visible>false</Visible>
-    </Content>
-  </ItemGroup>
-
-  <!-- ARM64 (linux-arm64) natives, packaged under their own RID folder. -->
-  <ItemGroup Condition="Exists('$(CefNativeLinuxArm64Dir)\CefBrowser.Native')">
-    <CefLinuxArm64NativeFile Include="$(CefNativeLinuxArm64Dir)\CefBrowser.Native" />
-    <CefLinuxArm64NativeFile Include="$(CefNativeLinuxArm64Dir)\chrome-sandbox" />
-    <CefLinuxArm64NativeFile Include="$(CefNativeLinuxArm64Dir)\libEGL.so" />
-    <CefLinuxArm64NativeFile Include="$(CefNativeLinuxArm64Dir)\libGLESv2.so" />
-    <CefLinuxArm64NativeFile Include="$(CefNativeLinuxArm64Dir)\libvk_swiftshader.so" />
-    <CefLinuxArm64NativeFile Include="$(CefNativeLinuxArm64Dir)\libvulkan.so.1" />
-    <CefLinuxArm64NativeFile Include="$(CefNativeLinuxArm64Dir)\vk_swiftshader_icd.json" />
-    <CefLinuxArm64NativeFile Include="$(CefNativeLinuxArm64Dir)\*.dat" />
-    <CefLinuxArm64NativeFile Include="$(CefNativeLinuxArm64Dir)\*.bin" />
-    <CefLinuxArm64NativeFile Include="$(CefNativeLinuxArm64Dir)\*.pak" />
-
-    <Content Include="@(CefLinuxArm64NativeFile)"
-             Pack="true" PackagePath="runtimes\linux-arm64\native\">
-      <Visible>false</Visible>
-    </Content>
-
-    <Content Include="$(CefNativeLinuxArm64Dir)\locales\*.pak"
-             Pack="true" PackagePath="runtimes\linux-arm64\native\locales\">
       <Visible>false</Visible>
     </Content>
   </ItemGroup>

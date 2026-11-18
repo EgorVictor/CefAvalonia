@@ -87,6 +87,7 @@ jobs:
         run: |
           $csprojs = @(
             "CefSharp.Avalonia\CefSharp.Avalonia.csproj",
+            "CefSharp.Avalonia.Windows\CefSharp.Avalonia.Windows.csproj",
             "CefSharp.Avalonia.Linux\CefSharp.Avalonia.Linux.csproj"
           )
           foreach ($csproj in $csprojs) {
@@ -126,8 +127,11 @@ jobs:
             @{n='MB';e={[math]::Round($_.Length/1MB,1)}}, `
             @{n='File';e={$_.FullName.Substring($dir.Length)}} | Format-Table -AutoSize | Out-String
 
-      - name: Pack CefSharp.Avalonia (managed + Windows natives)
+      - name: Pack CefSharp.Avalonia (managed only)
         run: dotnet pack CefSharp.Avalonia\CefSharp.Avalonia.csproj -c Release -o artifacts
+
+      - name: Pack CefSharp.Avalonia.Windows (Windows natives)
+        run: dotnet pack CefSharp.Avalonia.Windows\CefSharp.Avalonia.Windows.csproj -c Release -o artifacts
 
       - name: Pack CefSharp.Avalonia.Linux (Linux natives)
         run: |
@@ -175,22 +179,56 @@ jobs:
       # Re-check the natives AS PACKED, not as built. The build-time gate proves
       # the files in build/Release are fine; this proves the files that actually
       # landed under runtimes/<rid>/native/ inside the .nupkg are the same ones.
-      - name: Verify natives inside the .nupkg (glibc 2.28 / GLIBCXX 3.4.25)
+      # The main package is managed-only, so it must NOT carry a native payload;
+      # only the two platform packages are ABI-gated.
+      - name: Verify packages inside the .nupkg (glibc 2.28 / GLIBCXX 3.4.25)
         run: |
           set -euo pipefail
           shopt -s nullglob
           pkgs=(artifacts/*.nupkg)
-          if [ ${#pkgs[@]} -eq 0 ]; then
-            echo "::error::no .nupkg found in artifacts/"; exit 1
+          if [ ${#pkgs[@]} -ne 3 ]; then
+            echo "::error::expected 3 .nupkg files, found ${#pkgs[@]}"
+            printf '  %s\n' "${pkgs[@]}"
+            exit 1
           fi
+          for id in CefSharp.Avalonia CefSharp.Avalonia.Windows CefSharp.Avalonia.Linux; do
+            matches=0
+            for pkg in "${pkgs[@]}"; do
+              # The ID must be followed by a numeric version, otherwise
+              # "CefSharp.Avalonia." also matches the Windows/Linux packages.
+              [[ "$(basename "$pkg")" == "$id."[0-9]*.nupkg ]] && matches=$((matches + 1))
+            done
+            if [ "$matches" -ne 1 ]; then
+              echo "::error::expected exactly one $id package, found $matches"
+              exit 1
+            fi
+          done
+
           tmp="$(mktemp -d)"
           for pkg in "${pkgs[@]}"; do
-            echo "== $pkg"
+            base="$(basename "$pkg")"
+            echo "== $base"
             rm -rf "$tmp/x"; mkdir -p "$tmp/x"
             unzip -q "$pkg" -d "$tmp/x"
             native_dirs=$(find "$tmp/x/runtimes" -type d -name native 2>/dev/null || true)
+
+            if [[ "$base" == CefSharp.Avalonia.[0-9]*.nupkg ]]; then
+              # Managed-only main package: make sure no natives leaked back in.
+              if [ -n "$native_dirs" ]; then
+                echo "::error::$base must be managed-only but contains runtimes/*/native"
+                exit 1
+              fi
+              if [ ! -f "$tmp/x/lib/net8.0/CefSharp.Avalonia.dll" ]; then
+                echo "::error::$base is missing lib/net8.0/CefSharp.Avalonia.dll"
+                exit 1
+              fi
+              echo "  managed-only OK (no native payload)"
+              continue
+            fi
+
+            # Platform packages must ship the native payload and pass the ABI gate.
             if [ -z "$native_dirs" ]; then
-              echo "::error::$pkg contains no runtimes/*/native payload"; exit 1
+              echo "::error::$base contains no runtimes/*/native payload"; exit 1
             fi
             while IFS= read -r -d '' f; do
               if [ "$(head -c 4 "$f" | od -An -c | tr -d ' ')" = "177ELF" ]; then

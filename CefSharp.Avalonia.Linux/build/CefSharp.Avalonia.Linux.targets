@@ -10,8 +10,11 @@
   -->
   <PropertyGroup>
     <_CefLinuxRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</_CefLinuxRid>
-    <_CefLinuxRid Condition="'$(_CefLinuxRid)' == '' AND $([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) == 'Arm64'">linux-arm64</_CefLinuxRid>
     <_CefLinuxRid Condition="'$(_CefLinuxRid)' == ''">linux-x64</_CefLinuxRid>
+    <!-- Only copy for a Linux build, or a linux-* RID publish. Only x64 natives
+         are shipped; arm64 is deferred because CEF 109's linuxarm64 libcef.so
+         requires GLIBC_2.29, above our glibc 2.28 baseline. -->
+    <_CefLinuxRidOk Condition="$(_CefLinuxRid.StartsWith('linux'))">true</_CefLinuxRidOk>
     <_CefLinuxNativePackageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)../runtimes/$(_CefLinuxRid)/native'))</_CefLinuxNativePackageDir>
   </PropertyGroup>
 
@@ -20,7 +23,7 @@
   </ItemGroup>
 
   <Target Name="CopyCefLinuxNativeBinaries" AfterTargets="Build"
-          Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) AND '$(_CefLinuxRidOk)' == 'true'">
     <Copy SourceFiles="@(_CefLinuxNativeFile)"
           DestinationFiles="@(_CefLinuxNativeFile->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="true" />
@@ -39,7 +42,7 @@
 
   <!-- dotnet publish may reset Unix mode bits after copying. -->
   <Target Name="ChmodCefLinuxNativePublish" AfterTargets="Publish"
-          Condition="$([MSBuild]::IsOSPlatform('Linux')) AND '$(PublishDir)' != ''">
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) AND '$(_CefLinuxRidOk)' == 'true' AND '$(PublishDir)' != ''">
     <Exec Command="chmod +x &quot;$(PublishDir)CefBrowser.Native&quot;"
           Condition="Exists('$(PublishDir)CefBrowser.Native')" />
     <Exec Command="chmod +x &quot;$(PublishDir)chrome-sandbox&quot;"

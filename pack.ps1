@@ -53,13 +53,18 @@ finally {
     popd
 }
 
-# ---- Step 2: Build + pack the managed library -------------------------------
+# ---- Step 2: Build + pack the managed library and Windows natives -----------
 Write-Host "=== [2/3] Building + packing CefSharp.Avalonia ($Configuration) ===" -ForegroundColor Cyan
 dotnet build "$root\CefSharp.Avalonia\CefSharp.Avalonia.csproj" -c $Configuration
 if ($LASTEXITCODE -ne 0) { throw ".NET build failed" }
 
+# The managed library and the Windows native binaries ship as two packages so a
+# Linux restore does not download the ~116 MB Windows CEF payload.
 dotnet pack "$root\CefSharp.Avalonia\CefSharp.Avalonia.csproj" -c $Configuration -o $outputDir
-if ($LASTEXITCODE -ne 0) { throw "NuGet pack failed" }
+if ($LASTEXITCODE -ne 0) { throw "NuGet pack failed (managed)" }
+
+dotnet pack "$root\CefSharp.Avalonia.Windows\CefSharp.Avalonia.Windows.csproj" -c $Configuration -o $outputDir
+if ($LASTEXITCODE -ne 0) { throw "NuGet pack failed (Windows natives)" }
 
 # ---- Step 3: Show result ----------------------------------------------------
 Write-Host "=== [3/3] Done ===" -ForegroundColor Cyan
